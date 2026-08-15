@@ -1,0 +1,8 @@
+# Go build outputs (entrypoint, e2e — from Phase 2 on)
+/entrypoint/entrypoint
+*.test
+# Local scratch
+*.log
+.DS_Store
+# Local-only compose overrides
+docker-compose.override.yml
