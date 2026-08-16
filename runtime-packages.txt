@@ -32,28 +32,25 @@ libc6  # C library and ld.so for all 419 ELF objects
 libcap2  # libsmbconf links libcap.so.2 — capability checks
 libcrypt1  # libauth/libutil-crypt link libcrypt.so.1 — crypt() password hashes
 libgnutls30t64  # 33 objects link libgnutls.so.30 — LDAPS/TLS, encrypted secrets
-libgpgme11t64  # password_hash.so links libgpgme.so.11 — SambaGPG password store
 libicu76  # libsamba-util links libicui18n/libicuuc.so.76 — Unicode normalisation
-libjansson4  # libcommon-auth, net, rpcd_mdssvc link libjansson.so.4 — JSON audit log
+libjansson4  # libcommon-auth-private-samba.so, net and rpcd_mdssvc link libjansson.so.4 — JSON audit log
 libldap2  # 13 objects link libldap.so.2/liblber.so.2 — --with-ads client ops (samba-tool join, net ads)
 liblmdb0  # libldb-mdb-int links liblmdb.so.0 — the sam.ldb LMDB backend
 libncurses6  # samba-regedit links libncurses/libform/libpanel.so.6
-libpopt0  # 48 CLI tools link libpopt.so.0 — option parsing
+libpopt0  # 48 objects link libpopt.so.0 directly — 36 CLI tools in /usr/{bin,sbin} plus 12 libraries and modules — option parsing
 libpython3.13  # 77 python bindings link libpython3.13.so.1.0
 libreadline8t64  # net, regshell, rpcclient link libreadline.so.8 — interactive prompts
-libtinfo6  # linked by libncurses.so.6 and libreadline.so.8 — terminfo
+libtinfo6  # samba-regedit links libtinfo.so.6 directly (libncurses.so.6 and libreadline.so.8 also need it) — terminfo
 libtirpc3t64  # libsmbd-base links libtirpc.so.3 — Sun RPC (quota interfaces)
-zlib1g  # libgensec, libndr-krb5pac, libsamdb link libz.so.1 — compression
+zlib1g  # libndr-krb5pac, libgensec, libsamdb and libsmbconf link libz.so.1 — compression
 
 # --- reached only through the libraries above -----------------------------
-libassuan9  # pulled in by libgpgme11t64 — gpg-agent IPC
 libbz2-1.0  # pulled in by libarchive13t64
 libcom-err2  # pulled in by libgssapi-krb5-2
 libexpat1  # pulled in by libpython3.13
 libffi8  # pulled in by libp11-kit0
 libgcc-s1  # pulled in by libicu76
 libgmp10  # pulled in by libgnutls30t64
-libgpg-error0  # pulled in by libgpgme11t64 and libassuan9
 libgssapi-krb5-2  # transitive dep of libtirpc (RPCSEC_GSS); Samba's own Kerberos is bundled Heimdal (B.1) — samba code never links MIT directly
 libhogweed6t64  # pulled in by libgnutls30t64
 libidn2-0  # pulled in by libgnutls30t64
@@ -80,8 +77,10 @@ python3  # /usr/bin/python3 shebang of samba-tool and the samba_* admin scripts;
 python3-dnspython  # samba_dnsupdate, samba_upgradedns, samba.dnsresolver import dns.resolver unguarded
 python3-cryptography  # unguarded import in samba/netcmd/computer_generate_csr.py (also gkdi, key_credential_link); samba-tool loads its whole subcommand tree at startup, so WITHOUT it plain `samba-tool --help` exits 1 with ModuleNotFoundError
 # Deliberately NOT installed, verified by test rather than assumed:
-#   python3-gpg          - guarded import; `samba-tool user getpassword --help`
-#                          exits 0 without it (SambaGPG store is opt-in)
+#   python3-gpg          - guarded import; the SambaGPG password store it
+#                          serves is compiled out entirely (the builder
+#                          configures --without-gpgme, so no object links
+#                          libgpgme and the GnuPG suite stays out of the image)
 #   python3-setproctitle - guarded import; only hides passwords typed on the
 #                          command line, which this image's tooling does not do
 #   python3-markdown     - only samba.ms_schema_markdown, a doc generator

@@ -54,8 +54,18 @@ done < "$work/elves" \
     | awk '$2 == "=>" && $3 ~ /^\// { print $3 }' \
     | sort -u > "$work/libs"
 
-# 4. Whatever the DESTDIR ships itself is not a package requirement.
-grep -v "^$DEST/" "$work/libs" > "$work/external" || true
+# 4. Whatever the DESTDIR ships itself is not a package requirement. The
+#    test is a literal prefix match, not a regex: $DEST is caller-supplied,
+#    so neither a trailing slash nor a regex metacharacter in it may
+#    silently change which libraries get filtered out.
+dest_prefix=${DEST%/}
+: > "$work/external"
+while IFS= read -r lib; do
+    case "$lib" in
+        "$dest_prefix"/*) continue ;;
+    esac
+    printf '%s\n' "$lib" >> "$work/external"
+done < "$work/libs"
 
 # 5. Map library files to owning packages. Resolve symlinks first: dpkg
 #    owns libfoo.so.1.2.3 while the loader reports libfoo.so.1. A file

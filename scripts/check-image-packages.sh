@@ -17,6 +17,13 @@
 #
 # Anything in the image that none of those sets explains is reported and
 # the script exits 1.
+#
+# CI flake note: the apt closure is resolved against the LIVE Debian package
+# index at the moment the check runs, not against a snapshot. An upstream
+# dependency change (a package gaining or losing a Depends) can therefore
+# flip this check red or green with no change in this repository. A failure
+# that appears without a relevant commit is a signal to look upstream first,
+# not automatically a regression in the change under test.
 set -eu
 
 IMAGE=${1:-}
@@ -46,6 +53,24 @@ pkgs_of() {
         -W -f '${Package} ${db:Status-Status}\n' \
         | awk '$2 == "installed" { print $1 }' | sort -u
 }
+
+# The manifest the image carries is the operator-visible claim (SPEC §5.1);
+# if it is not the file this check reasons about, the whole check is about
+# a different image than the one shipped. Hash both inside a container so
+# the comparison does not depend on the host having sha256sum.
+echo "==> shipped manifest matches $MANIFEST"
+want=$(docker run --rm -i --entrypoint sha256sum "$IMAGE" < "$MANIFEST" | awk '{ print $1 }')
+got=$(docker run --rm --entrypoint sha256sum "$IMAGE" \
+        /usr/share/samba-ad-dc/runtime-packages.txt 2>/dev/null | awk '{ print $1 }') || {
+    echo "FAIL: $IMAGE ships no /usr/share/samba-ad-dc/runtime-packages.txt" >&2
+    exit 1
+}
+if [ "$want" != "$got" ]; then
+    echo "FAIL: the manifest inside $IMAGE differs from $MANIFEST" >&2
+    echo "      repo:   $want" >&2
+    echo "      image:  $got" >&2
+    exit 1
+fi
 
 echo "==> package set of image: $IMAGE"
 pkgs_of "$IMAGE" > "$work/image"

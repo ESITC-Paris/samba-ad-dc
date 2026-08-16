@@ -26,6 +26,19 @@ ARG SAMBA_SIGNING_FINGERPRINT=81F5E2832BD2545A1897B713AA99442FB680B620
 # against its own bundled Heimdal, never system MIT Kerberos.
 # libldap-dev is required by --with-ads (configure aborts without it) and
 # pulls no MIT Kerberos development package.
+# readelf, used by the MIT guardrail below, comes from binutils, which gcc
+# already depends on — no separate entry needed.
+# Deliberately NOT listed, each verified to leave the build byte-identical
+# in what it links: libblkid-dev, libkeyutils-dev (no shipped ELF names
+# libblkid/libkeyutils in its DT_NEEDED) and libtasn1-6-dev (nothing links
+# libtasn1 directly; libgnutls28-dev pulls it in anyway).
+# libgpgme11-dev is also deliberately absent: its only consumer is the
+# opt-in SambaGPG feature of password_hash.so, and libgpgme at runtime
+# drags the whole GnuPG suite (11 packages, including the network-capable
+# dirmngr) into the image — not justifiable under SPEC §5.1 for a DC.
+# Dropping the package is not enough: with the AD DC role enabled waf
+# treats a missing gpgme as fatal, so the opt-out is stated explicitly as
+# --without-gpgme below.
 # Package versions are not pinned here; reproducibility comes from the
 # digest-pinned base image plus versions.yaml's pkg_index_hash.
 # hadolint ignore=DL3008
@@ -33,10 +46,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
       bison flex perl libparse-yapp-perl rpcsvc-proto pkgconf \
       gcc g++ make python3 python3-dev \
       python3-dnspython python3-markdown \
-      libacl1-dev libarchive-dev libattr1-dev libblkid-dev libbsd-dev \
-      libcap-dev libcrypt-dev libgnutls28-dev libgpgme11-dev libicu-dev \
-      libjansson-dev libkeyutils-dev libldap-dev liblmdb-dev libpopt-dev \
-      libreadline-dev libtasn1-6-dev libtirpc-dev zlib1g-dev \
+      libacl1-dev libarchive-dev libattr1-dev libbsd-dev \
+      libcap-dev libcrypt-dev libgnutls28-dev libicu-dev \
+      libjansson-dev libldap-dev liblmdb-dev libpopt-dev \
+      libreadline-dev libtirpc-dev zlib1g-dev \
       xsltproc docbook-xsl docbook-xml \
       ca-certificates curl gpg gpg-agent \
     && rm -rf /var/lib/apt/lists/*
@@ -55,14 +68,16 @@ WORKDIR /tmp
 # The vendored key is BINARY OpenPGP despite the .asc name — plain
 # `gpg --import` handles it; never --dearmor it.
 RUN set -eux; \
-    curl -fsSLO "https://download.samba.org/pub/samba/stable/samba-${SAMBA_VERSION}.tar.gz"; \
-    curl -fsSLO "https://download.samba.org/pub/samba/stable/samba-${SAMBA_VERSION}.tar.asc"; \
+    curl -fsSLO --retry 3 --retry-delay 5 \
+        "https://download.samba.org/pub/samba/stable/samba-${SAMBA_VERSION}.tar.gz"; \
+    curl -fsSLO --retry 3 --retry-delay 5 \
+        "https://download.samba.org/pub/samba/stable/samba-${SAMBA_VERSION}.tar.asc"; \
     echo "${SAMBA_TARBALL_SHA256}  samba-${SAMBA_VERSION}.tar.gz" | sha256sum -c -; \
     gpg --batch --import /tmp/samba-release-key.asc; \
     gunzip "samba-${SAMBA_VERSION}.tar.gz"; \
     gpg --batch --status-fd 1 --verify \
         "samba-${SAMBA_VERSION}.tar.asc" "samba-${SAMBA_VERSION}.tar" > /tmp/gpg-status.txt; \
-    grep -q "VALIDSIG .* ${SAMBA_SIGNING_FINGERPRINT}" /tmp/gpg-status.txt; \
+    grep -q "VALIDSIG .* ${SAMBA_SIGNING_FINGERPRINT}$" /tmp/gpg-status.txt; \
     tar -xf "samba-${SAMBA_VERSION}.tar"; \
     rm -f "samba-${SAMBA_VERSION}.tar" "samba-${SAMBA_VERSION}.tar.asc" /tmp/gpg-status.txt
 
@@ -74,6 +89,22 @@ WORKDIR /tmp/samba-${SAMBA_VERSION}
 # image, so waf falls back to the bundled Heimdal — asserted below.
 # vfs_snapper is dropped because it hard-requires dbus-1, which an AD DC
 # has no use for; configure aborts otherwise.
+#
+# The invariant the guardrail below enforces: no ELF Samba built may name a
+# system MIT Kerberos library in its OWN DT_NEEDED, i.e. Samba's Kerberos is
+# the bundled Heimdal and nothing else. MIT reached *transitively* is
+# expected and allowed — Debian's libtirpc needs libgssapi_krb5 for
+# RPCSEC_GSS — so the assertion is deliberately about direct entries only.
+# Every step writes to a file and is tested with a plain command status; no
+# security decision rides on a pipe status that pipefail could turn into an
+# unrelated 141. The scan is proven non-vacuous by two positive assertions
+# (the result file is non-empty and contains the samba binary) before the
+# forbidden-name test runs.
+#
+# SC3045 (`read -d` is undefined in POSIX sh) does not apply: this stage's
+# SHELL is bash, which hadolint's shellcheck pass does not take into
+# account. NUL-delimited iteration is what makes the scan safe.
+# hadolint ignore=SC3045
 RUN set -eux; \
     ./configure \
       --enable-fhs \
@@ -84,6 +115,7 @@ RUN set -eux; \
       --with-piddir=/run/samba \
       --without-pam \
       --without-systemd \
+      --without-gpgme \
       --disable-cups \
       --disable-iprint \
       --with-acl-support \
@@ -92,9 +124,23 @@ RUN set -eux; \
     ; \
     make -j"$(nproc)"; \
     make install DESTDIR=/dest; \
-    if ldd /dest/usr/sbin/samba | grep -q 'libkrb5\.so\.3'; then \
-      echo "FATAL: system MIT Kerberos linked into samba" >&2; exit 1; \
+    : > /tmp/elf-needed.txt; \
+    find /dest -type f -print0 > /tmp/dest-files.bin; \
+    while IFS= read -r -d '' f; do \
+      readelf -dW "$f" > /tmp/readelf-out.txt 2>/dev/null || continue; \
+      awk -v F="$f" '/\(NEEDED\)/ { l = $0; sub(/.*\[/, "", l); sub(/\].*/, "", l); print F " " l }' \
+        /tmp/readelf-out.txt >> /tmp/elf-needed.txt; \
+    done < /tmp/dest-files.bin; \
+    test -s /tmp/elf-needed.txt; \
+    grep -q '^/dest/usr/sbin/samba ' /tmp/elf-needed.txt; \
+    echo "ELF scan: $(grep -c '' /tmp/elf-needed.txt) direct NEEDED entries under /dest"; \
+    if grep -E ' (libkrb5\.so\.3|libgssapi_krb5\.so\.2|libkrb5support\.so\.0|libk5crypto\.so\.3|libk5crypto3\.so\.3)$' \
+         /tmp/elf-needed.txt > /tmp/mit-direct.txt; then \
+      echo "FATAL: Samba-built ELF with a direct NEEDED entry on system MIT Kerberos:" >&2; \
+      cat /tmp/mit-direct.txt >&2; \
+      exit 1; \
     fi; \
+    rm -f /tmp/elf-needed.txt /tmp/dest-files.bin /tmp/readelf-out.txt /tmp/mit-direct.txt; \
     LD_LIBRARY_PATH="/dest/usr/lib/$(gcc -dumpmachine):/dest/usr/lib/$(gcc -dumpmachine)/samba" \
       /dest/usr/sbin/samba --version
 
