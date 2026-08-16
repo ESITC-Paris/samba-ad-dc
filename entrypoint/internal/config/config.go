@@ -14,12 +14,24 @@ import (
 	"strings"
 )
 
-// Exit codes (contract, immutable once released).
+// Exit codes (contract, immutable once released — SPEC §6.5).
 const (
 	// CodeConfigError is returned for any configuration problem.
 	CodeConfigError = 10
 	// CodeSecretError is returned when a secret file is missing or unreadable.
 	CodeSecretError = 11
+	// CodeStateExists is returned when provision or join is asked to run
+	// over an already initialized volume.
+	CodeStateExists = 20
+	// CodeStateAbsent is returned when run or maintenance finds no state.
+	CodeStateAbsent = 21
+	// CodeDowngrade is returned when the volume was written by a newer
+	// Samba than the image provides.
+	CodeDowngrade = 22
+	// CodeDBCheckFailed is returned when the database consistency check fails.
+	CodeDBCheckFailed = 23
+	// CodeRuntimeFailure is returned for samba/runtime failures.
+	CodeRuntimeFailure = 30
 )
 
 // Refusal is the typed error carried out of every package that declines to
