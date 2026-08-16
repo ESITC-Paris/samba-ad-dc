@@ -158,6 +158,12 @@ Structure (binding; exact YAML authored in-task, actions SHA-pinned):
   verify command, trigger_cause, degraded-mode disclosure if any.
 - Concurrency: `release-${{ inputs.branch || 'auto' }}`, no
   cancel-in-progress (a running release finishes).
+- ci.yml follow-ups while touching workflows (Phase 1 review carry):
+  change ci.yml concurrency to
+  `cancel-in-progress: ${{ github.event_name == 'pull_request' }}` so a
+  push cannot cancel a main-branch run once releases hang off main, and
+  add `workflow_dispatch:` to ci.yml triggers (manual first-run
+  validation).
 - Permissions: minimum per job (`contents: read`, `packages: write`,
   `id-token: write`, `attestations: write` only where needed).
 
