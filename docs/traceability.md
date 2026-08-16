@@ -1,0 +1,112 @@
+# Traceability — B.5 matrix ↔ E2E tests ↔ documentation
+
+This file is the single place where the three sides of SPEC §8.2 / §10.6
+are tied together:
+
+- **§8.2** requires the E2E suite to cover *all* documented use cases of
+  the image, and requires the mapping to be **bidirectional**: every
+  documented use case names the test that covers it, and every test
+  answers to a documented use case. An untested feature is an
+  undocumented feature, hence unsupported.
+- **§10.6** requires every guide section to carry a reference to the E2E
+  test that covers it. The guides do not exist yet (Phase 5), so the
+  **doc section** column below carries an explicit `pending (Phase 5)`
+  marker rather than a blank or an invented anchor. Phase 5 fills that
+  column in; the row set and the test IDs do not change when it does.
+
+The rows come from **B.5 “Documented use cases → E2E matrix”** in
+`docs/adaptation-profile.md`. The mapping is **one row ↔ one test ID**,
+in both directions.
+
+## Test IDs are frozen
+
+The Go function names in `test/e2e/*_test.go` **are** the traceability
+IDs. They are a published contract, not an implementation detail:
+
+- **Do not rename a test function.** A rename silently breaks every
+  reference to it — in this file, in the guides from Phase 5 on, and in
+  any postmortem or issue that cites a failing test by name.
+- **Do not delete a test without deleting its B.5 row**, and do not add
+  a B.5 row without adding its test. Either half alone is a matrix gap,
+  which §8.2 requires to be documented as a limitation (§12.4).
+- Adding a test means adding a row here in the same commit.
+
+`scripts/check-traceability.sh` enforces exactly this, and runs in CI's
+`lint` job. It is a *structural* check (names on both sides line up); it
+cannot tell whether a test actually exercises what its row claims. That
+part is the reviewer's job.
+
+## Matrix
+
+| B.5 matrix row | E2E test ID | file | doc section |
+|---|---|---|---|
+| **N1** — provision (nominal single-DC bring-up: realm, domain, marker) | `TestProvision` | `test/e2e/nominal_test.go` | pending (Phase 5) |
+| **N2** — Kerberos authentication (`kinit` against the realm's KDC) | `TestKerberosKinit` | `test/e2e/nominal_test.go` | pending (Phase 5) |
+| **N3** — Kerberized SMB (ticket-authenticated share access) | `TestKerberizedSMB` | `test/e2e/nominal_test.go` | pending (Phase 5) |
+| **N4** — NTLM authentication path | `TestNTLMAuth` | `test/e2e/nominal_test.go` | pending (Phase 5) |
+| **N5** — DNS SRV records served for the realm | `TestDNSSRVRecords` | `test/e2e/nominal_test.go` | pending (Phase 5) |
+| **N6** — LDAPS with certificate | `TestLDAPSCertificate` | `test/e2e/nominal_test.go` | pending (Phase 5) |
+| **N7** — signed-NTP wiring (MS-SNTP, `SAMBA_CHRONY`) | `TestSignedNTPWiring` | `test/e2e/nominal_test.go` | pending (Phase 5) |
+| **N8** — database consistency (`dbcheck`, maintenance mode) | `TestDBConsistency` | `test/e2e/nominal_test.go` | pending (Phase 5) |
+| **R1** — additional-DC join with bidirectional directory replication, verified by object propagation both ways | `TestJoinReplicationBothWays` | `test/e2e/replication_test.go` | pending (Phase 5) |
+| **O1** — idempotent restart without state loss | `TestIdempotentRestart` | `test/e2e/operational_test.go` | pending (Phase 5) |
+| **O2** — offline backup **and** restore into a fresh instance, with object-level verification | `TestOfflineBackupRestore` | `test/e2e/operational_test.go` | pending (Phase 5) |
+| **O3** — upgrade from the last published tag of the branch, data intact (§8.3) | `TestUpgradeFromLastPublished` | `test/e2e/operational_test.go` | pending (Phase 5) |
+| **O4** — explicit downgrade refusal | `TestDowngradeRefused` | `test/e2e/operational_test.go` | pending (Phase 5) |
+| **X1** — missing secret **file** fails fast with an actionable message | `TestMissingSecretFailsFast` | `test/e2e/negative_test.go` | pending (Phase 5) |
+| **X2** — secret offered as a plain environment variable refused (the “secret *file*” half of the same B.5 clause; runtime contract → *Environment variables*, §6.1) | `TestPlainEnvSecretRejected` | `test/e2e/negative_test.go` | pending (Phase 5) |
+| **X3** — provision over existing state refused | `TestProvisionOverStateRefused` | `test/e2e/negative_test.go` | pending (Phase 5) |
+| **X4** — run mode without state refused | `TestRunModeWithoutStateRefused` | `test/e2e/negative_test.go` | pending (Phase 5) |
+
+17 B.5 rows ↔ 17 tests.
+
+### Cross-cutting properties, deliberately not rows
+
+B.5 closes with “*all of the above executed on both architectures with
+the read-only rootfs configuration*”. That is a property **of every row**,
+not a row of its own, and it is enforced structurally rather than by a
+test of its own:
+
+- **Read-only rootfs + dropped capabilities** — every DC the suite starts
+  goes through `harness.StartDC`, which applies the constrained profile
+  (read-only root filesystem, `--cap-drop ALL` plus the established set,
+  `no-new-privileges`). No test can opt out, so there is nothing to
+  cover separately. The capability set itself is derived and recorded by
+  `test/capbisect/` (see B.5's neighbours in `docs/adaptation-profile.md`).
+- **Both architectures** — the CI `build` job is a matrix over `amd64`
+  and `arm64` native runners and runs the whole suite on each leg. The
+  architecture axis is a CI dimension, not a test.
+
+### Infrastructure tests (exempt from the matrix)
+
+Two functions in `test/e2e` match `^func Test` but are **not** B.5 rows,
+and `scripts/check-traceability.sh` exempts them by name. They must not
+appear in the table above:
+
+- `TestMain` (`test/e2e/main_test.go`) — the suite's entry point:
+  preflight (docker CLI + image under test present), leftover sweep, and
+  package-lifetime teardown. It asserts nothing about the product.
+- `TestHarnessSmoke` (`test/e2e/smoke_test.go`) — the harness's test of
+  *itself*: network creation, secret files, a constrained DC start, the
+  health wait, `samba-tool` exec, clean stop, test-client image. It
+  exists so that a broken harness fails as a harness failure instead of
+  as sixteen confusing product failures. Its subject is the test code,
+  not the image's documented behaviour.
+
+If a third infrastructure test is ever added, it goes in this list *and*
+in the script's exemption list — the script fails if an exempt name no
+longer names a real function, so the two cannot drift apart.
+
+## Known gaps
+
+None. Every B.5 row has a test.
+
+Two tests skip *loudly* under conditions the spec anticipates, which is a
+coverage caveat rather than a gap:
+
+- `TestUpgradeFromLastPublished` skips while `E2E_UPGRADE_FROM` is unset
+  — the first release of a branch has no published tag to upgrade from
+  (§8.3) — and skips again if the named tag ships the same Samba, where
+  there is no upgrade to observe. Both skips name the variable.
+- `TestJoinReplicationBothWays` refuses to start under a `go test`
+  deadline too short for it, rather than being killed mid-run.

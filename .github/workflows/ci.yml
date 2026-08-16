@@ -65,6 +65,14 @@ jobs:
           printf 'linting %d script(s)\n' "${#files[@]}"
           shellcheck "${files[@]}"
 
+      - name: Traceability
+        # SPEC §8.2/§10.6: docs/traceability.md and the E2E test functions
+        # must be the same set, in both directions. It lives in `lint`
+        # rather than in `build` because it reads two text files and needs
+        # neither Go nor docker — a mismatch is reported in seconds,
+        # before an hour of image builds.
+        run: sh scripts/check-traceability.sh
+
       - name: hadolint
         run: |
           mapfile -t dockerfiles < <(git ls-files '*Dockerfile*')
@@ -122,7 +130,14 @@ jobs:
     name: Build (${{ matrix.arch }})
     needs: [lint, unit]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # Image build (Samba is built from source) plus the full E2E suite.
+    # The suite alone takes ~8-15 min on a developer machine and is given
+    # `-timeout 45m` because it provisions domains, joins a second DC and
+    # waits for replication to converge; a runner is slower than a laptop
+    # and pulls the upgrade reference image over the network. 90 covered
+    # the build alone and would now cut the suite off mid-run, which is
+    # the one failure mode that leaves no readable result.
+    timeout-minutes: 120
     strategy:
       # Native runners per architecture: no QEMU, so an arch-specific
       # compile failure is reported by the leg that actually hit it.
@@ -230,3 +245,48 @@ jobs:
 
       - name: Package closure check
         run: sh scripts/check-image-packages.sh samba-ad-dc:ci
+
+      - name: Set up Go
+        # The E2E suite is a Go test binary, so this job needs a toolchain
+        # too — the same pinned action the `unit` job uses, resolved from
+        # the e2e module's own go.mod so the two modules can pick their
+        # toolchains independently.
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version-file: test/e2e/go.mod
+          # The e2e module has no external dependencies (and therefore no
+          # go.sum): there is nothing to cache, and pointing the cache at
+          # a file that does not exist fails the step.
+          cache: false
+
+      - name: Build test-client image
+        # The protocol client (kinit, smbclient, ldapsearch, dig, ntpdate)
+        # that drives the DC over the network. The harness builds it
+        # lazily on a developer machine; here it is a step of its own so a
+        # client-image failure is reported as one, and so it is not
+        # rebuilt inside the suite's own timeout.
+        run: docker build -t samba-ad-dc-e2e-client:ci test/client
+
+      - name: E2E suite
+        working-directory: test/e2e
+        env:
+          # The suite must never build or pull its own subject — it tests
+          # the image this job just built, by name.
+          E2E_IMAGE: samba-ad-dc:ci
+          E2E_CLIENT_IMAGE: samba-ad-dc-e2e-client:ci
+        run: |
+          # `-count=1` defeats the test cache: these tests talk to docker,
+          # so a cached PASS would be a statement about a previous run's
+          # containers. `-timeout 45m` is required, not decoration — the
+          # 10-minute default panics the process mid-suite, which skips
+          # every t.Cleanup and leaks containers, volumes and networks.
+          #
+          # Run from test/e2e (its own module, outside the image build's
+          # context) so the package pattern resolves without the
+          # workspace file.
+          #
+          # E2E_UPGRADE_FROM is deliberately unset: no tag of this branch
+          # is published yet, so TestUpgradeFromLastPublished skips loudly
+          # naming the variable (SPEC §8.3). Set it here as soon as the
+          # first tag exists.
+          go test ./... -v -timeout 45m -count=1

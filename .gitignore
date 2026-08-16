@@ -1,6 +1,12 @@
 # Go build outputs (entrypoint, e2e — from Phase 2 on)
 /entrypoint/entrypoint
 *.test
+# go.work is committed (it only names the two modules); go.work.sum is
+# not. It is a local resolution artifact of whichever toolchain last ran
+# a workspace-wide command, and committing it would let the workspace
+# override the modules' own go.sum files — the image build resolves
+# entrypoint/ alone and would never see it.
+go.work.sum
 # Local scratch
 *.log
 .DS_Store
