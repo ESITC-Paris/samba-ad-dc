@@ -495,6 +495,7 @@ type spec struct {
 	runArgs    []string
 	entrypoint string
 	cmd        []string
+	image      string
 }
 
 // WithVolumes reuses existing state and configuration volumes instead of
@@ -579,6 +580,58 @@ func WithEntrypoint(entrypoint string, argv ...string) Opt {
 	return func(s *spec) {
 		s.entrypoint = entrypoint
 		s.cmd = append([]string(nil), argv...)
+	}
+}
+
+// WithImage runs this container from a DIFFERENT image than the one under
+// test, in the same constrained profile.
+//
+// It exists for exactly one row of the B.5 matrix: the upgrade test has to
+// provision a volume with the LAST PUBLISHED image and then start the
+// candidate on it. Nothing else in the suite may use it — a test that
+// silently ran against another image would report a verdict about
+// something the build never produced.
+func WithImage(ref string) Opt {
+	return func(s *spec) { s.image = strings.TrimSpace(ref) }
+}
+
+// Volume creates an empty, harness-owned docker volume and returns its
+// name; removal is registered with t.Cleanup.
+//
+// StartDC creates the state and configuration volumes a DC needs on its
+// own, so this is only for the volumes that are not a DC's own state: the
+// one an offline backup writes its tarball into, and the empty pair a
+// restore is poured into before any container has ever run on them.
+func Volume(t *testing.T) string {
+	t.Helper()
+	name := UniqueName("e2e-vol")
+	mustDocker(t, "volume", "create", "--label", ownerLabelArg, name)
+	t.Cleanup(func() { removeOwned("volume", name) })
+	return name
+}
+
+// EnsureImage makes ref available locally, pulling it once if it is not.
+//
+// Preflight does this for the image under test, which the suite must never
+// build or fetch for itself — a suite that pulled its own subject could
+// report green about an image the build never produced. A reference image
+// named by the operator through E2E_UPGRADE_FROM is the opposite case: it
+// is an input, it is expected to come from a registry, and failing the
+// upgrade test with "no such image" would say nothing useful.
+func EnsureImage(t *testing.T, ref string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	_, code, err := dockerCmd(ctx, "image", "inspect", ref)
+	cancel()
+	if err == nil && code == 0 {
+		return
+	}
+	pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer pullCancel()
+	out, code, err := dockerCmd(pullCtx, "pull", ref)
+	if err != nil || code != 0 {
+		t.Fatalf("image %s is not present locally and cannot be pulled (exit %d): %v\n%s",
+			ref, code, err, strings.TrimSpace(out))
 	}
 }
 
@@ -715,7 +768,11 @@ func startDC(t *testing.T, net, name, mode string, env map[string]string, opts .
 	if s.entrypoint != "" {
 		args = append(args, "--entrypoint", s.entrypoint)
 	}
-	args = append(args, Image())
+	image := s.image
+	if image == "" {
+		image = Image()
+	}
+	args = append(args, image)
 	args = append(args, s.cmd...)
 
 	mustDocker(t, args...)
@@ -729,10 +786,22 @@ func startDC(t *testing.T, net, name, mode string, env map[string]string, opts .
 		StateVolume: s.stateVol,
 		ConfVolume:  s.confVol,
 	}
-	dc.IP = strings.TrimSpace(mustDocker(t, "inspect", "-f",
-		fmt.Sprintf("{{with index .NetworkSettings.Networks %q}}{{.IPAddress}}{{end}}", net), name))
-	if dc.IP == "" {
-		t.Fatalf("container %s has no address on network %s", name, net)
+	// The address and the state are read in ONE inspect on purpose. A
+	// container that has already finished has no address any more, and the
+	// one-off containers of the operational matrix — `samba-tool domain
+	// backup offline`, a marker edit through python3 — routinely exit
+	// before this line runs. Treating that as "no address on the network"
+	// would report a networking fault for a command that simply succeeded
+	// quickly. An address is therefore only *required* of a container that
+	// is still running, which is every container whose address a test can
+	// actually use; a DC that died on boot is diagnosed a moment later by
+	// WaitHealthy or RunDCExpectExit, with its logs attached.
+	out := strings.TrimSpace(mustDocker(t, "inspect", "-f",
+		fmt.Sprintf("{{with index .NetworkSettings.Networks %q}}{{.IPAddress}}{{end}}|{{.State.Status}}", net), name))
+	ip, status, _ := strings.Cut(out, "|")
+	dc.IP = strings.TrimSpace(ip)
+	if dc.IP == "" && strings.TrimSpace(status) == "running" {
+		t.Fatalf("container %s is running but has no address on network %s", name, net)
 	}
 	return dc, s
 }
