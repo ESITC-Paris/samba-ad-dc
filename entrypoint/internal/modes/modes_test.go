@@ -95,6 +95,14 @@ func matrix() []cell {
 			wantPlan: Plan{Kind: ActJoin},
 		},
 		{
+			// Both secrets mounted: joining an existing domain is the
+			// non-destructive reading, so join wins.
+			name:     "auto/absent/both admin and join creds -> join",
+			cfg:      cfgFor(config.ModeAuto, adminFile("/secrets/adminpass"), joinFile("/secrets/joinpass")),
+			obs:      absent(),
+			wantPlan: Plan{Kind: ActJoin},
+		},
+		{
 			name:     "auto/present/marker == image -> start",
 			cfg:      cfgFor(config.ModeAuto),
 			obs:      presentWith(imageVer),
@@ -154,6 +162,13 @@ func matrix() []cell {
 			wantCode:     config.CodeConfigError,
 			wantContains: []string{"SAMBA_REALM", "join"},
 		},
+		{
+			name:         "auto resolving to join with undotted realm -> refusal 10",
+			cfg:          cfgFor(config.ModeAuto, joinFile("/secrets/joinpass"), realm("EXAMPLE")),
+			obs:          absent(),
+			wantCode:     config.CodeConfigError,
+			wantContains: []string{"SAMBA_REALM", "AD.EXAMPLE.COM"},
+		},
 
 		// ---- provision -------------------------------------------------
 		{
@@ -168,6 +183,14 @@ func matrix() []cell {
 			obs:          presentWith(imageVer),
 			wantCode:     config.CodeStateExists,
 			wantContains: []string{"SAMBA_MODE=run", "delete"},
+		},
+		{
+			// An explicit mode is never overridden by the presence of the
+			// other mode's credentials.
+			name:     "provision/absent with join creds also present -> provision",
+			cfg:      cfgFor(config.ModeProvision, joinFile("/secrets/joinpass")),
+			obs:      absent(),
+			wantPlan: Plan{Kind: ActProvision},
 		},
 		{
 			name:         "provision/absent without admin password file -> refusal 10",
@@ -298,6 +321,23 @@ func matrix() []cell {
 			wantCode:     config.CodeDowngrade,
 			wantContains: []string{"5.0.0", imageVer, "restore"},
 		},
+		{
+			// The version guard applies to maintenance too: dbcheck --fix
+			// must not run against a database of unknown vintage.
+			name:         "maintenance/present/malformed marker version -> refusal 10",
+			cfg:          cfgFor(config.ModeMaintenance),
+			obs:          presentWith("4.24"),
+			wantCode:     config.CodeConfigError,
+			wantContains: []string{state.MarkerName, "samba_version", "delete"},
+		},
+		{
+			name:         "maintenance/present/no marker with malformed image version -> refusal 10",
+			cfg:          cfgFor(config.ModeMaintenance),
+			obs:          presentNoMarker(),
+			imageVersion: "not-a-version",
+			wantCode:     config.CodeConfigError,
+			wantContains: []string{"not-a-version", "image", "bug"},
+		},
 
 		// ---- degenerate inputs ------------------------------------------
 		{
@@ -344,6 +384,11 @@ func TestDecideMatrix(t *testing.T) {
 			if ref.Code != c.wantCode {
 				t.Fatalf("refusal code = %d, want %d (msg: %s)", ref.Code, c.wantCode, ref.Msg)
 			}
+			// Invariant: a refusal decides nothing. The zero Plan must
+			// never name an action — least of all provision.
+			if plan.Kind != ActNone {
+				t.Errorf("plan kind = %s alongside a refusal, want %s", plan.Kind, ActNone)
+			}
 			if plan != (Plan{}) {
 				t.Errorf("plan = %+v alongside a refusal, want the zero Plan", plan)
 			}
@@ -365,10 +410,22 @@ func TestDecideMatrix(t *testing.T) {
 	}
 }
 
+func TestZeroPlanDecidesNothing(t *testing.T) {
+	// The zero value of ActionKind must be "no decision", so a Plan that
+	// escaped a refusal path can never be executed as provision.
+	if (Plan{}).Kind != ActNone {
+		t.Errorf("Plan{}.Kind = %s, want %s", (Plan{}).Kind, ActNone)
+	}
+	if ActNone == ActProvision {
+		t.Errorf("ActNone must not share a value with ActProvision")
+	}
+}
+
 func TestActionKindString(t *testing.T) {
 	// The names appear in logs and in the §6.7 evidence, so they are part
 	// of the observable behavior.
 	want := map[ActionKind]string{
+		ActNone:             "none",
 		ActProvision:        "provision",
 		ActJoin:             "join",
 		ActStart:            "start",
@@ -386,21 +443,39 @@ func TestActionKindString(t *testing.T) {
 }
 
 func TestDecideIsPure(t *testing.T) {
-	// Same inputs, same answer; and the config is never mutated.
-	cfg := cfgFor(config.ModeAuto, func(c *config.Config) { c.JoinPasswordFile = "/secrets/joinpass" })
-	before := *cfg
+	// Every cell of the matrix, decided twice: same answer both times, and
+	// neither the config nor the observation is left modified.
+	for _, c := range matrix() {
+		t.Run(c.name, func(t *testing.T) {
+			img := c.imageVersion
+			if img == "" {
+				img = imageVer
+			}
+			before := *c.cfg
+			var markerBefore state.Marker
+			if c.obs.Marker != nil {
+				markerBefore = *c.obs.Marker
+			}
 
-	first, ref1 := Decide(cfg, absent(), imageVer)
-	second, ref2 := Decide(cfg, absent(), imageVer)
+			first, ref1 := Decide(c.cfg, c.obs, img)
+			second, ref2 := Decide(c.cfg, c.obs, img)
 
-	if ref1 != nil || ref2 != nil {
-		t.Fatalf("unexpected refusals: %v / %v", ref1, ref2)
-	}
-	if first != second {
-		t.Errorf("Decide is not deterministic: %+v then %+v", first, second)
-	}
-	if *cfg != before {
-		t.Errorf("Decide mutated the config: %+v, want %+v", *cfg, before)
+			if first != second {
+				t.Errorf("Decide is not deterministic: %+v then %+v", first, second)
+			}
+			switch {
+			case (ref1 == nil) != (ref2 == nil):
+				t.Errorf("Decide refused inconsistently: %v then %v", ref1, ref2)
+			case ref1 != nil && *ref1 != *ref2:
+				t.Errorf("refusal differs between runs: %+v then %+v", *ref1, *ref2)
+			}
+			if *c.cfg != before {
+				t.Errorf("Decide mutated the config: %+v, want %+v", *c.cfg, before)
+			}
+			if c.obs.Marker != nil && *c.obs.Marker != markerBefore {
+				t.Errorf("Decide mutated the marker: %+v, want %+v", *c.obs.Marker, markerBefore)
+			}
+		})
 	}
 }
 

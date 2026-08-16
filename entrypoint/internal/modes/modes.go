@@ -18,11 +18,15 @@ import (
 // ActionKind is what the entrypoint must do next.
 type ActionKind int
 
-// The possible actions. Provision and join initialize the volume and then
-// start the daemons; start only starts them; dbcheck-then-start covers both
-// the upgrade and the adoption path; maintenance never starts a daemon.
+// The possible actions. ActNone is the zero value on purpose: a Plan that was
+// never decided (every refusal path returns Plan{}) must not read as
+// "provision", which is the one action that destroys nothing only because
+// there is nothing there yet. Provision and join initialize the volume and
+// then start the daemons; start only starts them; dbcheck-then-start covers
+// both the upgrade and the adoption path; maintenance never starts a daemon.
 const (
-	ActProvision        ActionKind = iota // then start daemons
+	ActNone             ActionKind = iota // no decision (refusal)
+	ActProvision                          // then start daemons
 	ActJoin                               // then start daemons
 	ActStart                              // start daemons only
 	ActDBCheckThenStart                   // upgrade or adoption path
@@ -32,6 +36,8 @@ const (
 // String renders an ActionKind for logs and test failures.
 func (k ActionKind) String() string {
 	switch k {
+	case ActNone:
+		return "none"
 	case ActProvision:
 		return "provision"
 	case ActJoin:
@@ -190,6 +196,12 @@ func guardNotNewer(obs state.Observation, imageVersion string) *config.Refusal {
 // compare orders the marker version against the image version, turning the
 // two possible parse failures into their own refusals: a corrupt marker is an
 // operator problem, an unparsable image version is a build bug.
+//
+// When both are unparsable the marker message wins. That is deliberate: the
+// marker is the half the operator can act on (restore or delete it), and a
+// broken image version is reported by every other run of this image anyway,
+// including the marker-less adoption path where checkImageVersion is the only
+// check that runs.
 func compare(markerVersion, imageVersion string) (int, *config.Refusal) {
 	if ref := checkMarkerVersion(markerVersion); ref != nil {
 		return 0, ref
