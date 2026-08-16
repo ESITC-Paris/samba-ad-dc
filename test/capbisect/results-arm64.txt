@@ -1,0 +1,103 @@
+capability bisection report
+===========================
+
+date (UTC)     : 2026-08-16T13:15:50Z
+architecture   : arm64 (Darwin arm64)
+image          : samba-ad-dc:dev
+image digest   : sha256:198e52c9896718a6bcf273f58ab1d092800fbb63aa18a8a8b1d4e4862f27fb3e
+docker server  : 29.7.2
+subset         : go test -run 'TestProvision$|TestKerberosKinit|TestIdempotentRestart'
+per-run timeout: 40m
+ip_unpriv_port_start (inside a container of this image): 0
+
+method: baseline with the harness default set, then one run per
+capability with that capability removed, then one run with only
+the capabilities the drop-one phase proved required. Every run is
+the same subset against the same image; the only variable is
+E2E_CAPS. cap_drop ALL is the floor in all of them.
+
+default set under test (harness.DefaultCaps):
+  SYS_ADMIN
+  NET_BIND_SERVICE
+  CHOWN
+  FOWNER
+  DAC_OVERRIDE
+  SETUID
+  SETGID
+
+verdicts
+--------
+  SYS_ADMIN          REQUIRED    ERROR(runtime): uncaught exception - (3221225506, '{Access Denied} A process has requested acces
+  NET_BIND_SERVICE   DROPPABLE   suite passes without it
+  CHOWN              REQUIRED    INTERNAL ERROR: Security context active token stack underflow! in  () () pid 15 (4.24.6)
+  FOWNER             REQUIRED    ERROR(runtime): uncaught exception - (3221225506, '{Access Denied} A process has requested acces
+  DAC_OVERRIDE       DROPPABLE   suite passes without it
+  SETUID             REQUIRED    /usr/sbin/smbd: INTERNAL ERROR: failed to set uid
+  SETGID             REQUIRED    /usr/sbin/smbd: INTERNAL ERROR: sys_setgroups failed in smbd () () pid 24 (4.24.6)
+  DAC_READ_SEARCH    NOT NEEDED  absent from the verified minimal set, which passes
+
+verify-minimal : pass (measured directly)
+
+MEASURED MINIMAL SET
+--------------------
+  SYS_ADMIN
+  CHOWN
+  FOWNER
+  SETUID
+  SETGID
+
+  as E2E_CAPS: SYS_ADMIN,CHOWN,FOWNER,SETUID,SETGID
+
+PRIVILEGED-PORT CROSS-CHECK
+---------------------------
+  Docker sets net.ipv4.ip_unprivileged_port_start=0 in the network
+  namespace it creates for a container, which makes 53/88/389/445
+  unprivileged there. Under the E2E suite (a user-defined bridge)
+  NET_BIND_SERVICE therefore measures droppable no matter what the
+  image needs. SPEC B.3 also supports HOST networking, where the
+  container inherits the host's value — 1024 on any ordinary Linux
+  system. The probe below forces the floor back to 1024 and binds
+  :389 in this image, with the capability and without it:
+
+    without NET_BIND_SERVICE : denied
+    with    NET_BIND_SERVICE : bound
+
+  => NET_BIND_SERVICE is REQUIRED wherever the port floor is at the
+     kernel default. Its 'droppable' verdict above is a property of
+     the test runtime, not of the image, and it is RETAINED in the
+     shipped profile.
+
+RECOMMENDED PROFILE SET (what harness.DefaultCaps and B.2 carry)
+----------------------------------------------------------------
+  SYS_ADMIN
+  NET_BIND_SERVICE
+  CHOWN
+  FOWNER
+  SETUID
+  SETGID
+
+  = the measured minimal set, plus any capability the cross-check
+    proved necessary outside the suite's reach.
+
+recorded, not measured
+----------------------
+  CAP_KILL      NOT APPLICABLE  chronyd runs as root in this image
+                                (B.6), so no privilege-dropping
+                                child has to be signalled across a
+                                uid boundary. CAP_KILL is the named
+                                alternative IF chronyd is ever made
+                                to drop privileges; while it does
+                                not, there is nothing to measure.
+
+timings
+-------
+  baseline               42s
+  drop SYS_ADMIN         11s
+  drop NET_BIND_SERVICE  42s
+  drop CHOWN             11s
+  drop FOWNER            10s
+  drop DAC_OVERRIDE      41s
+  drop SETUID            493s
+  drop SETGID            15s
+  verify-minimal         41s
+  total                  708s

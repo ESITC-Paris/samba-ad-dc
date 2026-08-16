@@ -1,0 +1,97 @@
+name: Capability bisection
+
+# Manual only, and deliberately so. This workflow does not verify a change:
+# it MEASURES a property of the image — the minimal Linux capability set the
+# domain controller needs (SPEC §5.2, adaptation-profile B.2) — by running
+# the E2E smoke subset once per capability with that capability taken away.
+# That is roughly seven full provisions per architecture, so it is an hour
+# of runner time per leg and has no business running on every push. It is
+# run when the capability set is in question: a new Samba major, a change to
+# what the entrypoint does at boot, or a review that asks "is SYS_ADMIN
+# really needed?".
+#
+# Its output is a report artifact, not a commit. The findings are applied to
+# docs/adaptation-profile.md B.2 by a pull request that cites the run.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two legs of this workflow measure the same thing on two kernels, which is
+# the point; two RUNS of it would only compete for runners. A second dispatch
+# waits for the first rather than cancelling it — a bisection killed halfway
+# produces a report with holes in it, which is worse than a late report.
+concurrency:
+  group: "capbisect-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  bisect:
+    name: Bisect (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # The job budget covers a cold image build (ci.yml budgets 90 minutes for
+    # exactly that step) plus the bisection. The 60-minute budget that bounds
+    # the measurement itself is on the bisection step, where it belongs: a
+    # bisection that overruns must fail as a bisection, not as "the job ran
+    # out of time somewhere".
+    timeout-minutes: 180
+    strategy:
+      # Native runners per architecture. This is not a formality here: a
+      # capability check is kernel code, and "is SYS_ADMIN required" is a
+      # question two architectures may legitimately answer differently.
+      # fail-fast off so one arch's answer is never lost to the other's.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version-file: test/e2e/go.mod
+          # The suite has no third-party dependencies and therefore no
+          # go.sum; setup-go's cache wants one and warns without it.
+          cache: false
+
+      - name: Build image
+        run: |
+          # Same build the CI build job does, including the package-index
+          # hash from the catalog: the capability verdicts are statements
+          # about a specific image, so it has to be built the specific way.
+          pkg_index_hash=$(sh scripts/check-pins-consistency.sh --print pkg_index_hash)
+          echo "pkg_index_hash=${pkg_index_hash}"
+          docker build \
+            --build-arg "PKG_INDEX_HASH=${pkg_index_hash}" \
+            -t samba-ad-dc:dev .
+
+      - name: Build test client
+        run: |
+          # The harness builds this itself on first use; doing it here keeps
+          # the build out of the first run's timing, which would otherwise
+          # make the baseline look slower than every run after it.
+          docker build -t samba-ad-dc-e2e-client:dev test/client
+
+      - name: Bisect
+        timeout-minutes: 60
+        run: sh test/capbisect/bisect.sh
+
+      - name: Upload report
+        # Runs even when the bisection failed: a bisection that aborted
+        # midway still wrote the verdicts it had reached, and those are the
+        # first thing anyone debugging the failure will want.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: capbisect-report-${{ matrix.arch }}
+          path: |
+            test/capbisect/capbisect-report-*.txt
+            test/capbisect/results-*.txt
+          if-no-files-found: error
+          retention-days: 90

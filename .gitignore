@@ -8,3 +8,8 @@
 docker-compose.override.yml
 # SDD controller scratch (plans' working artifacts, never committed)
 .superpowers/
+# Capability-bisection output. The dated report is what a run emits and
+# what CI uploads as an artifact; the committed record of a run is the
+# stable copy next to it (test/capbisect/results-<arch>.txt), so the dated
+# file would only ever be a duplicate in the history.
+/test/capbisect/capbisect-report-*.txt

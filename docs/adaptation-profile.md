@@ -47,11 +47,52 @@ them.
 
 - **§5.2 non-root: impossible.** The AD DC writes extended attributes in
   the `security.*` namespace, which requires `CAP_SYS_ADMIN`; it binds
-  privileged ports (53, 88, 389, 445, 464, 636). Mitigation: minimal
-  capability set instead of `--privileged`, established by CI capability
-  bisection (working hypothesis: SYS_ADMIN, NET_BIND_SERVICE, CHOWN,
-  FOWNER, DAC_OVERRIDE, SETUID, SETGID; candidates to bisect include
-  DAC_READ_SEARCH), with `cap_drop: ALL` as the baseline in every example.
+  privileged ports (53, 88, 389, 445, 464, 636). Mitigation: a minimal
+  capability set instead of `--privileged`, with `cap_drop: ALL` as the
+  baseline in every example. The set is
+
+  ```
+  SYS_ADMIN  NET_BIND_SERVICE  CHOWN  FOWNER  SETUID  SETGID
+  ```
+
+  **established by capability bisection** — local arm64, 2026-08-16,
+  image digest
+  `sha256:198e52c9896718a6bcf273f58ab1d092800fbb63aa18a8a8b1d4e4862f27fb3e`,
+  driver `test/capbisect/bisect.sh`, report
+  `test/capbisect/results-arm64.txt`. **CI confirmation on both
+  architectures is pending the first run of
+  `.github/workflows/capbisect.yml`** (`workflow_dispatch`; it cannot run
+  before the repository has a GitHub remote). This is no longer a
+  hypothesis: each capability was removed from a real run of the E2E
+  smoke subset (provision, `kinit`, restart) against that image, and what
+  broke is what makes it "required". `test/e2e/harness.DefaultCaps`
+  carries exactly this list, so every E2E run re-proves that the set is
+  sufficient.
+
+  | capability | verdict | what removing it does |
+  | --- | --- | --- |
+  | `SYS_ADMIN` | required | provision aborts in `setntacl` → `smbd.set_nt_acl` — the `security.NTACL` xattr on sysvol cannot be written |
+  | `CHOWN` | required | provision aborts, `INTERNAL ERROR: Security context active token stack underflow` |
+  | `FOWNER` | required | provision aborts, `ERROR(runtime): uncaught exception - (3221225506, '{Access Denied} ...')` |
+  | `SETUID` | required | `smbd: INTERNAL ERROR: failed to set uid`; SYSVOL/NETLOGON are never exported and the container never turns healthy |
+  | `SETGID` | required | `smbd: INTERNAL ERROR: sys_setgroups failed`, samba exits |
+  | `NET_BIND_SERVICE` | droppable **under the suite** — **retained** | see below |
+  | `DAC_OVERRIDE` | droppable — **removed** | was in the pre-bisection hypothesis; the suite passes without it. Every process in the container runs as uid 0 over paths the entrypoint has already chowned to itself, so no discretionary check is left to override |
+  | `DAC_READ_SEARCH` | not needed | the candidate named by the previous hypothesis; the verified minimal set passes without it |
+  | `CAP_KILL` | not applicable | recorded, not measured: chronyd runs as root (B.6), so nothing has to be signalled across a uid boundary. It becomes measurable only if chronyd is made to drop privileges |
+
+  **`NET_BIND_SERVICE` is the one entry the E2E suite cannot decide, and
+  it is kept deliberately.** Docker sets
+  `net.ipv4.ip_unprivileged_port_start=0` in the network namespace it
+  creates for a container, so 53/88/389/445 are not privileged there and
+  the suite — which runs on a user-defined bridge — passes without the
+  capability no matter what the image needs. B.3 also supports **host
+  networking**, where the container inherits the host's floor: 1024 on
+  any ordinary Linux system. Measured directly (same report): with the
+  floor forced back to 1024, a `bind()` of :389 inside this image is
+  *denied* without the capability and *succeeds* with it. Dropping it
+  would leave the suite green and the documented deployment broken, so it
+  stays — and the reason it stays is a measurement, not caution.
 - **§5.6 read-only rootfs: supported and CI-proven.** Writable paths:
   `/var/lib/samba` (persistent volume: directory database, Kerberos
   secrets, sysvol, TLS material, NTP signing socket), `/etc/samba`
@@ -145,10 +186,17 @@ with the read-only rootfs configuration.
   contract is the **Runtime contract** section below.
 
 - **chronyd runs as root inside the container** (SIGTERM delivery without
-  `CAP_KILL`; ntp_signd socket access). **REVISIT at the Phase 3
-  capability bisection:** the alternative is `CAP_KILL` in the capability
-  set plus signing-socket group permissions; `TestSignedNTPWiring` is the
-  acceptance test either way.
+  `CAP_KILL`; ntp_signd socket access). The alternative is `CAP_KILL` in
+  the capability set plus signing-socket group permissions;
+  `TestSignedNTPWiring` is the acceptance test either way. **REVISIT
+  reached and closed (Phase 3 capability bisection, 2026-08-16):** the
+  ruling stands unchanged, and `CAP_KILL` is recorded in B.2 as *not
+  applicable* rather than measured. There is nothing to bisect while
+  chronyd is root — a capability that governs signalling across a uid
+  boundary cannot be shown necessary or unnecessary by a configuration
+  that never crosses one. Making chronyd drop privileges is what would
+  turn `CAP_KILL` into a measurable question, and that change would come
+  with its own bisection run.
 
 - **Sysvol replication is not provided by Samba** (no DFS-R): with
   multiple DCs, group policy content does not replicate by itself. An
@@ -468,3 +516,25 @@ it is harmless: Kerberos falls back to its built-in defaults.
   two boot logs shows no other difference; the DC reached healthy in both.
   The E2E harness starts every DC container with that tmpfs, so the
   three-path writable set is now proven on every run.
+- 2026-08-16: Phase 3 — **the B.2 capability set stops being a hypothesis
+  and becomes a measurement.** `test/capbisect/bisect.sh` re-runs the E2E
+  smoke subset (provision, `kinit`, restart) once per capability with that
+  capability removed, then re-runs it with only the ones that proved
+  required; report in `test/capbisect/results-arm64.txt` (local arm64,
+  image digest `sha256:198e52c9…`). Two changes to what the profile said:
+  `DAC_OVERRIDE` leaves the set (the suite passes without it — everything
+  runs as uid 0 over paths the entrypoint already chowned to itself), and
+  `DAC_READ_SEARCH`, previously carried as a candidate to bisect, is
+  recorded as not needed. `NET_BIND_SERVICE` measured droppable and was
+  **kept anyway**, on evidence rather than caution: docker sets
+  `net.ipv4.ip_unprivileged_port_start=0` in a container's network
+  namespace, so the suite could never need it, while a `bind()` of :389 in
+  this image with the floor back at the kernel default is denied without
+  the capability and succeeds with it — and B.3 supports host networking,
+  where that floor is the host's. The B.6 REVISIT on root-chronyd is
+  closed with the ruling unchanged: `CAP_KILL` is not applicable while
+  chronyd does not drop privileges, so it is recorded rather than
+  measured. `harness.DefaultCaps` now carries the established set, so
+  every E2E run re-proves its sufficiency. CI confirmation on both
+  architectures awaits the first `workflow_dispatch` run of
+  `.github/workflows/capbisect.yml`.

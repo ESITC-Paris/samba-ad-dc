@@ -103,16 +103,36 @@ const (
 )
 
 // DefaultCaps is THE capability set under test — the single place the
-// whole suite reads it from. It is the working hypothesis recorded in
-// adaptation-profile B.2; the capability-bisection driver narrows it by
-// re-running the suite with the E2E_CAPS override, so this list and that
-// override are the only two inputs to what a DC container gets.
+// whole suite reads it from, and the set adaptation-profile B.2
+// documents. It is no longer a hypothesis: every entry below was
+// MEASURED by test/capbisect/bisect.sh, which re-runs the smoke subset
+// once per capability with that capability taken away (report:
+// test/capbisect/results-arm64.txt, arm64, 2026-08-16).
+//
+// Five of the six are required because the image visibly breaks without
+// them — the failure each removal produces is quoted in B.2. The sixth,
+// NET_BIND_SERVICE, is the one this suite CANNOT measure: docker sets
+// net.ipv4.ip_unprivileged_port_start=0 in the network namespace it
+// creates, so no port is privileged inside a container on a bridge and
+// the suite passes without the capability. It is kept because the
+// bisection's separate port probe shows a bind of :389 in this image
+// being denied without it once the floor is back at the kernel default
+// — which is the floor a container gets under the host networking SPEC
+// B.3 supports. Dropping it here would make the suite green and the
+// documented deployment broken.
+//
+// DAC_OVERRIDE was in the pre-bisection hypothesis and is NOT here: the
+// suite passes without it, because everything in the container runs as
+// uid 0 over paths the entrypoint has already chowned to itself, so
+// there is no discretionary check left to override.
+//
+// E2E_CAPS overrides this list; the two are the only inputs to what a DC
+// container gets.
 var DefaultCaps = []string{
 	"SYS_ADMIN",
 	"NET_BIND_SERVICE",
 	"CHOWN",
 	"FOWNER",
-	"DAC_OVERRIDE",
 	"SETUID",
 	"SETGID",
 }
