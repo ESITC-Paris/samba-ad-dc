@@ -55,8 +55,14 @@ them.
 - **§5.6 read-only rootfs: supported and CI-proven.** Writable paths:
   `/var/lib/samba` (persistent volume: directory database, Kerberos
   secrets, sysvol, TLS material, NTP signing socket), `/etc/samba`
-  (persistent volume: generated configuration), `/run` and `/tmp`
-  (tmpfs). No writes under `/etc` at runtime.
+  (persistent volume: generated configuration), `/run`, `/tmp` and
+  `/var/cache/samba` (tmpfs). No writes under `/etc` at runtime.
+  `/var/cache/samba` holds winbindd's `netsamlogon_cache.tdb`, which it
+  opens on every boot: a tmpfs is the right answer because the content is
+  a pure cache that must not survive a restart, and without it every
+  start logs three `tdb_open_log`/`netsamlogon_cache_init` failures
+  (measured: with the tmpfs those three lines disappear and nothing else
+  in the boot log changes).
   Nothing may be baked into the image at those paths: a volume or tmpfs
   mount hides whatever the image holds there, so the entrypoint creates
   the runtime directories itself on every boot — `/run/samba`,
@@ -381,3 +387,11 @@ signing; 123/udp is exposed. `SAMBA_CHRONY=off` runs the DC without it.
   exact refusal-message shape (one line, cause then remedy, `;`-separated)
   and the statement that the §7.2 version guards apply in maintenance mode
   too.
+- 2026-08-16: Phase 3 — B.2 writable paths gain tmpfs `/var/cache/samba`,
+  resolving the Phase 2 hand-off about winbindd's `netsamlogon_cache`
+  under a read-only rootfs. Decided by A/B provision on the constrained
+  profile (arm64, local): without the tmpfs the boot log carries three
+  `netsamlogon_cache` failures, with it zero, and a normalized diff of the
+  two boot logs shows no other difference; the DC reached healthy in both.
+  The E2E harness starts every DC container with that tmpfs, so the
+  three-path writable set is now proven on every run.

@@ -1,0 +1,16 @@
+// The repository holds two Go modules that are deliberately separate:
+// `entrypoint` ships inside the image, `test/e2e` drives it from outside
+// and must never add a dependency to it. This workspace exists only so
+// editors, gopls and repo-root commands (`go vet ./entrypoint/...
+// ./test/e2e/...`) see both at once without an editor reconfiguration
+// per directory.
+//
+// It is invisible to the image build: the Dockerfile's gobuild stage
+// COPYs `entrypoint/` alone, so this file is not in its context and the
+// in-image build keeps resolving the entrypoint module on its own.
+go 1.24.0
+
+use (
+	./entrypoint
+	./test/e2e
+)

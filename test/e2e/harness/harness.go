@@ -1,0 +1,660 @@
+// Package harness drives the samba-ad-dc image through the docker CLI.
+//
+// The CLI — not the Docker SDK — is the interface used deliberately: it is
+// the stable, always-present surface on every CI runner, and what the
+// operator documentation tells people to type. Every container this
+// package starts runs the *constrained profile* of the adaptation profile
+// (SPEC Annex B.2): read-only rootfs, tmpfs for the writable runtime
+// paths, `--cap-drop ALL` plus the minimal capability set. Nothing here
+// ever uses `--privileged` (§5.2), and the profile is therefore proven on
+// every single E2E run rather than asserted in prose.
+package harness
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// The domain under test. Realm and domain are throwaway names in the
+// reserved-by-convention `.test` TLD (RFC 6761) so nothing here can
+// collide with, or leak into, a real directory.
+const (
+	// Realm is the Kerberos realm / AD DNS domain the suite provisions.
+	Realm = "AD.E2E.TEST"
+	// Domain is the NetBIOS domain name.
+	Domain = "E2E"
+	// AdminPassword is a THROWAWAY test literal, deliberately in the
+	// repository: it only ever protects a container that is destroyed at
+	// the end of the test that created it. It never reaches an
+	// environment variable of a DC container — the harness writes it to a
+	// file and mounts it, because the image accepts secrets through
+	// `*_FILE` variables only (§6.1).
+	AdminPassword = "E2ePassw0rd!"
+)
+
+// DefaultImage is the image under test unless E2E_IMAGE overrides it.
+const DefaultImage = "samba-ad-dc:dev"
+
+// Timeouts. Generous on purpose: a first-boot provision on a cold volume
+// legitimately takes minutes, and CI runners are slower than a laptop.
+const (
+	// HealthTimeout is the default budget for reaching `healthy`. The
+	// image's healthcheck has a 180 s start period, so anything shorter
+	// than that would only ever measure the start period.
+	HealthTimeout = 5 * time.Minute
+	// ExitTimeout is how long RunDCExpectExit waits for a container that
+	// is expected to terminate on its own.
+	ExitTimeout = 5 * time.Minute
+	// ExecTimeout bounds a single `docker exec`.
+	ExecTimeout = 2 * time.Minute
+	// dockerTimeout bounds the short bookkeeping commands (inspect, rm,
+	// volume create) that should answer immediately or not at all.
+	dockerTimeout = 60 * time.Second
+)
+
+// DefaultCaps is THE capability set under test — the single place the
+// whole suite reads it from. It is the working hypothesis recorded in
+// adaptation-profile B.2; the capability-bisection driver narrows it by
+// re-running the suite with the E2E_CAPS override, so this list and that
+// override are the only two inputs to what a DC container gets.
+var DefaultCaps = []string{
+	"SYS_ADMIN",
+	"NET_BIND_SERVICE",
+	"CHOWN",
+	"FOWNER",
+	"DAC_OVERRIDE",
+	"SETUID",
+	"SETGID",
+}
+
+// DefaultTmpfs is the writable-path set mounted as tmpfs on top of the
+// read-only rootfs, matching adaptation-profile B.2. `/var/lib/samba` and
+// `/etc/samba` are persistent volumes instead and are handled separately.
+//
+// `/var/cache/samba` is here because winbindd opens its netsamlogon cache
+// there on every boot and a read-only rootfs turns that into three lines
+// of error on every single start (evidence: task-1 report). It holds a
+// pure cache — nothing there needs to survive a restart — so a tmpfs is
+// the correct answer rather than a volume.
+var DefaultTmpfs = []string{"/run", "/tmp", "/var/cache/samba"}
+
+// Image returns the DC image under test.
+func Image() string {
+	if v := strings.TrimSpace(os.Getenv("E2E_IMAGE")); v != "" {
+		return v
+	}
+	return DefaultImage
+}
+
+// Caps returns the capability set every DC container is started with.
+//
+// E2E_CAPS overrides it with a comma-separated list; an E2E_CAPS that is
+// set but empty means *no* capabilities beyond the dropped-all baseline,
+// which is what the bisection driver needs to express.
+func Caps() []string {
+	v, ok := os.LookupEnv("E2E_CAPS")
+	if !ok {
+		return append([]string(nil), DefaultCaps...)
+	}
+	var caps []string
+	for _, c := range strings.Split(v, ",") {
+		if c = strings.ToUpper(strings.TrimSpace(c)); c != "" {
+			caps = append(caps, c)
+		}
+	}
+	return caps
+}
+
+// FQDN returns the fully qualified name a container called name answers
+// to inside the test network.
+func FQDN(name string) string {
+	return name + "." + strings.ToLower(Realm)
+}
+
+// BaseDN returns the realm as a directory naming context — the form
+// samba's own tooling reports, e.g. "DC=ad,DC=e2e,DC=test".
+func BaseDN() string {
+	labels := strings.Split(strings.ToLower(Realm), ".")
+	for i, l := range labels {
+		labels[i] = "DC=" + l
+	}
+	return strings.Join(labels, ",")
+}
+
+// Preflight checks the two things the suite cannot create for itself.
+// TestMain calls it once; a failure here beats every test failing with an
+// obscure docker error.
+func Preflight() error {
+	if _, err := exec.LookPath("docker"); err != nil {
+		return errors.New("the docker CLI is not on PATH; install docker and retry")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+
+	if out, code, err := dockerCmd(ctx, "version", "--format", "{{.Server.Version}}"); err != nil || code != 0 {
+		return fmt.Errorf("the docker daemon is not reachable: %s", firstLine(out))
+	}
+	if _, code, err := dockerCmd(ctx, "image", "inspect", Image()); err != nil || code != 0 {
+		return fmt.Errorf("image %s not found; build the image first: docker build -t %s .",
+			Image(), DefaultImage)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------
+// docker plumbing
+// ---------------------------------------------------------------------
+
+// dockerCmd runs the docker CLI and returns its combined output and exit
+// code. A non-nil error means docker could not be run (or the context
+// expired) — a container that merely exited non-zero is reported through
+// the code, not through the error.
+func dockerCmd(ctx context.Context, args ...string) (string, int, error) {
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	out := buf.String()
+	switch {
+	case err == nil:
+		return out, 0, nil
+	case ctx.Err() != nil:
+		return out, -1, fmt.Errorf("docker %s: %w", strings.Join(args, " "), ctx.Err())
+	default:
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return out, ee.ExitCode(), nil
+		}
+		return out, -1, fmt.Errorf("docker %s: %w", strings.Join(args, " "), err)
+	}
+}
+
+// mustDocker runs a docker command that has no business failing.
+func mustDocker(t *testing.T, args ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+	out, code, err := dockerCmd(ctx, args...)
+	if err != nil {
+		t.Fatalf("docker %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	if code != 0 {
+		t.Fatalf("docker %s: exit %d\n%s", strings.Join(args, " "), code, out)
+	}
+	return out
+}
+
+// quietDocker runs a best-effort cleanup command; failures are ignored on
+// purpose (the object may already be gone).
+func quietDocker(args ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+	_, _, _ = dockerCmd(ctx, args...)
+}
+
+var nameSeq atomic.Uint64
+
+// uniq builds a name that cannot collide with a parallel or previous run.
+func uniq(prefix string) string {
+	return fmt.Sprintf("%s-%d-%d", prefix, os.Getpid(), nameSeq.Add(1))
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------
+// network, secrets
+// ---------------------------------------------------------------------
+
+// Network creates a user-defined bridge network with its own /24 and
+// returns its name; removal is registered with t.Cleanup.
+//
+// This topology is CI-only and does not contradict B.3. What B.3 forbids
+// is NAT between domain members and the DC — a user-defined bridge gives
+// the containers direct L2/L3 reachability to each other with no address
+// translation, which is exactly the property the DC needs. Production
+// documentation still mandates macvlan/ipvlan or host networking, because
+// there the members live outside the docker host.
+func Network(t *testing.T) string {
+	t.Helper()
+	name := uniq("e2e-net")
+	// Pick a /24 out of a private range that docker's default pool does
+	// not hand out, retrying on the (rare) collision with a leftover.
+	start := rand.Intn(200) //nolint:gosec // test fixture, not cryptography
+	var last string
+	for i := 0; i < 32; i++ {
+		subnet := fmt.Sprintf("172.28.%d.0/24", (start+i)%200)
+		ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+		out, code, err := dockerCmd(ctx, "network", "create",
+			"--driver", "bridge", "--subnet", subnet, name)
+		cancel()
+		if err == nil && code == 0 {
+			t.Cleanup(func() { quietDocker("network", "rm", name) })
+			return name
+		}
+		last = out
+	}
+	t.Fatalf("could not create a test network after 32 subnet attempts: %s", strings.TrimSpace(last))
+	return ""
+}
+
+// Secret writes value to a file in the test's temporary directory and
+// returns its host path, ready to be bind-mounted into a container.
+//
+// The file is world-readable on purpose: it is bind-mounted into a
+// container whose capability set is under test, and a 0600 file owned by
+// the host user would make an unrelated capability (DAC_OVERRIDE) a
+// prerequisite for reading it — which would corrupt the bisection.
+func Secret(t *testing.T, value string) (hostPath string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte(value), 0o644); err != nil { //nolint:gosec // throwaway test secret, see doc comment
+		t.Fatalf("writing secret file: %v", err)
+	}
+	return path
+}
+
+// ---------------------------------------------------------------------
+// DC containers
+// ---------------------------------------------------------------------
+
+// DC describes a started DC container.
+type DC struct {
+	Name        string // container name (and its short DNS name on the network)
+	IP          string // its address on the test network
+	Realm       string // the realm it serves
+	FQDN        string // <name>.<realm in lower case>
+	Network     string // the network it is attached to
+	Mode        string // the SAMBA_MODE it was started in
+	StateVolume string // volume backing /var/lib/samba
+	ConfVolume  string // volume backing /etc/samba
+}
+
+// Opt customizes a DC container before it is started.
+type Opt func(*spec)
+
+type spec struct {
+	hostname   string
+	aliases    []string
+	env        map[string]string
+	binds      []string
+	stateVol   string
+	confVol    string
+	ownVolumes bool
+	caps       []string
+	tmpfs      []string
+	dns        []string
+	ip         string
+	runArgs    []string
+	entrypoint string
+	cmd        []string
+}
+
+// WithVolumes reuses existing state and configuration volumes instead of
+// creating fresh ones — the way an operator restarts a DC. The harness
+// does not remove volumes it did not create.
+func WithVolumes(state, conf string) Opt {
+	return func(s *spec) {
+		s.stateVol, s.confVol, s.ownVolumes = state, conf, false
+	}
+}
+
+// WithBind adds a host bind mount.
+func WithBind(hostPath, containerPath string, readOnly bool) Opt {
+	return func(s *spec) {
+		m := hostPath + ":" + containerPath
+		if readOnly {
+			m += ":ro"
+		}
+		s.binds = append(s.binds, m)
+	}
+}
+
+// WithSecret mounts hostPath read-only at /run/secrets/<name> and points
+// envVar at it — the `*_FILE` convention the image mandates (§6.1).
+func WithSecret(envVar, name, hostPath string) Opt {
+	return func(s *spec) {
+		containerPath := "/run/secrets/" + name
+		s.binds = append(s.binds, hostPath+":"+containerPath+":ro")
+		s.env[envVar] = containerPath
+	}
+}
+
+// AdminSecret mounts the throwaway Administrator password and points
+// SAMBA_ADMIN_PASSWORD_FILE at it. Tests that must *not* get a secret
+// (the negative matrix) simply do not pass this option.
+func AdminSecret(t *testing.T) Opt {
+	t.Helper()
+	return WithSecret("SAMBA_ADMIN_PASSWORD_FILE", "admin-password", Secret(t, AdminPassword))
+}
+
+// JoinSecret mounts the throwaway join-account password and points
+// SAMBA_JOIN_PASSWORD_FILE at it.
+func JoinSecret(t *testing.T) Opt {
+	t.Helper()
+	return WithSecret("SAMBA_JOIN_PASSWORD_FILE", "join-password", Secret(t, AdminPassword))
+}
+
+// WithDNS points the container's resolver at the given addresses.
+func WithDNS(ips ...string) Opt {
+	return func(s *spec) { s.dns = append(s.dns, ips...) }
+}
+
+// WithAliases adds extra DNS names the container answers to on the
+// network (it always answers to its name and its FQDN).
+func WithAliases(aliases ...string) Opt {
+	return func(s *spec) { s.aliases = append(s.aliases, aliases...) }
+}
+
+// WithIP pins the container's address on the network.
+func WithIP(ip string) Opt { return func(s *spec) { s.ip = ip } }
+
+// WithCaps replaces the capability set for this container only.
+func WithCaps(caps ...string) Opt {
+	return func(s *spec) { s.caps = append([]string(nil), caps...) }
+}
+
+// WithTmpfs replaces the tmpfs set for this container only.
+func WithTmpfs(paths ...string) Opt {
+	return func(s *spec) { s.tmpfs = append([]string(nil), paths...) }
+}
+
+// WithRunArgs appends raw `docker run` flags, for the rare case the
+// options above do not cover.
+func WithRunArgs(args ...string) Opt {
+	return func(s *spec) { s.runArgs = append(s.runArgs, args...) }
+}
+
+// WithEntrypoint overrides the image entrypoint and its argv — used by
+// the operational matrix to drive samba-tool directly against the
+// volumes without starting a DC.
+func WithEntrypoint(entrypoint string, argv ...string) Opt {
+	return func(s *spec) {
+		s.entrypoint = entrypoint
+		s.cmd = append([]string(nil), argv...)
+	}
+}
+
+// StartDC starts the image under test in the constrained profile and
+// returns once the container is running — not once it is healthy; use
+// WaitHealthy for that. Container and (harness-created) volumes are
+// removed by t.Cleanup, and the container's logs are dumped into the test
+// log if the test failed.
+func StartDC(t *testing.T, net, name, mode string, env map[string]string, opts ...Opt) *DC {
+	t.Helper()
+	dc, _ := startDC(t, net, name, mode, env, opts...)
+	return dc
+}
+
+// RunDCExpectExit starts the image in the SAME constrained profile, waits
+// for it to terminate on its own, and returns its exit code together with
+// its combined logs. It is how the negative matrix asserts the runtime
+// contract's exit codes.
+func RunDCExpectExit(t *testing.T, net, name, mode string, env map[string]string, opts ...Opt) (int, string) {
+	t.Helper()
+	dc, _ := startDC(t, net, name, mode, env, opts...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), ExitTimeout)
+	defer cancel()
+	if out, code, err := dockerCmd(ctx, "wait", dc.Name); err != nil || code != 0 {
+		t.Fatalf("container %s did not exit within %s (%v): %s\n--- logs ---\n%s",
+			dc.Name, ExitTimeout, err, strings.TrimSpace(out), Logs(t, dc.Name))
+	}
+	return exitCode(t, dc.Name), Logs(t, dc.Name)
+}
+
+func startDC(t *testing.T, net, name, mode string, env map[string]string, opts ...Opt) (*DC, *spec) {
+	t.Helper()
+
+	s := &spec{
+		hostname:   name,
+		env:        map[string]string{},
+		caps:       Caps(),
+		tmpfs:      append([]string(nil), DefaultTmpfs...),
+		ownVolumes: true,
+	}
+	for k, v := range env {
+		s.env[k] = v
+	}
+	if mode != "" {
+		s.env["SAMBA_MODE"] = mode
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	// A leftover container of the same name from an interrupted run must
+	// not turn every later run red.
+	quietDocker("rm", "-f", name)
+
+	if s.ownVolumes {
+		s.stateVol = uniq(name + "-state")
+		s.confVol = uniq(name + "-conf")
+		mustDocker(t, "volume", "create", s.stateVol)
+		mustDocker(t, "volume", "create", s.confVol)
+	}
+	stateVol, confVol, ownVolumes := s.stateVol, s.confVol, s.ownVolumes
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("--- docker logs %s ---\n%s", name, Logs(t, name))
+		}
+		quietDocker("rm", "-f", name)
+		if ownVolumes {
+			quietDocker("volume", "rm", "-f", stateVol, confVol)
+		}
+	})
+
+	args := []string{"run", "-d", "--name", name, "--network", net, "--hostname", s.hostname}
+	for _, a := range append([]string{FQDN(name)}, s.aliases...) {
+		args = append(args, "--network-alias", a)
+	}
+	if s.ip != "" {
+		args = append(args, "--ip", s.ip)
+	}
+	// The constrained profile (B.2 / §5.2), applied to every DC container
+	// the suite ever starts.
+	args = append(args, "--read-only")
+	for _, p := range s.tmpfs {
+		args = append(args, "--tmpfs", p)
+	}
+	args = append(args, "--cap-drop", "ALL")
+	for _, c := range s.caps {
+		args = append(args, "--cap-add", c)
+	}
+	args = append(args,
+		"-v", s.stateVol+":/var/lib/samba",
+		"-v", s.confVol+":/etc/samba")
+	for _, b := range s.binds {
+		args = append(args, "-v", b)
+	}
+	for _, d := range s.dns {
+		args = append(args, "--dns", d)
+	}
+	for _, k := range sortedKeys(s.env) {
+		args = append(args, "-e", k+"="+s.env[k])
+	}
+	args = append(args, s.runArgs...)
+	if s.entrypoint != "" {
+		args = append(args, "--entrypoint", s.entrypoint)
+	}
+	args = append(args, Image())
+	args = append(args, s.cmd...)
+
+	mustDocker(t, args...)
+
+	dc := &DC{
+		Name:        name,
+		Realm:       Realm,
+		FQDN:        FQDN(name),
+		Network:     net,
+		Mode:        mode,
+		StateVolume: s.stateVol,
+		ConfVolume:  s.confVol,
+	}
+	dc.IP = strings.TrimSpace(mustDocker(t, "inspect", "-f",
+		fmt.Sprintf("{{with index .NetworkSettings.Networks %q}}{{.IPAddress}}{{end}}", net), name))
+	if dc.IP == "" {
+		t.Fatalf("container %s has no address on network %s", name, net)
+	}
+	return dc, s
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ---------------------------------------------------------------------
+// observing a container
+// ---------------------------------------------------------------------
+
+// WaitHealthy blocks until docker reports the container healthy, failing
+// the test — with logs and the health-probe output — if it exits, stays
+// unhealthy, or runs out of time.
+func WaitHealthy(t *testing.T, name string, within time.Duration) {
+	t.Helper()
+	if within <= 0 {
+		within = HealthTimeout
+	}
+	deadline := time.Now().Add(within)
+	const format = "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+		out, code, err := dockerCmd(ctx, "inspect", "-f", format, name)
+		cancel()
+		if err != nil || code != 0 {
+			t.Fatalf("inspecting %s: %v\n%s", name, err, strings.TrimSpace(out))
+		}
+		state, health, _ := strings.Cut(strings.TrimSpace(out), "|")
+
+		switch {
+		case health == "healthy":
+			return
+		case health == "none":
+			t.Fatalf("container %s has no healthcheck; the image under test must define one", name)
+		case state != "running" && state != "created" && state != "restarting":
+			t.Fatalf("container %s is %s (exit %d) instead of becoming healthy\n--- logs ---\n%s",
+				name, state, exitCode(t, name), Logs(t, name))
+		case time.Now().After(deadline):
+			t.Fatalf("container %s did not become healthy within %s (last health: %s)\n"+
+				"--- health probe ---\n%s\n--- logs ---\n%s",
+				name, within, health, healthLog(name), Logs(t, name))
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// Stop stops a container the way an orchestrator does and returns its
+// exit code. The runtime contract says a container asked to stop exits 0
+// (§6.3), so this is what the operational matrix asserts on.
+func Stop(t *testing.T, name string, timeout time.Duration) int {
+	t.Helper()
+	secs := int(timeout.Round(time.Second) / time.Second)
+	if secs <= 0 {
+		secs = 15
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+dockerTimeout)
+	defer cancel()
+	if out, code, err := dockerCmd(ctx, "stop", "-t", strconv.Itoa(secs), name); err != nil || code != 0 {
+		t.Fatalf("stopping %s: %v (exit %d)\n%s", name, err, code, strings.TrimSpace(out))
+	}
+	return exitCode(t, name)
+}
+
+// Exec runs a command inside a running container and returns its combined
+// output, failing the test if it exits non-zero.
+func Exec(t *testing.T, name string, cmd ...string) string {
+	t.Helper()
+	code, out := ExecErr(t, name, cmd...)
+	if code != 0 {
+		t.Fatalf("docker exec %s %s: exit %d\n%s", name, strings.Join(cmd, " "), code, out)
+	}
+	return out
+}
+
+// ExecErr is Exec without the assertion: it returns the exit code and the
+// combined output so a test can assert on a failure.
+func ExecErr(t *testing.T, name string, cmd ...string) (int, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), ExecTimeout)
+	defer cancel()
+	out, code, err := dockerCmd(ctx, append([]string{"exec", name}, cmd...)...)
+	if err != nil {
+		t.Fatalf("docker exec %s %s: %v\n%s", name, strings.Join(cmd, " "), err, out)
+	}
+	return code, out
+}
+
+// Logs returns a container's combined stdout and stderr so far. It never
+// fails the test: it is used on the failure path, where losing the logs
+// to a secondary error would be the worst possible outcome.
+func Logs(t *testing.T, name string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+	out, _, err := dockerCmd(ctx, "logs", name)
+	if err != nil {
+		return fmt.Sprintf("(logs unavailable: %v)", err)
+	}
+	return out
+}
+
+// exitCode reads a stopped container's exit status.
+func exitCode(t *testing.T, name string) int {
+	t.Helper()
+	out := strings.TrimSpace(mustDocker(t, "inspect", "-f", "{{.State.ExitCode}}", name))
+	code, err := strconv.Atoi(out)
+	if err != nil {
+		t.Fatalf("unparsable exit code %q for container %s", out, name)
+	}
+	return code
+}
+
+// healthLog returns the recorded output of the last health probes.
+func healthLog(name string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+	out, _, err := dockerCmd(ctx, "inspect", "-f",
+		"{{range .State.Health.Log}}[exit {{.ExitCode}}] {{.Output}}{{end}}", name)
+	if err != nil {
+		return fmt.Sprintf("(health log unavailable: %v)", err)
+	}
+	return strings.TrimSpace(out)
+}
+
+// repoPath resolves a path relative to the repository root, independent
+// of the directory `go test` was invoked from.
+func repoPath(parts ...string) string {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return filepath.Join(parts...)
+	}
+	// this file is <root>/test/e2e/harness/harness.go
+	root := filepath.Join(filepath.Dir(file), "..", "..", "..")
+	return filepath.Join(append([]string{root}, parts...)...)
+}
