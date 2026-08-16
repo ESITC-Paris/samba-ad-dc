@@ -8,27 +8,115 @@ on:
 permissions:
   contents: read
 
+# One run per ref: a force-push supersedes its own in-flight run rather
+# than queueing behind it. Never cancels anything on another ref.
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Linters run as digest-pinned containers; the human-readable tag is
+      # kept in the reference so a bump is reviewable. Dependabot does not
+      # track image refs inside `run:`, so these are bumped by hand when
+      # the release notes justify it.
+      HADOLINT_IMAGE: >-
+        ghcr.io/hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+      ACTIONLINT_IMAGE: >-
+        rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+
       - name: yamllint
-        run: pipx run yamllint --strict .
+        run: pipx run yamllint==1.38.0 --strict .
+
       - name: shellcheck
         run: |
-          mapfile -t files < <(git ls-files '*.sh')
-          if [ "${#files[@]}" -gt 0 ]; then
-            shellcheck "${files[@]}"
-          else
-            echo "no shell scripts yet"
+          # The linter comes from the runner image, so it is pinned by
+          # assertion rather than by version: ubuntu-24.04 ships 0.9.x and
+          # a downgrade below that floor must be loud, while a runner-image
+          # bump to a newer release stays green. (A comment may not open
+          # with the tool's own name here - it would parse as a directive.)
+          version=$(shellcheck --version | sed -n 's/^version: //p')
+          echo "shellcheck ${version}"
+          major=${version%%.*}
+          minor=${version#*.}
+          minor=${minor%%.*}
+          if [ "${major}" -eq 0 ] && [ "${minor}" -lt 9 ]; then
+            echo "::error::shellcheck ${version} is below the expected 0.9 floor"
+            exit 1
           fi
+          # Fail on an empty selection: a gate that lints nothing passes
+          # vacuously, which is indistinguishable from a gate that works.
+          mapfile -t files < <(git ls-files '*.sh')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no *.sh tracked - the shellcheck gate would pass vacuously"
+            exit 1
+          fi
+          printf 'linting %d script(s)\n' "${#files[@]}"
+          shellcheck "${files[@]}"
+
       - name: hadolint
         run: |
-          if [ -f Dockerfile ]; then
-            docker run --rm -i ghcr.io/hadolint/hadolint < Dockerfile
-          else
-            echo "no Dockerfile yet"
+          mapfile -t dockerfiles < <(git ls-files '*Dockerfile*')
+          if [ "${#dockerfiles[@]}" -eq 0 ]; then
+            echo "::error::no Dockerfile tracked - the hadolint gate would pass vacuously"
+            exit 1
           fi
+          for dockerfile in "${dockerfiles[@]}"; do
+            echo "hadolint ${dockerfile}"
+            docker run --rm -i "${HADOLINT_IMAGE}" < "${dockerfile}"
+          done
+
+      - name: actionlint
+        # Workflow-schema validation (expression syntax, runner labels,
+        # action inputs) — none of which yamllint can see.
+        run: |
+          docker run --rm -v "${PWD}:/repo:ro" -w /repo "${ACTIONLINT_IMAGE}" -color
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: lint
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      # Native runners per architecture: no QEMU, so an arch-specific
+      # compile failure is reported by the leg that actually hit it.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+
+      - name: Pin consistency
+        run: sh scripts/check-pins-consistency.sh
+
+      - name: Build image
+        run: docker build -t samba-ad-dc:ci .
+
+      - name: Smoke
+        run: |
+          expected=$(sh scripts/check-pins-consistency.sh --print samba_version)
+          actual=$(docker run --rm samba-ad-dc:ci samba --version)
+          echo "${actual} (versions.yaml pins ${expected})"
+          case "${actual}" in
+            *"${expected}"*) ;;
+            *)
+              echo "::error::samba reports '${actual}', versions.yaml pins ${expected}"
+              exit 1
+              ;;
+          esac
+          docker run --rm samba-ad-dc:ci samba-tool --help > /dev/null
+
+      - name: Package closure check
+        run: sh scripts/check-image-packages.sh samba-ad-dc:ci

@@ -1,0 +1,15 @@
+# Keeps the SHA/digest pins in .github/workflows/ maintained by bot PRs.
+# Actions are pinned by commit SHA (SPEC §4.1), which is only safe if
+# something proposes the bumps; that something is this file.
+---
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
