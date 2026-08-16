@@ -113,7 +113,10 @@ jobs:
             exit 1
           fi
           go vet ./...
-          go test ./...
+          # -race here and not in the image build: the supervision and
+          # shutdown tests run real goroutines against real signals, and the
+          # runner has the cgo toolchain the detector needs.
+          go test -race ./...
 
   build:
     name: Build (${{ matrix.arch }})

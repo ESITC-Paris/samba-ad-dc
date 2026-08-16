@@ -59,11 +59,14 @@ const (
 	// it to prove the -ldflags injection worked.
 	versionFlag = "--version"
 
-	// healthcheckTimeout bounds the whole probe run. It matches the
-	// HEALTHCHECK --timeout in the Dockerfile: a probe that outlives the
-	// timeout would be killed by docker anyway, and being killed produces a
-	// worse message than timing out here does.
-	healthcheckTimeout = 10 * time.Second
+	// healthcheckTimeout bounds the whole probe run. It sits deliberately
+	// BELOW the 10 s HEALTHCHECK --timeout in the Dockerfile so that this
+	// internal deadline is the one that fires: docker starts its timer
+	// before this process is even executed, so an equal timeout would
+	// always be won by docker, which kills the probe and reports nothing
+	// about it. Firing first means the operator gets the named-probe error
+	// ("DNS/LDAP/SMB did not answer") instead of a silent kill.
+	healthcheckTimeout = 8 * time.Second
 
 	// exitUnhealthy is what a failed HEALTHCHECK returns. Docker reads 0 as
 	// healthy and anything else as unhealthy, so the refusal exit codes

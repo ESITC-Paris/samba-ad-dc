@@ -1046,10 +1046,10 @@ func TestSuperviseShutdownSharesOneBudget(t *testing.T) {
 	}
 }
 
-// TestSuperviseShutdownFitsTheGraceWithDefaultRatio checks the same ceiling
-// with a kill window larger than the whole grace: the phases must still add
-// up to no more than the total.
-func TestSuperviseShutdownFitsTheGraceWithDefaultRatio(t *testing.T) {
+// TestSuperviseShutdownFitsTheGraceWhenTheKillWindowExceedsTheGrace checks
+// the same ceiling with a kill window larger than the whole grace: the phases
+// must still add up to no more than the total.
+func TestSuperviseShutdownFitsTheGraceWhenTheKillWindowExceedsTheGrace(t *testing.T) {
 	r := newFakeRunner()
 	chrony, samba := unreapableProc(t), unreapableProc(t)
 	r.procs["chronyd"], r.procs["samba"] = chrony, samba

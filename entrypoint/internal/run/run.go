@@ -135,9 +135,14 @@ func Supervise(ctx context.Context, r Runner, cfg *config.Config) *config.Refusa
 // record the marker only after that succeeded, and hand over to Supervise.
 // Maintenance is the one plan that never starts a daemon.
 //
-// The marker is written after initialization and never before: a provision
-// that fails halfway must leave the volume looking uninitialized, so the next
-// start retries instead of starting a broken domain (§6.2).
+// The marker is written after initialization and never before: only a
+// completed initialization may claim the volume, so no later start can mistake
+// a half-provisioned tree for one this image owns (§6.2). That is a guarantee
+// about the marker, not about the tree: samba-tool creates private/sam.ldb
+// early, so a failed initialization can still leave partial state behind — the
+// next boot then sees state without a marker and refuses (20) or adopts it and
+// fails the database check (23), which is why the failure messages below say
+// to delete the volume rather than promising a free retry.
 func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.Plan, stateDir, imageVersion string) *config.Refusal {
 	// Before anything shells out, not just before the daemons start:
 	// samba-tool domain provision writes into /var/lock/samba (a symlink
@@ -229,7 +234,7 @@ func (e *Executor) provision(ctx context.Context, cfg *config.Config) *config.Re
 	e.logf("provisioning a new domain %s in realm %s (functional level %s)", cfg.Domain, cfg.Realm, cfg.FunctionLevel)
 	if err := e.Runner.Run(ctx, e.Bin.SambaTool, provisionArgs(cfg, secret)...); err != nil {
 		return config.Refuse(config.CodeRuntimeFailure,
-			"samba-tool domain provision failed (%s); read the samba-tool output above, fix the cause and start the container again — no state was recorded, so provisioning will be retried",
+			"samba-tool domain provision failed (%s) and no version marker was written; inspect the logs; if the volume now holds partial state, delete/recreate it before retrying",
 			scrub(oneLine(err.Error()), secret))
 	}
 	e.logf("domain %s provisioned", cfg.Domain)
@@ -246,7 +251,7 @@ func (e *Executor) join(ctx context.Context, cfg *config.Config) *config.Refusal
 	e.logf("joining realm %s as a domain controller with account %s", cfg.Realm, cfg.JoinUsername)
 	if err := e.Runner.Run(ctx, e.Bin.SambaTool, joinArgs(cfg, secret)...); err != nil {
 		return config.Refuse(config.CodeRuntimeFailure,
-			"samba-tool domain join failed (%s); check that the realm resolves and that %s may join a DC, then start the container again — no state was recorded, so the join will be retried",
+			"samba-tool domain join failed (%s) and no version marker was written; inspect the logs and check that the realm resolves and that %s may join a DC; if the volume now holds partial state, delete/recreate it before retrying",
 			scrub(oneLine(err.Error()), secret), cfg.JoinUsername)
 	}
 	e.logf("joined realm %s", cfg.Realm)

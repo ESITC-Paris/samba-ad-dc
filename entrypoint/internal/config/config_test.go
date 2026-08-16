@@ -403,6 +403,36 @@ func TestReadSecret(t *testing.T) {
 	})
 }
 
+// TestExitCodesAreTheirPublishedLiterals pins the numbers themselves, not
+// the constant names. The exit-code table in docs/adaptation-profile.md
+// (Runtime contract → Exit codes) is the published contract these values are
+// frozen by: operators, compose restart policies and the E2E matrix all
+// branch on the literals, so renaming a constant is free but renumbering one
+// is a breaking change. Asserting `CodeConfigError == CodeConfigError` would
+// prove nothing; only the literal does.
+func TestExitCodesAreTheirPublishedLiterals(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"configuration error", CodeConfigError, 10},
+		{"missing/unreadable secret file", CodeSecretError, 11},
+		{"provision/join over existing state", CodeStateExists, 20},
+		{"run/maintenance with absent state", CodeStateAbsent, 21},
+		{"downgrade refusal", CodeDowngrade, 22},
+		{"database consistency check failure", CodeDBCheckFailed, 23},
+		{"samba runtime failure", CodeRuntimeFailure, 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("exit code for %s = %d, want %d; docs/adaptation-profile.md publishes %d and exit codes are immutable once released",
+					tc.name, tc.got, tc.want, tc.want)
+			}
+		})
+	}
+}
+
 func TestRefuse(t *testing.T) {
 	r := Refuse(CodeStateAbsent, "no state in %s; mount the %s volume", "/var/lib/samba", "state")
 	if r.Code != CodeStateAbsent {

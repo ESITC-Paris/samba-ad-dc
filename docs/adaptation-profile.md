@@ -57,6 +57,17 @@ them.
   secrets, sysvol, TLS material, NTP signing socket), `/etc/samba`
   (persistent volume: generated configuration), `/run` and `/tmp`
   (tmpfs). No writes under `/etc` at runtime.
+  Nothing may be baked into the image at those paths: a volume or tmpfs
+  mount hides whatever the image holds there, so the entrypoint creates
+  the runtime directories itself on every boot — `/run/samba`,
+  `/run/lock/samba` and `/run/chrony`, mode `0755`, owned by root (the
+  entrypoint's uid), before either daemon starts. `/run/chrony` is
+  root-owned and needs no ownership handoff because chronyd runs as root
+  in this image (B.6); chronyd's drift file is deliberately *not* there
+  but on the persistent volume at `/var/lib/samba/chrony` (mode `0750`,
+  created by the entrypoint for the same mount-hiding reason), so the
+  clock estimate survives a restart instead of being lost with the
+  tmpfs.
 
 ### B.3 Non-negotiable deployment constraints
 
@@ -70,8 +81,11 @@ them.
   Samba's signing socket) to domain members but does not discipline the
   clock by default — host time synchronization is the operator's
   responsibility (option exists to grant CAP_SYS_TIME instead).
+  (Implemented in Phase 2 — see Runtime contract: **Time service**.)
 - **Secrets:** file-based only (`*_FILE`); the domain administrator
   password is never accepted via plain environment variable.
+  (Implemented in Phase 2 — see Runtime contract: **Environment
+  variables**, secrets paragraph.)
 
 ### B.4 Entrypoint state machine (documented modes = tested modes)
 
@@ -105,9 +119,18 @@ with the read-only rootfs configuration.
 
 ### B.6 Known limitations (stated per §12.4)
 
-- **§6.7: not applicable.** The entrypoint is implemented in Go from the
-  first release; no shell interim ever ships and no §11.2 exception is
-  required (see `docs/exceptions/README.md`).
+- **§6.7 shell-entrypoint exception: not required** — the entrypoint is Go
+  from the first release, so no shell interim ever ships and no §11.2
+  exception is filed (see `docs/exceptions/README.md`). §6.7 itself is
+  satisfied; evidence: the unit-test gate runs inside the image build
+  (Dockerfile `gobuild` stage) and in CI (`unit` job), and the behavior
+  contract is the **Runtime contract** section below.
+
+- **chronyd runs as root inside the container** (SIGTERM delivery without
+  `CAP_KILL`; ntp_signd socket access). **REVISIT at the Phase 3
+  capability bisection:** the alternative is `CAP_KILL` in the capability
+  set plus signing-socket group permissions; `TestSignedNTPWiring` is the
+  acceptance test either way.
 
 - **Sysvol replication is not provided by Samba** (no DFS-R): with
   multiple DCs, group policy content does not replicate by itself. An
@@ -179,7 +202,7 @@ against a running container. Exit codes are **immutable once released**.
 | `SAMBA_JOIN_PASSWORD_FILE` | join | — required | file with the join account password |
 | `SAMBA_DNS_FORWARDER` | provision | none | upstream DNS forwarder IP |
 | `SAMBA_DNS_BACKEND` | provision, join | `SAMBA_INTERNAL` | only `SAMBA_INTERNAL` supported in v1 |
-| `SAMBA_FUNCTION_LEVEL` | provision | `2016` | AD functional level |
+| `SAMBA_FUNCTION_LEVEL` | provision | `2016` | AD functional level; provision also mirrors it onto the `ad dc functional level` smb.conf parameter for `2012`, `2012_R2` and `2016` (see below) |
 | `SAMBA_LOG_LEVEL` | all | `1` | samba debug level |
 | `SAMBA_CHRONY` | auto/provision/join/run | `on` | serve MS-SNTP signed time (`on|off`) |
 | `SAMBA_MAINTENANCE_OP` | maintenance | `check` | `check` (dbcheck) or `repair` (dbcheck --fix --yes) |
@@ -188,6 +211,33 @@ Secrets are accepted **only** through the `*_FILE` variables (§6.1).
 Setting a plain `SAMBA_ADMIN_PASSWORD` or `SAMBA_JOIN_PASSWORD` in the
 environment is refused with exit 10 and a message naming the `_FILE`
 variant; no secret value is ever logged.
+
+**`SAMBA_FUNCTION_LEVEL` is mirrored onto smb.conf.** Provision passes
+`--function-level=<level>` *and*, for `2012`, `2012_R2` and `2016`,
+`--option=ad dc functional level = <level>`, so the value lands in the
+generated `smb.conf` and every later start keeps the level the domain was
+created at. This is not cosmetic: since Samba 4.19 that parameter defaults
+to `2008_R2`, and provision refuses outright when the requested domain and
+forest level is higher than the DC's own level — so a provision at this
+image's `2016` default fails without the mirror. Levels at or below the
+default get no `--option` at all: the parameter does not accept `2000`,
+`2003` or `2008` as values, and setting it there would turn a working
+provision into a configuration error.
+
+### Argv
+
+| Argument | Meaning |
+|---|---|
+| *(none)* | the container's `ENTRYPOINT`: load, observe, decide, initialize if needed, supervise |
+| `healthcheck` | the image's `HEALTHCHECK` probe (see below) |
+| `--version` | print the Samba version embedded at build time (`-ldflags -X main.sambaVersion=<v>`) and exit `0` |
+
+Anything else is refused with exit 10. `--version` exists for the build
+and CI guards: the version guard on the state volume is only as
+trustworthy as that injected value, so CI asserts that what the entrypoint
+reports matches the version pinned in `versions.yaml` — a binary built
+without the flag reports `unset` and is refused by the guard rather than
+silently trusted.
 
 ### Mode semantics (B.4)
 
@@ -202,7 +252,13 @@ variant; no secret value is ever logged.
   Else guards, then start daemons.
 - `maintenance`: state absent → exit 21. Else run dbcheck (or --fix),
   print summary, exit without starting daemons (0 on clean, 23 on
-  failure).
+  failure). The §7.2 version guards below apply in maintenance mode too:
+  a volume written by a newer Samba is refused with 22 and a malformed
+  marker with 10, *before* any dbcheck runs. That is the point rather
+  than an oversight — `dbcheck --fix` driven by an older Samba against a
+  database written by a newer one is the exact hazard the downgrade
+  guard exists for, and "repair" is the mode an operator reaches for
+  when something is already wrong.
 
 ### State & guards
 
@@ -235,8 +291,8 @@ variant; no secret value is ever logged.
 | `23` | database consistency check failure |
 | `30` | samba runtime failure |
 
-Every failure message carries a cause and a remedy, one line each, on
-stderr, prefixed `ERROR: ` (§6.5). Logs go to stdout/stderr exclusively
+Every failure message is **one line, cause then remedy, separated by
+`;`**, written to stderr and prefixed `ERROR: ` (§6.5). Logs go to stdout/stderr exclusively
 (§6.4); samba runs `--foreground --no-process-group --debug-stdout`.
 
 ### Process model and shutdown
@@ -311,3 +367,17 @@ signing; 123/udp is exposed. `SAMBA_CHRONY=off` runs the DC without it.
   read the MS update tables out of markdown), and chronyd runs as root
   because the B.2 capability set excludes CAP_KILL — a privilege-dropping
   chronyd cannot be stopped in order, nor reach samba's signing socket.
+- 2026-08-16: Phase 2 final-review amendments. B.6 restates the §6.7
+  ruling precisely (the shell-entrypoint *exception* is what is not
+  required; §6.7 itself is satisfied, with the in-image and CI unit-test
+  gates as evidence) and the root-chronyd ruling stops being presented as
+  settled: it now carries an explicit REVISIT at the Phase 3 capability
+  bisection, with `CAP_KILL` plus signing-socket group permissions as the
+  named alternative. B.2 gains the `/run/chrony` ownership and permission
+  story; B.3 cross-references the Phase 2 implementation of its Time and
+  Secrets constraints. Runtime contract gains the `--version` argv, the
+  `ad dc functional level` mirror behind `SAMBA_FUNCTION_LEVEL` (without
+  which provision at the 2016 default is refused since Samba 4.19), the
+  exact refusal-message shape (one line, cause then remedy, `;`-separated)
+  and the statement that the §7.2 version guards apply in maintenance mode
+  too.

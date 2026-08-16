@@ -133,6 +133,8 @@ func TestChronyStateDirIsCreatedOnlyForPlansThatStartTheDaemon(t *testing.T) {
 	}{
 		{"start plan with chrony on", true, modes.Plan{Kind: modes.ActStart}, true},
 		{"provision plan with chrony on", true, modes.Plan{Kind: modes.ActProvision}, true},
+		{"join plan with chrony on", true, modes.Plan{Kind: modes.ActJoin}, true},
+		{"dbcheck-then-start plan with chrony on", true, modes.Plan{Kind: modes.ActDBCheckThenStart}, true},
 		{"start plan with chrony off", false, modes.Plan{Kind: modes.ActStart}, false},
 		{"maintenance never starts a daemon", true, modes.Plan{Kind: modes.ActMaintenance}, false},
 	} {

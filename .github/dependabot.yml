@@ -13,3 +13,15 @@ updates:
       prefix: "ci"
     labels:
       - "dependencies"
+
+  # The entrypoint module: its own go.mod lives under /entrypoint, so the
+  # ecosystem has to be pointed at that directory rather than the repo root.
+  - package-ecosystem: "gomod"
+    directory: "/entrypoint"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+    labels:
+      - "dependencies"
