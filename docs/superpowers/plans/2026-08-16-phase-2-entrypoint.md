@@ -273,9 +273,15 @@ transition and refusal`.
 - Exact commands (binding):
   - provision: `samba-tool domain provision --server-role=dc
     --use-rfc2307 --dns-backend=SAMBA_INTERNAL --realm=<R> --domain=<D>
-    --function-level=<FL> [--option=dns forwarder=<IP>]` with the admin
-    password supplied non-interactively (`--adminpass` read from the
-    secret file — see argv note above).
+    --function-level=<FL> [--option=dns forwarder=<IP>]
+    --option=dns update command = /usr/sbin/samba_dnsupdate --use-samba-tool`
+    with the admin password supplied non-interactively (`--adminpass`
+    read from the secret file — see argv note above). The dns-update
+    option is a Phase 1 ruling: the image ships no `nsupdate`
+    (bind9-dnsutils not installed), so samba_dnsupdate MUST take the
+    samba-tool path; join mode ensures the same option lands in the
+    generated smb.conf (append via config edit after join if
+    samba-tool domain join lacks an equivalent --option passthrough).
   - join: `samba-tool domain join <realm> DC -U"<user>"
     --dns-backend=SAMBA_INTERNAL` password via stdin (`--password`
     alternative note applies).
@@ -368,7 +374,9 @@ Steps:
    port 123
    cmdport 0
    ```
-3. Dockerfile: add digest-pinned `golang:1.24-trixie` (or current)
+3. Dockerfile: add `EXPOSE 123/udp` to the runtime stage (chrony serves
+   NTP; omitted in Phase 1 — review finding). Add digest-pinned
+   `golang:1.24-trixie` (or current)
    `gobuild` stage: `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X
    main.sambaVersion=${SAMBA_VERSION}" ./cmd/entrypoint` AND `go test
    ./...` in the same stage (unit gate travels with the build, §6.7);
