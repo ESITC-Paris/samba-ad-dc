@@ -53,7 +53,11 @@ jobs:
           fi
           # Fail on an empty selection: a gate that lints nothing passes
           # vacuously, which is indistinguishable from a gate that works.
-          mapfile -t files < <(git ls-files '*.sh')
+          # Both pathspecs, deduped: '*.sh' catches the tracked scripts and
+          # 'test/**/*.sh' keeps the future test tree in scope explicitly,
+          # so a script added under test/ can never be linted by accident
+          # only.
+          mapfile -t files < <(git ls-files '*.sh' 'test/**/*.sh' | sort -u)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::no *.sh tracked - the shellcheck gate would pass vacuously"
             exit 1
@@ -102,7 +106,16 @@ jobs:
         run: sh scripts/check-pins-consistency.sh
 
       - name: Build image
-        run: docker build -t samba-ad-dc:ci .
+        run: |
+          # The package-index hash comes from the catalog, not from the
+          # Dockerfile ARG default (which is only a fallback for a bare
+          # `docker build .`): the watcher edits versions.yaml, and this is
+          # what turns that edit into a busted apt layer (SPEC §9.3).
+          pkg_index_hash=$(sh scripts/check-pins-consistency.sh --print pkg_index_hash)
+          echo "pkg_index_hash=${pkg_index_hash}"
+          docker build \
+            --build-arg "PKG_INDEX_HASH=${pkg_index_hash}" \
+            -t samba-ad-dc:ci .
 
       - name: Smoke
         run: |
@@ -117,6 +130,42 @@ jobs:
               ;;
           esac
           docker run --rm samba-ad-dc:ci samba-tool --help > /dev/null
+
+      - name: Label assertion
+        run: |
+          # The OCI labels are the image's only self-description once it is
+          # pulled from a registry; a build-arg that silently stayed empty
+          # would ship a label with an empty value, which reads as "present"
+          # to anything that only checks for the key. Both are checked.
+          labels=$(docker inspect --format '{{json .Config.Labels}}' samba-ad-dc:ci)
+          echo "${labels}"
+          required=(
+            org.opencontainers.image.source
+            org.opencontainers.image.version
+            org.opencontainers.image.revision
+            org.opencontainers.image.licenses
+            org.opencontainers.image.description
+            org.opencontainers.image.created
+            org.opencontainers.image.base.name
+            org.opencontainers.image.base.digest
+            org.esitc-paris.spec-version
+          )
+          missing=0
+          for key in "${required[@]}"; do
+            value=$(printf '%s' "${labels}" | python3 -c \
+              'import json,sys; print((json.load(sys.stdin) or {}).get(sys.argv[1], ""))' "${key}")
+            if [ -z "${value}" ]; then
+              echo "::error::image label ${key} is missing or empty"
+              missing=$((missing + 1))
+            else
+              printf 'ok  %-45s = %s\n' "${key}" "${value}"
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::${missing} required OCI label(s) missing or empty"
+            exit 1
+          fi
+          printf 'all %d required labels present\n' "${#required[@]}"
 
       - name: Package closure check
         run: sh scripts/check-image-packages.sh samba-ad-dc:ci

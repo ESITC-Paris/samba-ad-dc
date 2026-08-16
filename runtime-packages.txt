@@ -13,9 +13,20 @@
 # library is only reached through X.
 #
 # Transitive libraries are listed explicitly rather than left to apt on
-# purpose: SPEC §9bis.1.c has the watcher monitor the distribution package
-# index "restricted to each image's runtime package list", so anything not
-# named here would never trigger a security rebuild.
+# purpose: naming them makes the linkage reviewable and gives the watcher a
+# stable, justified core to diff against.
+#
+# What this file is NOT is the watcher's monitored set. SPEC §9bis.1.c
+# restricts the package-index watch to "each image's runtime package list",
+# and that list is THIS MANIFEST PLUS ITS FULL APT DEPENDENCY CLOSURE as
+# materialized in the published image's SBOM. The closure is strictly
+# larger than what is named here — roughly 28 further packages arrive as
+# dependencies of the entries below (chrony pulls iproute2 and libedit2,
+# python3 pulls python3-cffi-backend, and so on) and a security update to
+# any one of them MUST trigger a rebuild. This file lists the direct
+# requirements with their justifications; the SBOM closure is the
+# monitoring input. That is an explicit obligation handed to the watcher
+# phase: monitor the closure, not this file.
 #
 # What this method cannot see, and what is therefore justified by hand at
 # the bottom: interpreted (python) dependencies and service-level needs.

@@ -17,6 +17,11 @@
 #   ARG BUILDER_BASE           == branches[b].base.builder
 #   ARG RUNTIME_BASE           == branches[b].base.runtime
 #   ARG BASE_DIGEST            == digest(RUNTIME_BASE) == digest(base.runtime)
+#   ARG BASE_NAME              == RUNTIME_BASE with the @sha256:... cut off
+#
+# ARG PKG_INDEX_HASH is intentionally absent from that list: its default is
+# a fallback for a bare `docker build .`, and CI injects the catalog value
+# via `--print pkg_index_hash` + `--build-arg`.
 #
 # BASE_DIGEST exists only to feed the org.opencontainers.image.base.digest
 # label; it duplicates the digest already inside RUNTIME_BASE, which is
@@ -57,6 +62,7 @@ print("samba_version=%s" % entry["samba_version"])
 print("tarball_sha256=%s" % entry["tarball_sha256"])
 print("base_builder=%s" % entry["base"]["builder"])
 print("base_runtime=%s" % entry["base"]["runtime"])
+print("pkg_index_hash=%s" % entry["pkg_index_hash"])
 PY
 }
 
@@ -79,6 +85,7 @@ read_versions_awk() {
         /^    [^ #]/ { inbase = 0 }
         /^    samba_version:/  { print "samba_version=" val($0) }
         /^    tarball_sha256:/ { print "tarball_sha256=" val($0) }
+        /^    pkg_index_hash:/ { print "pkg_index_hash=" val($0) }
         inbase && /^      builder:/ { print "base_builder=" val($0) }
         inbase && /^      runtime:/ { print "base_runtime=" val($0) }
     ' "$VERSIONS"
@@ -101,13 +108,15 @@ v_samba_version=$(get samba_version)
 v_tarball_sha256=$(get tarball_sha256)
 v_base_builder=$(get base_builder)
 v_base_runtime=$(get base_runtime)
+v_pkg_index_hash=$(get pkg_index_hash)
 
 for pair in \
     "default_branch:$v_branch" \
     "samba_version:$v_samba_version" \
     "tarball_sha256:$v_tarball_sha256" \
     "base.builder:$v_base_builder" \
-    "base.runtime:$v_base_runtime"
+    "base.runtime:$v_base_runtime" \
+    "pkg_index_hash:$v_pkg_index_hash"
 do
     if [ -z "${pair#*:}" ]; then
         echo "versions.yaml: no value for ${pair%%:*} (parser: $parser)" >&2
@@ -123,7 +132,7 @@ if [ "${1:-}" = "--print" ]; then
     value=$(get "$key")
     if [ -z "$value" ]; then
         echo "unknown pin: ${key:-<missing>}" >&2
-        echo "known: default_branch samba_version tarball_sha256 base_builder base_runtime" >&2
+        echo "known: default_branch samba_version tarball_sha256 base_builder base_runtime pkg_index_hash" >&2
         exit 2
     fi
     printf '%s\n' "$value"
@@ -154,11 +163,14 @@ digest_of() {
     esac
 }
 
-# check_arg <ARG name> <expected value> — asserts the ARG exists and that
-# every occurrence of it carries the expected default.
+# check_arg <ARG name> <expected value> [source label] — asserts the ARG
+# exists and that every occurrence of it carries the expected default. The
+# source label names where the expected value came from (versions.yaml for
+# most pins, the Dockerfile itself for the derived ones).
 check_arg() {
     name=$1
     expected=$2
+    src=${3:-versions.yaml}
     found=$(arg_defaults "$name")
     if [ -z "$found" ]; then
         fail "Dockerfile has no 'ARG $name=<default>'"
@@ -168,7 +180,7 @@ check_arg() {
     while IFS= read -r actual; do
         [ -n "$actual" ] || continue
         if [ "$actual" != "$expected" ]; then
-            fail "ARG $name=$actual != versions.yaml $expected"
+            fail "ARG $name=$actual != $src $expected"
             bad=1
         fi
     done <<EOF
@@ -208,6 +220,18 @@ if [ -n "$runtime_digest" ]; then
 versions.yaml base.runtime digest ($runtime_digest)"
     fi
 fi
+
+# BASE_NAME (the other half of the base-image label pair) must be the
+# untagged-by-digest form of the very ref the runtime stage builds FROM;
+# otherwise the image would advertise a base it was not built on.
+if [ -n "$dockerfile_runtime" ]; then
+    check_arg BASE_NAME "${dockerfile_runtime%%@*}" "Dockerfile RUNTIME_BASE minus digest"
+fi
+
+# Deliberately NOT checked: ARG PKG_INDEX_HASH against versions.yaml. That
+# default is a bare fallback for `docker build .` with no build args; the
+# catalog value is injected by CI (--print pkg_index_hash + --build-arg),
+# so the ARG default floats on purpose.
 
 if [ "$errors" -ne 0 ]; then
     echo "" >&2

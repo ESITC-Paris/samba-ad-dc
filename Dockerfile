@@ -39,8 +39,10 @@ ARG SAMBA_SIGNING_FINGERPRINT=81F5E2832BD2545A1897B713AA99442FB680B620
 # Dropping the package is not enough: with the AD DC role enabled waf
 # treats a missing gpgme as fatal, so the opt-out is stated explicitly as
 # --without-gpgme below.
-# Package versions are not pinned here; reproducibility comes from the
-# digest-pinned base image plus versions.yaml's pkg_index_hash.
+# Package versions are not pinned here: the build's INPUTS are pinned (base
+# image digest, tarball hash, package-index hash) and the resolved package
+# versions are recorded in the published SBOM (SPEC §4.3 interpretation in
+# the adaptation profile).
 # hadolint ignore=DL3008
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       bison flex perl libparse-yapp-perl rpcsvc-proto pkgconf \
@@ -65,6 +67,12 @@ WORKDIR /tmp
 #      upstream signs), asserting the pinned primary key fingerprint.
 # The status output goes to a file rather than through a pipe so that
 # `grep -q` cannot SIGPIPE gpg under `set -o pipefail`.
+# Two assertions ride on that status file: the positive one (VALIDSIG on the
+# pinned fingerprint) and a negative one rejecting EXPKEYSIG/REVKEYSIG/
+# ERRSIG/BADSIG. The negative test is written as an `if ... exit 1` block,
+# NOT as `! grep -q ...`: a command whose status is inverted with `!` is
+# explicitly exempt from `set -e`, so the `!` form would never fail the
+# build no matter what gpg reported.
 # The vendored key is BINARY OpenPGP despite the .asc name — plain
 # `gpg --import` handles it; never --dearmor it.
 RUN set -eux; \
@@ -78,6 +86,11 @@ RUN set -eux; \
     gpg --batch --status-fd 1 --verify \
         "samba-${SAMBA_VERSION}.tar.asc" "samba-${SAMBA_VERSION}.tar" > /tmp/gpg-status.txt; \
     grep -q "VALIDSIG .* ${SAMBA_SIGNING_FINGERPRINT}$" /tmp/gpg-status.txt; \
+    if grep -qE '^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG|ERRSIG|BADSIG)' /tmp/gpg-status.txt; then \
+      echo "FATAL: gpg reported a rejected signature status:" >&2; \
+      grep -E '^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG|ERRSIG|BADSIG)' /tmp/gpg-status.txt >&2; \
+      exit 1; \
+    fi; \
     tar -xf "samba-${SAMBA_VERSION}.tar"; \
     rm -f "samba-${SAMBA_VERSION}.tar" "samba-${SAMBA_VERSION}.tar.asc" /tmp/gpg-status.txt
 
@@ -86,25 +99,12 @@ WORKDIR /tmp/samba-${SAMBA_VERSION}
 # FHS layout under /usr with config in /etc and state in /var; AD DC role
 # left enabled (no --without-ad-dc) and Python left enabled (samba-tool
 # needs it). Kerberos: no --with-system-mitkrb5 and no MIT headers in the
-# image, so waf falls back to the bundled Heimdal — asserted below.
+# image, so waf falls back to the bundled Heimdal — asserted by the
+# guardrail scan further down.
 # vfs_snapper is dropped because it hard-requires dbus-1, which an AD DC
 # has no use for; configure aborts otherwise.
-#
-# The invariant the guardrail below enforces: no ELF Samba built may name a
-# system MIT Kerberos library in its OWN DT_NEEDED, i.e. Samba's Kerberos is
-# the bundled Heimdal and nothing else. MIT reached *transitively* is
-# expected and allowed — Debian's libtirpc needs libgssapi_krb5 for
-# RPCSEC_GSS — so the assertion is deliberately about direct entries only.
-# Every step writes to a file and is tested with a plain command status; no
-# security decision rides on a pipe status that pipefail could turn into an
-# unrelated 141. The scan is proven non-vacuous by two positive assertions
-# (the result file is non-empty and contains the samba binary) before the
-# forbidden-name test runs.
-#
-# SC3045 (`read -d` is undefined in POSIX sh) does not apply: this stage's
-# SHELL is bash, which hadolint's shellcheck pass does not take into
-# account. NUL-delimited iteration is what makes the scan safe.
-# hadolint ignore=SC3045
+# 4.24 has no --without-quic: SMB-over-QUIC and its bundled ngtcp2 are
+# unconditional; unconfigured at runtime (see adaptation profile B.6).
 RUN set -eux; \
     ./configure \
       --enable-fhs \
@@ -123,7 +123,53 @@ RUN set -eux; \
       --with-shared-modules='!vfs_snapper' \
     ; \
     make -j"$(nproc)"; \
-    make install DESTDIR=/dest; \
+    make install DESTDIR=/dest
+
+# Prune what the runtime image has no use for, BEFORE the guardrail scan
+# below, so the scan runs on the tree that actually ships and proves the
+# prune regressed nothing. Exactly two classes go: the fuzz/torture test
+# drivers (smbtorture, gentest, locktest, masktest — developer tools, never
+# invoked by a DC) and the build-time-only development artifacts (public
+# headers, pkg-config files). No private .so is touched: Samba dlopen()s
+# modules by path at runtime, so "unreferenced" says nothing about
+# "unused". Every path is asserted present before removal — a silent
+# no-op prune after an upstream layout change would quietly put the test
+# drivers back in the image.
+RUN set -eux; \
+    triplet="$(gcc -dumpmachine)"; \
+    before=$(du -sb /dest | cut -f1); \
+    for p in /dest/usr/bin/smbtorture \
+             /dest/usr/bin/gentest \
+             /dest/usr/bin/locktest \
+             /dest/usr/bin/masktest \
+             /dest/usr/include \
+             "/dest/usr/lib/${triplet}/pkgconfig"; do \
+      if [ ! -e "$p" ]; then \
+        echo "FATAL: prune target absent (upstream install layout changed?): $p" >&2; \
+        exit 1; \
+      fi; \
+      rm -rf "$p"; \
+    done; \
+    after=$(du -sb /dest | cut -f1); \
+    echo "prune: /dest ${before} -> ${after} bytes (delta $((before - after)))"
+
+# The invariant this guardrail enforces: no ELF Samba built may name a
+# system MIT Kerberos library in its OWN DT_NEEDED, i.e. Samba's Kerberos is
+# the bundled Heimdal and nothing else. MIT reached *transitively* is
+# expected and allowed — Debian's libtirpc needs libgssapi_krb5 for
+# RPCSEC_GSS — so the assertion is deliberately about direct entries only.
+# Every step writes to a file and is tested with a plain command status; no
+# security decision rides on a pipe status that pipefail could turn into an
+# unrelated 141. The scan is proven non-vacuous by two positive assertions
+# (the result file is non-empty and contains the samba binary) before the
+# forbidden-name test runs. It scans the pruned tree on purpose: what is
+# asserted is what ships.
+#
+# SC3045 (`read -d` is undefined in POSIX sh) does not apply: this stage's
+# SHELL is bash, which hadolint's shellcheck pass does not take into
+# account. NUL-delimited iteration is what makes the scan safe.
+# hadolint ignore=SC3045
+RUN set -eux; \
     : > /tmp/elf-needed.txt; \
     find /dest -type f -print0 > /tmp/dest-files.bin; \
     while IFS= read -r -d '' f; do \
@@ -160,8 +206,15 @@ RUN set -eux; \
 FROM ${RUNTIME_BASE} AS runtime
 
 ARG SAMBA_VERSION=4.24.6
-# Replaced by the watcher (SPEC §9bis.1.c) with the hash of the versioned
-# runtime-package list; "bootstrap" matches versions.yaml until Phase 6.
+# The hash of the distribution package index the runtime closure was
+# resolved against (SPEC §9bis.1.c); the watcher edits it in versions.yaml
+# and CI injects it with --build-arg. The default below is a bare fallback
+# for a plain `docker build .` — it is deliberately NOT asserted equal to
+# versions.yaml, so nothing here claims to mirror the catalog.
+# BuildKit invalidates a layer from the instruction that REFERENCES an ARG,
+# not from the ARG declaration, and the only instruction referencing this
+# one is the apt RUN below; the ARGs and COPY in between therefore do not
+# weaken the §9.3 "busts exactly this layer" property — do not reorder.
 ARG PKG_INDEX_HASH=bootstrap
 ARG VCS_REF=dev
 ARG CREATED=1970-01-01T00:00:00Z
@@ -176,7 +229,9 @@ COPY runtime-packages.txt /usr/share/samba-ad-dc/runtime-packages.txt
 # this layer when the watcher detects a runtime-package delta (SPEC §9.3),
 # "nothing more, nothing less".
 # Package versions are not pinned here for the same reason as in the
-# builder: the pin is the base image digest plus PKG_INDEX_HASH.
+# builder: the inputs are pinned (base image digest, PKG_INDEX_HASH) and the
+# resolved package versions are recorded in the published SBOM (SPEC §4.3
+# interpretation in the adaptation profile).
 # hadolint ignore=DL3008,SC2046
 RUN echo "pkg-index=${PKG_INDEX_HASH}" \
     && apt-get update \
