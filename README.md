@@ -44,7 +44,7 @@ runbook in the deployment guide.)*
 
 Primary tags are `X.Y.Z-rN` (immutable); aliases `X.Y.Z`, `X.Y`, `X`.
 `latest` is **not** production-usable. Production deployments should pin
-by digest. Full policy: `docs/update-guide.md`.
+by digest. Full policy: `docs/update-guide.md` *(completed in Phase 5)*.
 
 ## Verifying images
 

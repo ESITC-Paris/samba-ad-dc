@@ -24,6 +24,6 @@ Do not open public issues for security reports.
 ## Published-image security
 
 Every published image ships with a cosign signature, SBOM, and SLSA
-provenance; verification instructions are in the README. Known
-unfixable CVEs are tracked in `security/cve-exceptions.yaml` with review
-dates (SPEC.md §5.4).
+provenance; verification instructions are in the README from the first
+release onward. Known unfixable CVEs are tracked in
+`security/cve-exceptions.yaml` with review dates (SPEC.md §5.4).

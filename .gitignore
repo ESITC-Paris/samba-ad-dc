@@ -6,3 +6,5 @@
 .DS_Store
 # Local-only compose overrides
 docker-compose.override.yml
+# SDD controller scratch (plans' working artifacts, never committed)
+.superpowers/
