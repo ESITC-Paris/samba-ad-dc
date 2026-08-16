@@ -1,0 +1,23 @@
+# Versions catalog — the single source of truth for what gets built.
+#
+# Consumed by: the Dockerfile build args (Phase 1), CI (Phase 4) and the
+# release watcher (Phase 6). Every value here is a pin: nothing in the
+# build resolves a "latest" anything.
+#
+# tarball_sha256 is the SHA-256 of the shipped samba-<version>.tar.gz.
+# Upstream signs the *uncompressed* tar, so provenance is established by
+# verifying samba-<version>.tar.asc against keys/samba-release-key.asc
+# (fingerprint 81F5E2832BD2545A1897B713AA99442FB680B620, see
+# keys/PINNING.md) over the gunzipped tar; this checksum then pins the
+# exact compressed artifact the build downloads.
+---
+default_branch: "4.24"
+branches:
+  "4.24":
+    samba_version: "4.24.6"
+    revision: 1  # the N in X.Y.Z-rN
+    tarball_sha256: "810cc955acb367e9bde556dccfb50db177a02b7c553aa1629a0b905fa7616267"
+    base:
+      builder: "debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
+      runtime: "debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
+    pkg_index_hash: "bootstrap"  # replaced by the watcher from Phase 6 on
