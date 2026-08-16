@@ -193,6 +193,70 @@ func Preflight() error {
 	return nil
 }
 
+// Sweep removes every container, volume and network still carrying this
+// harness's ownership label, and returns one line per object it destroyed.
+//
+// It exists for the abnormal exit: a `go test` killed with SIGKILL, a CI job
+// cancelled mid-run, a laptop that slept through a provision. None of those
+// run t.Cleanup or AtExit, so they leave a container holding a fixed name
+// and volumes holding a stale domain — and the next run then either fails on
+// the name or, worse, silently adopts the old state.
+//
+// It is safe by construction: selection is by LABEL, so an object this
+// harness did not create cannot be selected, no matter what it is called.
+// That is the same guarantee removeOwned gives, moved to the front of the
+// run and applied to objects whose names this process no longer knows.
+//
+// TestMain calls it before the first test. Callers should log what it
+// returns: silently destroying state is exactly the behaviour the ownership
+// label exists to prevent.
+func Sweep() []string {
+	var swept []string
+	// Containers first: a volume or network still attached to a running
+	// container cannot be removed, and `rm -f` on the container releases both.
+	for _, kind := range []string{"container", "volume", "network"} {
+		for _, name := range listOwned(kind) {
+			// Re-check ownership rather than trusting the listing: removeOwned
+			// is the single place that decides what may be destroyed.
+			if _, owned := ownership(kind, name); !owned {
+				continue
+			}
+			removeOwned(kind, name)
+			if exists, _ := ownership(kind, name); !exists {
+				swept = append(swept, kind+" "+name)
+			}
+		}
+	}
+	return swept
+}
+
+// listOwned returns the names of docker objects of that kind carrying the
+// ownership label. A docker error yields no names: a sweep that cannot see
+// is a sweep that does nothing.
+func listOwned(kind string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+
+	args := []string{kind, "ls", "--filter", "label=" + ownerLabelArg, "--format", "{{.Name}}"}
+	if kind == "container" {
+		// Only `container ls` needs -a: a stopped leftover is precisely the
+		// case this exists for. It also reports {{.Names}}, not {{.Name}}.
+		args = []string{"container", "ls", "-a",
+			"--filter", "label=" + ownerLabelArg, "--format", "{{.Names}}"}
+	}
+	out, code, err := dockerCmd(ctx, args...)
+	if err != nil || code != 0 {
+		return nil
+	}
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		if n := strings.TrimSpace(line); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
 // ---------------------------------------------------------------------
 // docker plumbing
 // ---------------------------------------------------------------------

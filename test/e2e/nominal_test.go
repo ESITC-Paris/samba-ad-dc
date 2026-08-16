@@ -84,6 +84,19 @@ func provisionedDC(t *testing.T) *nominalFixture {
 		t.Fatalf("the shared provisioned DC could not be created; " +
 			"the first test that needed it failed with the real cause")
 	}
+
+	// A shared container's teardown runs at AtExit, long after the test that
+	// failed has finished, so harness.Shared() cannot dump its logs the way
+	// t.Cleanup does for an owned one. Registering the dump here — on EVERY
+	// test that uses the fixture, not just the one that created it — puts the
+	// DC's log next to the failure that needs it, while the container is still
+	// alive. It costs nothing on a green run.
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("--- docker logs %s (shared fixture) ---\n%s",
+				fixture.DC.Name, harness.Logs(t, fixture.DC.Name))
+		}
+	})
 	return fixture
 }
 
@@ -136,6 +149,11 @@ func mustContain(t *testing.T, what, out string, wants ...string) {
 // B.5: provisioning
 // ---------------------------------------------------------------------
 
+// defaultFunctionLevel is the level the image provisions at when
+// SAMBA_FUNCTION_LEVEL is not set, which is how the fixture starts its DC.
+// It is spelled the way `samba-tool domain level show` prints it.
+const defaultFunctionLevel = "(Windows) 2016"
+
 // TestProvision asserts that a first boot on an empty volume really creates
 // the domain it was asked for: the container reaches healthy, the
 // entrypoint reports the provision as completed, and samba's own CLI reads
@@ -154,11 +172,15 @@ func TestProvision(t *testing.T) {
 		fmt.Sprintf("provisioning a new domain %s in realm %s", harness.Domain, harness.Realm),
 		fmt.Sprintf("domain %s provisioned", harness.Domain))
 
+	// The levels are asserted by VALUE, not merely present: the whole point
+	// of the SAMBA_FUNCTION_LEVEL mirror onto `ad dc functional level` is
+	// that the domain comes up at the level that was asked for, and a check
+	// that only looked for the label would pass at samba's 2008_R2 default.
 	out := harness.Exec(t, f.DC.Name, "samba-tool", "domain", "level", "show")
 	mustContain(t, "samba-tool domain level show", out,
 		harness.BaseDN(),
-		"Domain function level",
-		"Forest function level")
+		"Domain function level: "+defaultFunctionLevel,
+		"Forest function level: "+defaultFunctionLevel)
 }
 
 // ---------------------------------------------------------------------
@@ -222,6 +244,11 @@ func TestKerberosKinit(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("kinit with a wrong password succeeded; the KDC is not authenticating:\n%s", out)
 	}
+	// The REASON has to be the password, not the client failing to find a
+	// KDC, a broken DNS answer or a clock skew — all of which also exit
+	// non-zero and would leave "the KDC rejects bad passwords" unproven.
+	// Heimdal renders the KDC's preauthentication failure as this line.
+	mustContain(t, "kinit with a wrong password", out, "Password incorrect")
 }
 
 // TestKerberizedSMB asserts that the ticket is worth something: after
@@ -243,6 +270,15 @@ func TestKerberizedSMB(t *testing.T) {
 		t.Fatalf("smbclient --use-kerberos=required succeeded with an empty ticket cache; "+
 			"the share is not actually Kerberos-protected:\n%s", out)
 	}
+	// As with kinit above, the REASON is asserted and not just the exit
+	// code — otherwise an unreachable DC would "prove" the same thing. With
+	// Kerberos required and nothing in the cache the client has no mechanism
+	// left to offer, and SPNEGO says so before a session setup is even
+	// attempted. That is a client-side refusal by construction: it is the
+	// absence of the ticket, not a DC-side rejection, and it is exactly the
+	// difference from the successful run above.
+	mustContain(t, "kerberized smbclient with an empty ticket cache", out,
+		"Could not find a suitable mechtype in NEG_TOKEN_INIT")
 }
 
 // ---------------------------------------------------------------------
@@ -348,31 +384,40 @@ func TestLDAPSCertificate(t *testing.T) {
 // B.5 / B.6: signed NTP
 // ---------------------------------------------------------------------
 
-// TestSignedNTPWiring asserts the MS-SNTP wiring the image claims: samba
-// creates and serves a signing socket, chrony is configured against that
-// exact directory (the two ends are configured in different files, so
-// asserting they agree is the whole point), and a client on the domain
-// network gets a usable time measurement out of the DC.
+// TestSignedNTPWiring asserts the MS-SNTP *wiring* the image claims, and is
+// deliberate about where that stops.
 //
-// This is the acceptance test named by the chrony-as-root ruling (B.6): a
-// chronyd that could not reach the signing socket, or that refused to serve
-// its undisciplined clock, fails here.
+// What it proves: samba creates and serves the signing socket; chrony is
+// configured against that exact directory (the two ends are configured in
+// different files that nothing else reconciles, so asserting they agree is
+// the point); and chronyd is actually serving time to the domain network,
+// from a clock it is not allowed to discipline.
+//
+// What it does NOT prove: that a *signed* reply is produced. chrony opens
+// the signing socket lazily, only when a request arrives carrying an
+// authenticator, and producing one requires a client authenticating as a
+// domain machine account — which the protocol test-client is not. The
+// measurement below therefore succeeds whether or not signing works. That
+// boundary is recorded in the profile's B.6 known limitations; a regression
+// inside the signing path itself would show up as a chrony log error, not
+// as a failure here.
+//
+// It remains the acceptance test named by the chrony-as-root ruling (B.6):
+// chronyd unable to open the socket directory, or refusing to serve its
+// undisciplined clock, fails here.
 func TestSignedNTPWiring(t *testing.T) {
 	f := provisionedDC(t)
 	const signdDir = "/var/lib/samba/ntp_signd"
+	// samba names the socket after the service; asserting the exact path
+	// rather than "something socket-shaped is in the directory" is what makes
+	// a failure say which file is missing.
+	const signdSocket = signdDir + "/socket"
 
-	// The socket file name is samba's business; what the contract needs is
-	// a socket in that directory.
-	listing := harness.Exec(t, f.DC.Name, "sh", "-c", "ls -l "+signdDir)
-	var sockets int
-	for _, line := range strings.Split(listing, "\n") {
-		if strings.HasPrefix(line, "s") {
-			sockets++
-		}
-	}
-	if sockets == 0 {
-		t.Fatalf("no socket in %s; samba is not serving MS-SNTP signing requests:\n%s",
-			signdDir, listing)
+	code, out := harness.ExecErr(t, f.DC.Name, "sh", "-c",
+		"test -S "+signdSocket+" || { ls -l "+signdDir+"; exit 1; }")
+	if code != 0 {
+		t.Fatalf("%s is not a socket; samba is not serving MS-SNTP signing "+
+			"requests. Contents of %s:\n%s", signdSocket, signdDir, out)
 	}
 
 	// samba's effective configuration, read through its own parser.
@@ -392,10 +437,11 @@ func TestSignedNTPWiring(t *testing.T) {
 	}
 
 	// And the service answers: a one-shot query (never disciplining the
-	// client's clock) that produces a measurement.
-	out := harness.Client(t, f.Net, clientEnv(f), "sh", "-c",
+	// client's clock) that produces a measurement. Unauthenticated, per the
+	// boundary in this test's doc comment.
+	measured := harness.Client(t, f.Net, clientEnv(f), "sh", "-c",
 		`timeout 60 chronyd -Q -t 30 "server `+f.DC.IP+` iburst"`)
-	mustContain(t, "chronyd -Q against the DC", out, "System clock wrong by")
+	mustContain(t, "chronyd -Q against the DC", measured, "System clock wrong by")
 }
 
 // ---------------------------------------------------------------------
@@ -419,6 +465,11 @@ func TestDBConsistency(t *testing.T) {
 	}, harness.AdminSecret(t))
 	harness.WaitHealthy(t, dc.Name, harness.HealthTimeout)
 
+	// Scope note: bare `samba-tool dbcheck` checks the DEFAULT naming context
+	// only — `--cross-ncs` (schema, configuration, the DNS partitions) is not
+	// run here, and deliberately so: this mirrors exactly what the
+	// entrypoint's maintenance mode does, and a test that checked more than
+	// the shipped procedure would pass while the procedure stayed blind.
 	mustContain(t, "samba-tool dbcheck on the running DC",
 		harness.Exec(t, dc.Name, "samba-tool", "dbcheck"), "(0 errors)")
 

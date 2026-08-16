@@ -55,11 +55,44 @@ const (
 	inboundReplicationTimeout  = 6 * time.Minute
 )
 
+// worstCaseRuntime is what this test can consume if every budget above is
+// spent: a provision, an 8-minute join and the two replication waits. It is
+// what requireDeadline demands, and the reason the package doc insists on
+// `-timeout 45m` for the suite — go test's 10-minute default cannot even
+// hold this one test, and blowing it panics the binary past every cleanup.
+const worstCaseRuntime = joinTimeout + outboundReplicationTimeout + inboundReplicationTimeout +
+	harness.HealthTimeout
+
 // dockerEmbeddedResolver is the address docker publishes its own DNS
 // resolver on inside every container attached to a user-defined network.
 // It is what the DC's internal DNS forwards to; see the comment in the
 // test body for why that address in particular.
 const dockerEmbeddedResolver = "127.0.0.11"
+
+// requireDeadline fails BEFORE starting anything when the time left in the
+// test binary cannot cover what this test is about to do.
+//
+// Failing early is the whole point. Started under the default 10-minute
+// binary timeout, this test gets most of the way through a join and is then
+// killed by a panic — which reads like a product defect, points at whatever
+// happened to be running, and (because a panicking binary runs no
+// t.Cleanup) leaves the containers and volumes behind. A Fatal here names
+// the real cause and the fix. It is deliberately not a Skip: a silently
+// skipped test is a B.5 matrix row that stopped being covered without
+// anyone noticing.
+func requireDeadline(t *testing.T, need time.Duration) {
+	t.Helper()
+	deadline, ok := t.Deadline()
+	if !ok {
+		return // `-timeout 0`: no deadline at all, nothing to check
+	}
+	if left := time.Until(deadline); left < need {
+		t.Fatalf("this test needs up to %s and only %s of the test binary's timeout is left; "+
+			"rerun with a longer one, e.g. go test ./... -timeout 45m "+
+			"(the default 10m cannot hold a DC join plus replication convergence)",
+			need.Round(time.Second), left.Round(time.Second))
+	}
+}
 
 // TestJoinReplicationBothWays asserts the property that makes a second DC
 // worth running: a container started in join mode becomes a full replica
@@ -84,6 +117,7 @@ const dockerEmbeddedResolver = "127.0.0.11"
 //   - both DCs report the SAME functional levels, and the domain's lowest
 //     DC level has not been dragged down by the join (Phase 2 hand-off).
 func TestJoinReplicationBothWays(t *testing.T) {
+	requireDeadline(t, worstCaseRuntime)
 	net := harness.Network(t)
 
 	// The first DC resolves through ITSELF and forwards what it is not
@@ -214,44 +248,81 @@ func showrepl(t *testing.T, container string) string {
 // under each neighbour, e.g. "\t\t0 consecutive failure(s).".
 var consecutiveFailures = regexp.MustCompile(`(?m)^\s*(\d+) consecutive failure`)
 
+// sectionHeader matches the banners `samba-tool drs showrepl` divides its
+// report with, e.g. "==== INBOUND NEIGHBORS ====".
+var sectionHeader = regexp.MustCompile(`(?m)^====\s*(.+?)\s*====\s*$`)
+
+// The two sections this test reads. INBOUND is what this DC pulls FROM its
+// partners; OUTBOUND is the notify list — the partners it tells about its
+// own changes.
+const (
+	inboundSection  = "INBOUND NEIGHBORS"
+	outboundSection = "OUTBOUND NEIGHBORS"
+)
+
+// showreplSections splits a showrepl report into its banner-delimited
+// sections, keyed by banner text. Reading a counter without knowing which
+// section it came from is what makes a failure say "replication is broken"
+// instead of "this DC cannot pull from that one".
+func showreplSections(out string) map[string]string {
+	locs := sectionHeader.FindAllStringSubmatchIndex(out, -1)
+	sections := make(map[string]string, len(locs))
+	for i, loc := range locs {
+		end := len(out)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		sections[strings.ToUpper(out[loc[2]:loc[3]])] = out[loc[1]:end]
+	}
+	return sections
+}
+
 // assertReplicationHealthy asserts that a DC's replication links are not
-// merely present but working: it names wantPartner as a neighbour, it
-// reports both neighbour sections, and every partner it lists has zero
-// consecutive failures.
+// merely present but working: it pulls from wantPartner, and no partner in
+// either direction has a non-zero failure counter.
 //
 // Counting the neighbours matters as much as reading the counters: a DC
 // with no partners at all reports no failures either, and would sail
-// through a check that only looked for the word "failure".
+// through a check that only looked for the word "failure". That count is
+// required of the INBOUND section only — an empty OUTBOUND list is a normal
+// transient state, because a DC appears in its partner's notify list only
+// once that partner has registered itself there (observed on a freshly
+// joined DC), while an empty INBOUND list means this DC can never learn
+// anything from the domain.
 func assertReplicationHealthy(t *testing.T, container, wantPartner string) {
 	t.Helper()
 	out := harness.Exec(t, container, "samba-tool", "drs", "showrepl")
+	sections := showreplSections(out)
+	partner := strings.ToUpper(wantPartner)
 
-	for _, section := range []string{"INBOUND NEIGHBORS", "OUTBOUND NEIGHBORS"} {
-		if !strings.Contains(out, section) {
-			t.Fatalf("drs showrepl on %s has no %s section:\n%s", container, section, out)
+	for _, name := range []string{inboundSection, outboundSection} {
+		body, ok := sections[name]
+		if !ok {
+			t.Fatalf("drs showrepl on %s has no %s section:\n%s", container, name, out)
+		}
+		// The counter — not the presence of the word "failed" — is the
+		// verdict: samba keeps printing the last failed attempt of a partner
+		// that has since recovered, and a link that recovered is a working
+		// link. A counter above zero means it has not.
+		for _, m := range consecutiveFailures.FindAllStringSubmatch(body, -1) {
+			n, err := strconv.Atoi(m[1])
+			if err != nil || n != 0 {
+				t.Fatalf("drs showrepl on %s reports %q under %s; "+
+					"replication is failing in that direction:\n%s",
+					container, strings.TrimSpace(m[0]), name, out)
+			}
 		}
 	}
+
+	inbound := sections[inboundSection]
 	// samba prints a DC as "<site>\<NETBIOS NAME>", upper-cased.
-	if !strings.Contains(out, `\`+strings.ToUpper(wantPartner)) {
-		t.Fatalf("drs showrepl on %s does not name %s as a replication partner:\n%s",
-			container, strings.ToUpper(wantPartner), out)
+	if !strings.Contains(inbound, `\`+partner) {
+		t.Fatalf("drs showrepl on %s lists no inbound connection from %s; "+
+			"it cannot pull changes made there:\n%s", container, partner, out)
 	}
-
-	matches := consecutiveFailures.FindAllStringSubmatch(out, -1)
-	if len(matches) == 0 {
-		t.Fatalf("drs showrepl on %s reports no replication partner at all; "+
+	if len(consecutiveFailures.FindAllString(inbound, -1)) == 0 {
+		t.Fatalf("drs showrepl on %s reports no inbound replication partner at all; "+
 			"the DC is isolated:\n%s", container, out)
-	}
-	// The counter — not the presence of the word "failed" — is the verdict:
-	// samba keeps printing the last failed attempt of a partner that has
-	// since recovered, and a link that recovered is a working link. A
-	// counter above zero means it has not.
-	for _, m := range matches {
-		n, err := strconv.Atoi(m[1])
-		if err != nil || n != 0 {
-			t.Fatalf("drs showrepl on %s reports %q; replication is failing:\n%s",
-				container, strings.TrimSpace(m[0]), out)
-		}
 	}
 }
 

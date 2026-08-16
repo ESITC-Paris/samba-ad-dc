@@ -2,6 +2,24 @@
 // image (SPEC §8.2, Annex B.5). Every test function name in this package
 // is a stable traceability ID: they are referenced from
 // docs/traceability.md and MUST NOT be renamed.
+//
+// # Running it
+//
+//	cd test/e2e && go test ./... -v -count=1 -timeout 45m
+//
+// The `-timeout` is REQUIRED, not decoration. go test defaults to 10
+// minutes for the whole binary, and this suite provisions domains, joins a
+// second domain controller and waits for replication to converge: the
+// multi-DC test alone budgets up to ~19 minutes of worst case. Worse than
+// being slow, blowing the binary timeout is *destructive*: go test panics
+// the process, which skips every t.Cleanup and every AtExit teardown and
+// leaves labeled containers, volumes and networks behind. (harness.Sweep,
+// which TestMain runs, cleans those up on the NEXT run — but a run that
+// leaks is still a run whose teardown never proved anything.)
+//
+// TestJoinReplicationBothWays refuses to start when the deadline it is
+// given is plainly too short, rather than failing 10 minutes later with a
+// timeout that looks like a product defect.
 package e2e
 
 import (
@@ -25,6 +43,13 @@ func TestMain(m *testing.M) {
 	if err := harness.Preflight(); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e preflight failed: %v\n", err)
 		os.Exit(1)
+	}
+	// Anything still labeled belongs to a run that died without teardown —
+	// a killed `go test`, a cancelled CI job, a binary timeout. It is
+	// reported rather than swept in silence, because "the suite destroyed
+	// something" must always be visible in the log.
+	for _, s := range harness.Sweep() {
+		fmt.Fprintf(os.Stderr, "e2e preflight: swept leftover %s from a previous run\n", s)
 	}
 	code := m.Run()
 	harness.Cleanup()
