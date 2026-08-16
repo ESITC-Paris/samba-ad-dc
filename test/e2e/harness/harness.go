@@ -91,6 +91,12 @@ const (
 	ExitTimeout = 5 * time.Minute
 	// ExecTimeout bounds a single `docker exec`.
 	ExecTimeout = 2 * time.Minute
+	// PullTimeout is how long EnsureImage may spend fetching a reference
+	// image from a registry. It is exported because a test that calls
+	// EnsureImage must count it into the deadline it demands of the test
+	// binary: a pull that runs for its whole budget is time the test then
+	// no longer has for the domain controller it was about to start.
+	PullTimeout = 10 * time.Minute
 	// dockerTimeout bounds the short bookkeeping commands (inspect, rm,
 	// volume create) that should answer immediately or not at all.
 	dockerTimeout = 60 * time.Second
@@ -626,7 +632,7 @@ func EnsureImage(t *testing.T, ref string) {
 	if err == nil && code == 0 {
 		return
 	}
-	pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	pullCtx, pullCancel := context.WithTimeout(context.Background(), PullTimeout)
 	defer pullCancel()
 	out, code, err := dockerCmd(pullCtx, "pull", ref)
 	if err != nil || code != 0 {
@@ -642,7 +648,7 @@ func EnsureImage(t *testing.T, ref string) {
 // log if the test failed.
 func StartDC(t *testing.T, net, name, mode string, env map[string]string, opts ...Opt) *DC {
 	t.Helper()
-	dc, _ := startDC(t, net, name, mode, env, opts...)
+	dc, _ := startDC(t, net, name, mode, env, true, opts...)
 	return dc
 }
 
@@ -652,7 +658,7 @@ func StartDC(t *testing.T, net, name, mode string, env map[string]string, opts .
 // contract's exit codes.
 func RunDCExpectExit(t *testing.T, net, name, mode string, env map[string]string, opts ...Opt) (int, string) {
 	t.Helper()
-	dc, _ := startDC(t, net, name, mode, env, opts...)
+	dc, _ := startDC(t, net, name, mode, env, false, opts...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), ExitTimeout)
 	defer cancel()
@@ -673,7 +679,11 @@ func RunDCExpectExit(t *testing.T, net, name, mode string, env map[string]string
 	return exit, logs
 }
 
-func startDC(t *testing.T, net, name, mode string, env map[string]string, opts ...Opt) (*DC, *spec) {
+// startDC is the shared body of StartDC and RunDCExpectExit. mustLive says
+// which of the two called it: true when the container is expected to come up
+// and keep running, false when it is expected to terminate on its own. Only
+// the name guard below reads it.
+func startDC(t *testing.T, net, name, mode string, env map[string]string, mustLive bool, opts ...Opt) (*DC, *spec) {
 	t.Helper()
 
 	s := &spec{
@@ -692,6 +702,7 @@ func startDC(t *testing.T, net, name, mode string, env map[string]string, opts .
 	for _, opt := range opts {
 		opt(s)
 	}
+	requireNetBIOSName(t, name, mode, s, mustLive)
 
 	// A leftover container of the same name from an interrupted run must
 	// not turn every later run red — but only a leftover of *ours* may be
@@ -789,21 +800,97 @@ func startDC(t *testing.T, net, name, mode string, env map[string]string, opts .
 	// The address and the state are read in ONE inspect on purpose. A
 	// container that has already finished has no address any more, and the
 	// one-off containers of the operational matrix — `samba-tool domain
-	// backup offline`, a marker edit through python3 — routinely exit
-	// before this line runs. Treating that as "no address on the network"
-	// would report a networking fault for a command that simply succeeded
-	// quickly. An address is therefore only *required* of a container that
-	// is still running, which is every container whose address a test can
-	// actually use; a DC that died on boot is diagnosed a moment later by
-	// WaitHealthy or RunDCExpectExit, with its logs attached.
+	// backup offline`, a marker edit through python3 — routinely exit before
+	// this line runs. Treating that as "no address on the network" would
+	// report a networking fault for a command that simply succeeded quickly.
+	//
+	// The relaxation is keyed on mustLive, not on the entrypoint override: a
+	// container handed to RunDCExpectExit is asserted to terminate, and it
+	// may well have done so already — the negative matrix's refusals exit in
+	// under a second, and so does `python3 -c`. Demanding an address of a
+	// container that has correctly finished reports a networking fault for a
+	// success.
+	//
+	// A container StartDC started is the opposite case: it must be running,
+	// its address is what the tests talk to, and a missing one is a fault
+	// worth naming here and now rather than letting WaitHealthy turn a
+	// precise diagnosis into a timeout.
 	out := strings.TrimSpace(mustDocker(t, "inspect", "-f",
 		fmt.Sprintf("{{with index .NetworkSettings.Networks %q}}{{.IPAddress}}{{end}}|{{.State.Status}}", net), name))
 	ip, status, _ := strings.Cut(out, "|")
 	dc.IP = strings.TrimSpace(ip)
-	if dc.IP == "" && strings.TrimSpace(status) == "running" {
-		t.Fatalf("container %s is running but has no address on network %s", name, net)
+	if dc.IP == "" && mustLive {
+		t.Fatalf("container %s has no address on network %s (state: %s)",
+			name, net, strings.TrimSpace(status))
 	}
 	return dc, s
+}
+
+// NetBIOSNameLimit is the longest a container name may be when that
+// container is allowed to INITIALIZE a domain.
+//
+// A DC container's name is its host name, and samba derives the domain
+// controller's NetBIOS name from it. NetBIOS names are capped at 15
+// characters, so samba truncates — and a name that is 16 characters with a
+// hyphen at position 16 truncates to something ending in `-`, which is not a
+// legal DNS label. The provision then registers a host record the image's own
+// health probe cannot resolve, and the container sits at `starting` until it
+// times out with a DNS error that points at samba's DNS server rather than at
+// the name that caused it.
+//
+// Evidence: Task 5 hit exactly this with the container name
+// `negative-state-dc1` (18 characters). The failure looked like a product
+// defect and was not one.
+const NetBIOSNameLimit = 15
+
+// requireNetBIOSName refuses, before anything is created, a container name
+// that samba would have to truncate.
+//
+// It is deliberately narrow, and each of the three exemptions is load-bearing
+// rather than a convenience:
+//
+//   - Only modes that may WRITE a new domain into the volume are checked —
+//     provision, join, and the auto mode an empty SAMBA_MODE selects —
+//     because that is the moment the name is baked into the directory as
+//     `netbios name`. A run- or maintenance-mode container reads that name
+//     back out of the smb.conf on the configuration volume and never
+//     consults its own host name, which is why the restart and upgrade rows
+//     can legitimately give the replacement container a longer, more
+//     descriptive name.
+//   - A container whose entrypoint is overridden is exempt because the
+//     entrypoint never runs at all: a one-off `samba-tool`, `sh` or
+//     `python3` initializes nothing.
+//   - Only StartDC is checked, never RunDCExpectExit (mustLive). A container
+//     handed to RunDCExpectExit is asserted to TERMINATE — it is the
+//     negative matrix, where provision mode is chosen precisely so the
+//     entrypoint can refuse it, and the name never reaches samba. Guarding
+//     there would fail correct tests (`refuse-provision`, `refuse-env-admin`)
+//     for a truncation that can never happen, while adding nothing: a
+//     container that did provision successfully would not exit, and the
+//     exit-code assertion would catch it.
+func requireNetBIOSName(t *testing.T, name, mode string, s *spec, mustLive bool) {
+	t.Helper()
+	if !mustLive || s.entrypoint != "" || len(name) <= NetBIOSNameLimit {
+		return
+	}
+	switch mode {
+	case "", "auto", "provision", "join":
+		t.Fatalf("container name %q is %d characters, over the %d-character NetBIOS limit, "+
+			"and SAMBA_MODE=%s may initialize a domain with it: samba would truncate the "+
+			"name to %q and register a host record the health probe cannot resolve "+
+			"(a truncation ending in `-` is not a legal DNS label). Give the container a "+
+			"name of at most %d characters.",
+			name, len(name), NetBIOSNameLimit, modeOrAuto(mode),
+			name[:NetBIOSNameLimit], NetBIOSNameLimit)
+	}
+}
+
+// modeOrAuto renders an empty SAMBA_MODE as the mode it actually selects.
+func modeOrAuto(mode string) string {
+	if mode == "" {
+		return "auto (unset)"
+	}
+	return mode
 }
 
 func sortedKeys(m map[string]string) []string {

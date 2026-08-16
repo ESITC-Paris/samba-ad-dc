@@ -66,20 +66,31 @@ const (
 // which then reported "DNS response contained records which contain invalid
 // names" — refuses the answer, and the container never becomes healthy. The
 // symptom is a DC that provisions perfectly and then fails its health check
-// forever, which reads exactly like an image defect. Only `refuseDC` below
-// actually provisions; the rest exit before samba ever starts and are
-// therefore unconstrained, but they are kept short for consistency.
+// forever, which reads exactly like an image defect.
+//
+// Only `refuseDC` below actually provisions; the rest exit before samba ever
+// starts and are therefore unconstrained. They are nonetheless all kept to
+// harness.NetBIOSNameLimit (15 characters) so that no name in this file
+// depends on which side of that line it happens to fall — the harness guard
+// that enforces the limit exempts them, and a name kept legal by an
+// exemption is one rename away from being a bug.
+//
+// `refuseDCRestart` is the single deliberate exception: at 16 characters it
+// is over the limit, and it may be, because it is the only name here used in
+// `run` mode. A run-mode container reads its NetBIOS name back out of the
+// smb.conf on the configuration volume and never derives one from its host
+// name, so nothing truncates.
 const (
 	refuseNoFile  = "refuse-nofile"
 	refuseBadFile = "refuse-badfile"
 
-	refuseEnvAdmin = "refuse-env-admin"
+	refuseEnvAdmin = "refuse-env-adm"
 	refuseEnvJoin  = "refuse-env-join"
 
 	refuseDC        = "refuse-dc1"
-	refuseProvision = "refuse-provision"
+	refuseProvision = "refuse-prov"
 	refuseJoin      = "refuse-join"
-	refuseDCRestart = "refuse-dc1-again"
+	refuseDCRestart = "refuse-dc1-again" // run mode only; see the note above
 
 	refuseRun   = "refuse-run"
 	refuseMaint = "refuse-maint"
@@ -301,9 +312,10 @@ const stateGuardWorstCase = harness.HealthTimeout + 2*harness.ExitTimeout + harn
 // domain provision` had already begun writing, and every assertion about
 // the code and the message would still pass over the wreckage. So the same
 // volumes are then started in run mode and interrogated: the user created
-// before the refusal is still in the directory, and the marker is
-// byte-for-byte the one the provision wrote. That — not the exit code — is
-// the property an operator is actually relying on.
+// before the refusal is still in the directory, and the marker matches
+// field-for-field over the documented marker fields the one the provision
+// wrote. That — not the exit code — is the property an operator is actually
+// relying on.
 func TestProvisionOverStateRefused(t *testing.T) {
 	requireDeadline(t, stateGuardWorstCase)
 	net := harness.Network(t)
@@ -365,10 +377,17 @@ func TestProvisionOverStateRefused(t *testing.T) {
 	mustExit(t, refuseJoin, code, exitStateExists,
 		"join over an initialized volume is refused with 20, like provision", logs)
 
+	// The same four fragments the provision twin asserts, for the same
+	// reason: this row is a full half of the contract, not a spot check, and
+	// a join refusal that dropped the "discard it on purpose" remedy would
+	// leave an operator who really did mean to rebuild the domain with no
+	// documented way forward.
 	mustContain(t, "join-over-state refusal", logs,
 		"ERROR: SAMBA_MODE=join would initialize a new domain "+
 			"but the volume already holds samba state",
-		"set SAMBA_MODE=run to keep and start the existing domain")
+		"/var/lib/samba/private/sam.ldb exists",
+		"set SAMBA_MODE=run to keep and start the existing domain",
+		"delete the state volume first")
 	mustNotContain(t, "join-over-state refusal", logs, initPhrases...)
 
 	// --- the state the refusals protected --------------------------------

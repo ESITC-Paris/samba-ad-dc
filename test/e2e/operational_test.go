@@ -28,6 +28,7 @@ const (
 	backupSource   = "backup-dc1"
 	backupRestored = "backup-dc2"
 	backupRunner   = "backup-offline"
+	backupLister   = "backup-list"
 	restoreRunner  = "backup-restore"
 
 	downgradeDC     = "downgrade-dc1"
@@ -132,8 +133,9 @@ func mustNotContain(t *testing.T, what, out string, unwanted ...string) {
 //   - the container exits 0 when asked to stop (§6.3);
 //   - the replacement container reaches the image's own health verdict;
 //   - a user created before the stop is still there afterwards;
-//   - the marker is byte-for-byte what it was, and the second boot printed
-//     none of the lines an initialization or an adoption prints.
+//   - the marker matches field-for-field over the documented marker fields,
+//     and the second boot printed none of the lines an initialization or an
+//     adoption prints.
 func TestIdempotentRestart(t *testing.T) {
 	net := harness.Network(t)
 
@@ -196,10 +198,22 @@ func TestIdempotentRestart(t *testing.T) {
 	// terminated: " or "shutdown requested: ". That race is harmless (both
 	// lead to the same ordered stop) and pinning either wording would make
 	// this test flaky for no gain.
-	mustContain(t, "shutdown trace of "+dc.Name, harness.Logs(t, dc.Name),
+	shutdown := harness.Logs(t, dc.Name)
+	mustContain(t, "shutdown trace of "+dc.Name, shutdown,
 		"stopping samba, then chronyd",
 		"samba stopped",
 		"chronyd stopped")
+
+	// The ORDER is the contract, not merely the presence of both lines: the
+	// directory has to leave the network before the time service it depends
+	// on, and a supervisor that stopped chronyd first would print exactly the
+	// same three lines. Read off the log because that is the only place the
+	// sequence is observable from outside the container.
+	if i, j := strings.Index(shutdown, "samba stopped"), strings.Index(shutdown, "chronyd stopped"); i > j {
+		t.Fatalf("chronyd stopped before samba did (offsets %d and %d): the supervisor must "+
+			"stop the domain controller first and its time service second (§6.3)\n%s",
+			j, i, shutdown)
+	}
 
 	// --- the restart ----------------------------------------------------
 	//
@@ -217,6 +231,9 @@ func TestIdempotentRestart(t *testing.T) {
 	// The directory, not the container: carol survived the stop.
 	harness.Exec(t, again.Name, "samba-tool", "user", "show", "carol")
 
+	// Field-for-field over the documented marker fields (samba_version,
+	// initialized_at, last_mode): a start on a volume this image already
+	// owns must touch none of them.
 	if after := readMarker(t, again.Name); after != before {
 		t.Fatalf("the marker changed across a restart: was %+v, is now %+v; "+
 			"a start on a volume this image already owns must touch nothing", before, after)
@@ -236,10 +253,13 @@ func TestIdempotentRestart(t *testing.T) {
 // the health probe's first question can be answered at all.
 const restoreHealthTimeout = 6 * time.Minute
 
-// backupWorstCase is what this test can consume if every budget is spent.
-// It is well past `go test`'s 10-minute default, which is why the test
-// refuses to start under one — see requireDeadline in replication_test.go.
-const backupWorstCase = harness.HealthTimeout + harness.ExitTimeout + restoreHealthTimeout
+// backupWorstCase is what this test can consume if every budget is spent:
+// the source DC's provision, THREE one-off containers each bounded by
+// harness.ExitTimeout (the backup, the listing that proves its tarball
+// exists, and the restore), and the restored DC's health transition. It is
+// well past `go test`'s 10-minute default, which is why the test refuses to
+// start under one — see requireDeadline in replication_test.go.
+const backupWorstCase = harness.HealthTimeout + 3*harness.ExitTimeout + restoreHealthTimeout
 
 // TestOfflineBackupRestore asserts the disaster-recovery procedure end to
 // end: an offline backup taken from the stopped volumes of one DC is
@@ -285,6 +305,13 @@ func TestOfflineBackupRestore(t *testing.T) {
 	}
 
 	// --- the backup -----------------------------------------------------
+	//
+	// The state and configuration volumes are mounted READ-WRITE, and cannot
+	// be otherwise: `samba-tool domain backup offline` takes exclusive locks
+	// on the databases it copies — which is precisely why a read-only
+	// snapshot of a live volume is not a valid backup of an AD database and
+	// why the profile's B.6 position points operators at this command rather
+	// than at `cp` or a filesystem snapshot.
 	backupVol := harness.Volume(t)
 	code, logs := harness.RunDCExpectExit(t, net, backupRunner, "", nil,
 		harness.WithVolumes(src.StateVolume, src.ConfVolume),
@@ -295,6 +322,22 @@ func TestOfflineBackupRestore(t *testing.T) {
 		t.Fatalf("samba-tool domain backup offline: exit code = %d, want 0\n%s", code, logs)
 	}
 	mustContain(t, "offline backup", logs, "Backup succeeded.")
+
+	// The tarball is asserted to EXIST, separately and immediately, rather
+	// than being discovered missing by the restore's shell glob three steps
+	// later. "Backup succeeded." is samba's opinion; this is the artefact.
+	// No WithVolumes: this container has no business seeing the domain's
+	// state, so it gets throwaway volumes of its own and only the backup
+	// volume — read-only, which IS possible here because reading a tarball
+	// takes no locks.
+	code, logs = harness.RunDCExpectExit(t, net, backupLister, "", nil,
+		harness.WithRunArgs("-v", backupVol+":"+backupDir+":ro"),
+		harness.WithEntrypoint("ls", "-l", backupDir))
+	if code != 0 {
+		t.Fatalf("listing the backup volume after a backup that reported success: "+
+			"exit code = %d, want 0\n%s", code, logs)
+	}
+	mustContain(t, "the backup volume", logs, "samba-backup-")
 
 	// --- the restore ----------------------------------------------------
 	//
@@ -395,9 +438,14 @@ func TestOfflineBackupRestore(t *testing.T) {
 // B.5 / §8.3: upgrade from the last published image
 // ---------------------------------------------------------------------
 
-// upgradeWorstCase is this test's budget when it does not skip: a provision
-// on the old image, and a health transition that includes a full dbcheck.
-const upgradeWorstCase = harness.HealthTimeout + harness.HealthTransitionTimeout
+// upgradeWorstCase is this test's budget when it does not skip: fetching the
+// published image it upgrades FROM, a provision on that image, and a health
+// transition that includes a full dbcheck.
+//
+// The pull is counted because it is real time this test can spend before it
+// has started anything: E2E_UPGRADE_FROM names a registry reference, and on
+// a cold CI runner harness.EnsureImage will actually go and get it.
+const upgradeWorstCase = harness.PullTimeout + harness.HealthTimeout + harness.HealthTransitionTimeout
 
 // TestUpgradeFromLastPublished asserts that an existing domain survives the
 // image being replaced: the volume a published image initialized is started
@@ -472,6 +520,13 @@ func TestUpgradeFromLastPublished(t *testing.T) {
 // B.5: the downgrade guard
 // ---------------------------------------------------------------------
 
+// downgradeWorstCase is this test's budget if every one of them is spent: a
+// provision, then TWO one-off containers each bounded by harness.ExitTimeout
+// — the marker edit, and the refusal itself. That is past `go test`'s
+// 10-minute default, so this test refuses to start under one rather than
+// being killed mid-provision by a panic that skips every cleanup.
+const downgradeWorstCase = harness.HealthTimeout + 2*harness.ExitTimeout
+
 // TestDowngradeRefused asserts the guard that protects a directory database
 // from being opened by an older Samba than the one that wrote it: the
 // container refuses to start, with the documented exit code and a message
@@ -481,6 +536,7 @@ func TestUpgradeFromLastPublished(t *testing.T) {
 // what is exercised is the guard in front of a working DC, not a synthetic
 // file the entrypoint would have rejected for some other reason.
 func TestDowngradeRefused(t *testing.T) {
+	requireDeadline(t, downgradeWorstCase)
 	net := harness.Network(t)
 
 	dc := harness.StartDC(t, net, downgradeDC, "provision", map[string]string{
