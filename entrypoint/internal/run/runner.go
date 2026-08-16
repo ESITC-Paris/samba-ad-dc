@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 )
 
 // Runner is the single seam through which the entrypoint shells out (§6.7).
@@ -32,9 +31,14 @@ const redactedValue = "<redacted>"
 
 // secretFlags are the argv flags whose value is a password. samba-tool has no
 // way to take these from the environment or from stdin, so they are passed on
-// the command line — see the note on provisionArgs in run.go. They are
+// the command line — see the note on Executor.provision in run.go. They are
 // redacted in every log line and every error this package produces, because a
 // crash report or a CI log outlives the container's process table.
+//
+// MAINTENANCE: any future flag that carries a secret — a machine password, a
+// keytab passphrase, a bind DN password — MUST be added here in the same
+// change that introduces it. Redaction is opt-in by construction, so a flag
+// missing from this list is a password printed to the container log.
 var secretFlags = []string{"--adminpass", "--password"}
 
 // redactArgs returns a copy of args with every password value replaced. The
@@ -92,16 +96,21 @@ func (r *execRunner) Run(ctx context.Context, name string, args ...string) error
 	return nil
 }
 
-// Start executes name as a daemon. Cancelling ctx asks the child to stop the
-// same way Supervise does — with SIGTERM — instead of the SIGKILL os/exec
-// would send by default: a killed samba leaves its databases mid-write.
+// Start executes name as a daemon.
+//
+// Cancelling ctx does NOT touch the child: the supervisor owns every signal
+// a daemon receives, and it stops them in a deliberate order (samba, then
+// chronyd). The default os/exec behavior — SIGKILL to every child the moment
+// the context is done — would both defeat that order and leave samba's
+// databases mid-write, so Cancel is a no-op and Supervise passes a
+// non-cancellable context anyway.
 func (r *execRunner) Start(ctx context.Context, name string, args ...string) (Proc, error) {
 	line := commandLine(name, args)
 	r.log(line)
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout = r.stdout
 	cmd.Stderr = r.stderr
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.Cancel = func() error { return nil }
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%s: %w", line, err)
 	}

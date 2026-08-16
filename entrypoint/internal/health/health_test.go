@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/esitc-paris/samba-ad-dc/entrypoint/internal/run"
 )
@@ -280,6 +281,33 @@ func TestCheckUsesTheConfiguredSmbclientBinary(t *testing.T) {
 	}
 }
 
+func TestRemainingNeverReturnsANonPositiveTimeout(t *testing.T) {
+	t.Run("no deadline falls back to the probe timeout", func(t *testing.T) {
+		if got := remaining(context.Background()); got != probeTimeout {
+			t.Errorf("remaining = %s, want %s", got, probeTimeout)
+		}
+	})
+
+	t.Run("an exhausted budget is clamped to a positive floor", func(t *testing.T) {
+		// A zero or negative timeout means "no timeout" to net.Dialer: an
+		// exhausted budget must fail the probe, never unbound it.
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		if got := remaining(ctx); got != minProbeTimeout {
+			t.Errorf("remaining = %s, want the %s floor", got, minProbeTimeout)
+		}
+	})
+
+	t.Run("a live deadline is used as is", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		got := remaining(ctx)
+		if got <= minProbeTimeout || got > time.Second {
+			t.Errorf("remaining = %s, want roughly the caller's second", got)
+		}
+	})
+}
+
 // TestNewInstallsRealProbes guards the wiring: the package-level Check must
 // reach the real network probes, not nil function fields.
 func TestNewInstallsRealProbes(t *testing.T) {
@@ -299,21 +327,94 @@ func TestNewInstallsRealProbes(t *testing.T) {
 }
 
 // TestCheckFunctionDelegates covers the exported convenience wrapper that
-// main calls for the HEALTHCHECK subcommand.
+// main calls for the HEALTHCHECK subcommand. It stays hermetic: the
+// configuration is unreadable, which fails before any probe dials anything,
+// so the test asserts the delegation without depending on what does or does
+// not answer on the loopback address of the machine running it.
 func TestCheckFunctionDelegates(t *testing.T) {
 	r := &fakeRunner{}
-	path := smbConf(t, validConf)
-	// The real DNS and LDAP probes cannot reach a DC from a unit test, so
-	// this asserts only that the wrapper fails rather than panicking, and
-	// that it names the first failing probe.
+	path := filepath.Join(t.TempDir(), "absent", "smb.conf")
+
 	err := Check(context.Background(), r, path)
 	if err == nil {
-		t.Skip("a DC answers on this host; the E2E health test covers the passing path")
+		t.Fatal("expected an error when the configuration cannot be read")
 	}
-	if !strings.Contains(err.Error(), "DNS") && !strings.Contains(err.Error(), "LDAP") {
-		t.Errorf("error %q names no probe", err)
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("error %q does not name the configuration file", err)
 	}
-	if !strings.Contains(err.Error(), "127.0.0.1") {
-		t.Errorf("error %q does not say where it probed", err)
+	if len(r.calls) != 0 {
+		t.Errorf("the wrapper probed anyway: %v", r.calls)
 	}
+}
+
+// TestCheckReportsWhereItProbed pins the addresses in the messages: an
+// operator reading a failed HEALTHCHECK must see that the check is about
+// this container's loopback, not about the network.
+func TestCheckReportsWhereItProbed(t *testing.T) {
+	tests := []struct {
+		name    string
+		arrange func(*Prober, *probeLog, *fakeRunner)
+		want    []string
+	}{
+		{
+			name:    "dns",
+			arrange: func(_ *Prober, l *probeLog, _ *fakeRunner) { l.dnsErr = errors.New("i/o timeout") },
+			want:    []string{"DNS", "127.0.0.1:53", "_ldap._tcp.AD.EXAMPLE.COM"},
+		},
+		{
+			name:    "ldap",
+			arrange: func(_ *Prober, l *probeLog, _ *fakeRunner) { l.ldapErr = errors.New("connection refused") },
+			want:    []string{"LDAP", "ldap://127.0.0.1:389"},
+		},
+		{
+			name:    "smb",
+			arrange: func(_ *Prober, _ *probeLog, r *fakeRunner) { r.err = errors.New("NT_STATUS_CONNECTION_REFUSED") },
+			want:    []string{"SMB", "127.0.0.1"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &fakeRunner{}
+			p, log := testProber(t, r, validConf)
+			tc.arrange(p, log, r)
+
+			err := p.Check(context.Background())
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			for _, frag := range tc.want {
+				if !strings.Contains(err.Error(), frag) {
+					t.Errorf("error %q does not contain %q", err, frag)
+				}
+			}
+		})
+	}
+}
+
+// TestSMBProbeIsBounded asserts the SMB probe is given a deadline like the
+// other two: a hung smbclient must fail the health check, not outlive it.
+func TestSMBProbeIsBounded(t *testing.T) {
+	r := &deadlineRunner{}
+	p, _ := testProber(t, r, validConf)
+
+	if err := p.Check(context.Background()); err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if !r.hadDeadline {
+		t.Error("the SMB probe ran with an unbounded context")
+	}
+}
+
+// deadlineRunner records whether the context it received carried a deadline.
+type deadlineRunner struct {
+	hadDeadline bool
+}
+
+func (d *deadlineRunner) Run(ctx context.Context, name string, args ...string) error {
+	_, d.hadDeadline = ctx.Deadline()
+	return nil
+}
+
+func (d *deadlineRunner) Start(ctx context.Context, name string, args ...string) (run.Proc, error) {
+	return nil, errors.New("the health check never starts daemons")
 }

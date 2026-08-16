@@ -26,6 +26,7 @@ type call struct {
 	kind string // "run" (waited) or "start" (daemon)
 	name string
 	args []string
+	ctx  context.Context
 }
 
 // key names a call the way the fakes are scripted: binary plus its first
@@ -39,11 +40,13 @@ func key(name string, args []string) string {
 
 // fakeProc is a controllable stand-in for a started daemon.
 type fakeProc struct {
-	mu       sync.Mutex
-	sigs     []os.Signal
-	done     chan error
-	once     sync.Once
-	onSignal func() // observation point for shutdown ordering
+	mu         sync.Mutex
+	sigs       []os.Signal
+	done       chan error
+	once       sync.Once
+	onSignal   func() // observation point for shutdown ordering
+	ignoreTerm bool   // only SIGKILL ends it
+	ignoreAll  bool   // nothing ends it: the unreapable daemon
 }
 
 // exitingProc returns a process that has already exited with err.
@@ -56,17 +59,39 @@ func exitingProc(err error) *fakeProc {
 // liveProc returns a process that runs until it is signaled.
 func liveProc() *fakeProc { return &fakeProc{done: make(chan error, 1)} }
 
+// stubbornProc ignores SIGTERM the way a wedged samba does, and dies only
+// when it is killed.
+func stubbornProc() *fakeProc { return &fakeProc{done: make(chan error, 1), ignoreTerm: true} }
+
+// unreapableProc never exits, whatever it is sent: the D-state process the
+// shutdown must give up on instead of hanging behind.
+func unreapableProc(t *testing.T) *fakeProc {
+	p := &fakeProc{done: make(chan error, 1), ignoreAll: true}
+	// Release the reaping goroutine when the test ends.
+	t.Cleanup(p.exit)
+	return p
+}
+
 func (p *fakeProc) Signal(sig os.Signal) error {
 	p.mu.Lock()
 	p.sigs = append(p.sigs, sig)
 	hook := p.onSignal
+	ignoreAll, ignoreTerm := p.ignoreAll, p.ignoreTerm
 	p.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
-	p.once.Do(func() { p.done <- nil })
+	switch {
+	case ignoreAll:
+	case ignoreTerm && sig != os.Kill:
+	default:
+		p.exit()
+	}
 	return nil
 }
+
+// exit ends the process once.
+func (p *fakeProc) exit() { p.once.Do(func() { p.done <- nil }) }
 
 func (p *fakeProc) Wait() error { return <-p.done }
 
@@ -104,12 +129,12 @@ func (f *fakeRunner) record(c call) {
 }
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) error {
-	f.record(call{kind: "run", name: name, args: args})
+	f.record(call{kind: "run", name: name, args: args, ctx: ctx})
 	return f.runErr[key(name, args)]
 }
 
 func (f *fakeRunner) Start(ctx context.Context, name string, args ...string) (Proc, error) {
-	f.record(call{kind: "start", name: name, args: args})
+	f.record(call{kind: "start", name: name, args: args, ctx: ctx})
 	if err := f.startErr[name]; err != nil {
 		return nil, err
 	}
@@ -119,6 +144,19 @@ func (f *fakeRunner) Start(ctx context.Context, name string, args ...string) (Pr
 		f.procs[name] = p
 	}
 	return p, nil
+}
+
+// startContexts returns the context each daemon was started with.
+func (f *fakeRunner) startContexts() []context.Context {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []context.Context
+	for _, c := range f.calls {
+		if c.kind == "start" {
+			out = append(out, c.ctx)
+		}
+	}
+	return out
 }
 
 // names renders the recorded calls as "kind:binary" for order assertions.
@@ -157,9 +195,9 @@ const testSecret = "hunter2"
 
 // newTestExecutor wires an executor with fake binaries, a temp filesystem
 // root, a fixed clock and a captured log.
-func newTestExecutor(t *testing.T, r Runner) (*Executor, *bytes.Buffer) {
+func newTestExecutor(t *testing.T, r Runner) (*Executor, *syncBuffer) {
 	t.Helper()
-	logBuf := &bytes.Buffer{}
+	logBuf := &syncBuffer{}
 	e := New(r)
 	e.Root = t.TempDir()
 	e.Log = logBuf
@@ -169,6 +207,26 @@ func newTestExecutor(t *testing.T, r Runner) (*Executor, *bytes.Buffer) {
 	e.Notify = func(c chan<- os.Signal, _ ...os.Signal) {}
 	e.Stop = func(c chan<- os.Signal) {}
 	return e, logBuf
+}
+
+// syncBuffer is a log sink that can be read while the supervisor is writing
+// to it from its own goroutine. A plain bytes.Buffer is not safe for that,
+// and the supervision tests do exactly that.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // secretFile writes a password file and returns its path.
@@ -296,20 +354,26 @@ func TestExecuteProvisionInitializesThenStartsDaemons(t *testing.T) {
 		t.Errorf("InitializedAt = %q, want the injected clock value", m.InitializedAt)
 	}
 
+	// The whole command line, in order, on its redacted rendering: an
+	// option landing in the wrong place is a different command.
 	args := r.argsOf(t, "run", "samba-tool")
-	for _, want := range []string{
-		"domain", "provision", "--server-role=dc", "--use-rfc2307",
-		"--dns-backend=SAMBA_INTERNAL", "--realm=AD.EXAMPLE.COM",
-		"--domain=AD", "--function-level=2016",
+	wantArgs := []string{
+		"domain", "provision",
+		"--server-role=dc",
+		"--use-rfc2307",
+		"--dns-backend=SAMBA_INTERNAL",
+		"--realm=AD.EXAMPLE.COM",
+		"--domain=AD",
+		"--function-level=2016",
+		"--option=ad dc functional level = 2016",
 		"--option=dns update command = /usr/sbin/samba_dnsupdate --use-samba-tool",
-		"--adminpass=" + testSecret,
-	} {
-		if !hasArg(args, want) {
-			t.Errorf("provision args %v missing %q", args, want)
-		}
+		"--adminpass=<redacted>",
 	}
-	if hasArg(args, "--option=dns forwarder=") {
-		t.Errorf("empty forwarder must not be passed: %v", args)
+	if got := redactArgs(args); !equalStrings(got, wantArgs) {
+		t.Errorf("provision args =\n%v\nwant\n%v", got, wantArgs)
+	}
+	if !hasArg(args, "--adminpass="+testSecret) {
+		t.Errorf("the real password did not reach samba-tool: %v", redactArgs(args))
 	}
 	// The executor narrates the step; the runner renders the command line
 	// (redacted, see TestExecRunnerLogsRedactedCommands). Neither may echo
@@ -331,9 +395,21 @@ func TestExecuteProvisionPassesDNSForwarder(t *testing.T) {
 	if ref := e.Execute(context.Background(), cfg, modes.Plan{Kind: modes.ActProvision}, t.TempDir(), testImageVersion); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
-	args := r.argsOf(t, "run", "samba-tool")
-	if !hasArg(args, "--option=dns forwarder=10.0.0.53") {
-		t.Errorf("provision args %v missing the forwarder option", args)
+	wantArgs := []string{
+		"domain", "provision",
+		"--server-role=dc",
+		"--use-rfc2307",
+		"--dns-backend=SAMBA_INTERNAL",
+		"--realm=AD.EXAMPLE.COM",
+		"--domain=AD",
+		"--function-level=2016",
+		"--option=ad dc functional level = 2016",
+		"--option=dns forwarder=10.0.0.53",
+		"--option=dns update command = /usr/sbin/samba_dnsupdate --use-samba-tool",
+		"--adminpass=<redacted>",
+	}
+	if got := redactArgs(r.argsOf(t, "run", "samba-tool")); !equalStrings(got, wantArgs) {
+		t.Errorf("provision args =\n%v\nwant\n%v", got, wantArgs)
 	}
 }
 
@@ -361,6 +437,45 @@ func TestExecuteFailedProvisionWritesNoMarker(t *testing.T) {
 	}
 }
 
+// TestExecuteRefusalNeverEchoesTheSecret covers the last line of defence: a
+// Runner that is not the ExecRunner — a future implementation, or samba-tool
+// itself quoting the failing command back at us — can hand this package an
+// error that still holds the password. It must not reach the refusal an
+// operator sees in the container log.
+func TestExecuteRefusalNeverEchoesTheSecret(t *testing.T) {
+	tests := []struct {
+		name string
+		flag string
+		plan modes.Plan
+		cfg  func(*testing.T) *config.Config
+	}{
+		{name: "provision", flag: "--adminpass", plan: modes.Plan{Kind: modes.ActProvision}, cfg: provisionConfig},
+		{name: "join", flag: "--password", plan: modes.Plan{Kind: modes.ActJoin}, cfg: joinConfig},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newFakeRunner()
+			r.runErr["samba-tool domain"] = errors.New(
+				"samba-tool domain " + tc.name + " " + tc.flag + "=" + testSecret + " failed: ERROR(ldb)")
+			e, logBuf := newTestExecutor(t, r)
+
+			ref := e.Execute(context.Background(), tc.cfg(t), tc.plan, t.TempDir(), testImageVersion)
+			if ref == nil {
+				t.Fatal("expected a refusal")
+			}
+			if strings.Contains(ref.Msg, testSecret) {
+				t.Errorf("the refusal leaked the password: %s", ref.Msg)
+			}
+			if !strings.Contains(ref.Msg, "<redacted>") {
+				t.Errorf("the refusal does not show the redacted flag: %s", ref.Msg)
+			}
+			if strings.Contains(logBuf.String(), testSecret) {
+				t.Errorf("the log leaked the password:\n%s", logBuf.String())
+			}
+		})
+	}
+}
+
 func TestExecuteJoinInitializesThenStartsDaemons(t *testing.T) {
 	r := newFakeRunner()
 	r.procs["chronyd"] = liveProc()
@@ -383,13 +498,18 @@ func TestExecuteJoinInitializesThenStartsDaemons(t *testing.T) {
 	}
 
 	args := r.argsOf(t, "run", "samba-tool")
-	for _, want := range []string{
-		"domain", "join", "AD.EXAMPLE.COM", "DC", "-Ujoiner",
-		"--dns-backend=SAMBA_INTERNAL", "--password=" + testSecret,
-	} {
-		if !hasArg(args, want) {
-			t.Errorf("join args %v missing %q", args, want)
-		}
+	wantArgs := []string{
+		"domain", "join",
+		"AD.EXAMPLE.COM", "DC",
+		"-Ujoiner",
+		"--dns-backend=SAMBA_INTERNAL",
+		"--password=<redacted>",
+	}
+	if got := redactArgs(args); !equalStrings(got, wantArgs) {
+		t.Errorf("join args =\n%v\nwant\n%v", got, wantArgs)
+	}
+	if !hasArg(args, "--password="+testSecret) {
+		t.Errorf("the real password did not reach samba-tool: %v", redactArgs(args))
 	}
 
 	conf, err := os.ReadFile(e.SMBConfPath)
@@ -483,7 +603,15 @@ func TestExecuteDBCheckThenStartUpgradesMarker(t *testing.T) {
 	}
 	m := readMarker(t, dir)
 	if m == nil || m.SambaVersion != testImageVersion {
-		t.Errorf("marker = %+v, want the image version %q after a successful check", m, testImageVersion)
+		t.Fatalf("marker = %+v, want the image version %q after a successful check", m, testImageVersion)
+	}
+	// initialized_at answers "when was this domain created", not "when was
+	// it last checked": an upgrade must not rewrite the domain's birthday.
+	if m.InitializedAt != "2026-01-01T00:00:00Z" {
+		t.Errorf("InitializedAt = %q, want the original %q preserved across the upgrade", m.InitializedAt, "2026-01-01T00:00:00Z")
+	}
+	if m.LastMode != "run" {
+		t.Errorf("LastMode = %q, want run", m.LastMode)
 	}
 }
 
@@ -501,6 +629,10 @@ func TestExecuteDBCheckThenStartAdoptsForeignVolume(t *testing.T) {
 	m := readMarker(t, dir)
 	if m == nil || m.SambaVersion != testImageVersion {
 		t.Fatalf("marker = %+v, want an adopted marker carrying %q", m, testImageVersion)
+	}
+	// Adoption has no earlier marker to preserve, so it stamps the clock.
+	if m.InitializedAt != "2026-08-16T10:00:00Z" {
+		t.Errorf("InitializedAt = %q, want the injected clock value for an adopted volume", m.InitializedAt)
 	}
 	if !strings.Contains(strings.ToLower(logBuf.String()), "adopt") {
 		t.Errorf("adoption was not announced in the log:\n%s", logBuf.String())
@@ -756,16 +888,198 @@ func TestSuperviseSignalStopsSambaBeforeChrony(t *testing.T) {
 	}
 }
 
+// supervising starts Supervise in the background with a captured signal
+// channel and returns the channel, the result channel and the runner.
+func supervising(t *testing.T, ctx context.Context, e *Executor, r *fakeRunner, cfg *config.Config) (chan<- os.Signal, chan *config.Refusal) {
+	t.Helper()
+	var sigCh chan<- os.Signal
+	ready := make(chan struct{})
+	e.Notify = func(c chan<- os.Signal, _ ...os.Signal) { sigCh = c; close(ready) }
+	e.Stop = func(chan<- os.Signal) {}
+
+	done := make(chan *config.Refusal, 1)
+	go func() { done <- e.Supervise(ctx, cfg) }()
+	<-ready
+	waitFor(t, func() bool { return len(r.names()) == 2 })
+	return sigCh, done
+}
+
+// awaitClean asserts Supervise returned a clean exit within the timeout.
+func awaitClean(t *testing.T, done <-chan *config.Refusal, timeout time.Duration) {
+	t.Helper()
+	select {
+	case ref := <-done:
+		if ref != nil {
+			t.Fatalf("a clean shutdown must exit 0, got refusal %d: %s", ref.Code, ref.Msg)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("Supervise did not return within %s", timeout)
+	}
+}
+
+// TestSuperviseCancellationStopsSambaBeforeChrony pins the ordering on the
+// context path. Handing the daemons the cancellable context would let
+// os/exec signal both of them the moment it is cancelled — concurrently, and
+// behind this function's back — so the test also asserts that the context
+// the daemons were started with is not the one being cancelled.
+func TestSuperviseCancellationStopsSambaBeforeChrony(t *testing.T) {
+	r := newFakeRunner()
+	chrony, samba := liveProc(), liveProc()
+	r.procs["chronyd"], r.procs["samba"] = chrony, samba
+
+	var mu sync.Mutex
+	var order []string
+	chrony.onSignal = func() { mu.Lock(); order = append(order, "chronyd"); mu.Unlock() }
+	samba.onSignal = func() { mu.Lock(); order = append(order, "samba"); mu.Unlock() }
+
+	e, _ := newTestExecutor(t, r)
+	ctx, cancel := context.WithCancel(context.Background())
+	_, done := supervising(t, ctx, e, r, runConfig(config.ModeRun))
+
+	cancel()
+	awaitClean(t, done, 5*time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !equalStrings(order, []string{"samba", "chronyd"}) {
+		t.Errorf("shutdown order = %v, want samba stopped before chronyd", order)
+	}
+	for i, daemonCtx := range r.startContexts() {
+		if daemonCtx.Err() != nil {
+			t.Errorf("daemon %d was started with a cancellable context (%v); os/exec would signal it on its own", i, daemonCtx.Err())
+		}
+	}
+}
+
+// TestSuperviseKillsADaemonThatIgnoresSIGTERM exercises the safety valve: a
+// wedged daemon is killed once the grace window is spent, and must not
+// strand the other daemon.
+func TestSuperviseKillsADaemonThatIgnoresSIGTERM(t *testing.T) {
+	r := newFakeRunner()
+	chrony, samba := liveProc(), stubbornProc()
+	r.procs["chronyd"], r.procs["samba"] = chrony, samba
+
+	e, logBuf := newTestExecutor(t, r)
+	e.ShutdownGrace = 40 * time.Millisecond
+	e.KillGrace = 40 * time.Millisecond
+
+	sigCh, done := supervising(t, context.Background(), e, r, runConfig(config.ModeRun))
+	sigCh <- syscall.SIGTERM
+	awaitClean(t, done, 5*time.Second)
+
+	if got := samba.signals(); len(got) != 2 || got[0] != syscall.SIGTERM || got[1] != os.Kill {
+		t.Errorf("samba signals = %v, want SIGTERM then SIGKILL", got)
+	}
+	if len(chrony.signals()) == 0 {
+		t.Error("chronyd was never stopped: a wedged samba stranded it")
+	}
+	if !strings.Contains(logBuf.String(), "killing it") {
+		t.Errorf("the escalation was not announced:\n%s", logBuf.String())
+	}
+}
+
+// TestSuperviseGivesUpOnAnUnreapableDaemon covers the last branch: a process
+// that cannot be reaped at all is left to the init process rather than
+// blocking the container's shutdown for ever.
+func TestSuperviseGivesUpOnAnUnreapableDaemon(t *testing.T) {
+	r := newFakeRunner()
+	chrony, samba := liveProc(), unreapableProc(t)
+	r.procs["chronyd"], r.procs["samba"] = chrony, samba
+
+	e, logBuf := newTestExecutor(t, r)
+	e.ShutdownGrace = 40 * time.Millisecond
+	e.KillGrace = 40 * time.Millisecond
+
+	sigCh, done := supervising(t, context.Background(), e, r, runConfig(config.ModeRun))
+	sigCh <- syscall.SIGTERM
+	awaitClean(t, done, 5*time.Second)
+
+	if !strings.Contains(logBuf.String(), "could not be reaped") {
+		t.Errorf("giving up was not announced:\n%s", logBuf.String())
+	}
+	if len(chrony.signals()) == 0 {
+		t.Error("chronyd was never stopped: an unreapable samba stranded it")
+	}
+}
+
+// TestSuperviseShutdownSharesOneBudget pins the §6.3 contract: the 10 s is
+// for the whole shutdown, not for each daemon. Two daemons that never
+// respond must still be given up on inside one grace window plus one kill
+// window, not two of each.
+func TestSuperviseShutdownSharesOneBudget(t *testing.T) {
+	r := newFakeRunner()
+	chrony, samba := unreapableProc(t), unreapableProc(t)
+	r.procs["chronyd"], r.procs["samba"] = chrony, samba
+
+	e, _ := newTestExecutor(t, r)
+	e.ShutdownGrace = 200 * time.Millisecond
+	e.KillGrace = 100 * time.Millisecond
+
+	sigCh, done := supervising(t, context.Background(), e, r, runConfig(config.ModeRun))
+	start := time.Now()
+	sigCh <- syscall.SIGTERM
+	awaitClean(t, done, 5*time.Second)
+	elapsed := time.Since(start)
+
+	// Shared: ~300ms. Per-daemon budgets would take ~600ms.
+	const shared = 300 * time.Millisecond
+	if elapsed >= 2*shared-50*time.Millisecond {
+		t.Errorf("shutdown took %s: the two daemons each got their own budget instead of sharing one", elapsed)
+	}
+	if elapsed < e.ShutdownGrace {
+		t.Errorf("shutdown took %s: the grace window was not honoured at all", elapsed)
+	}
+}
+
+// TestSuperviseSurvivesChronydExit records a deliberate decision: chrony
+// serves time, it is not the directory, so losing it degrades the DC without
+// taking it down.
+func TestSuperviseSurvivesChronydExit(t *testing.T) {
+	r := newFakeRunner()
+	chrony := exitingProc(errors.New("chronyd: exit status 1"))
+	samba := liveProc()
+	r.procs["chronyd"], r.procs["samba"] = chrony, samba
+
+	e, logBuf := newTestExecutor(t, r)
+	sigCh, done := supervising(t, context.Background(), e, r, runConfig(config.ModeRun))
+
+	waitFor(t, func() bool { return strings.Contains(logBuf.String(), "chronyd exited") })
+	select {
+	case ref := <-done:
+		t.Fatalf("Supervise returned (%v) when only chronyd died; the DC must keep serving", ref)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	sigCh <- syscall.SIGTERM
+	awaitClean(t, done, 5*time.Second)
+
+	if got := samba.signals(); len(got) == 0 || got[0] != syscall.SIGTERM {
+		t.Errorf("samba signals = %v, want SIGTERM", got)
+	}
+	if len(chrony.signals()) != 0 {
+		t.Errorf("a dead chronyd was signaled again: %v", chrony.signals())
+	}
+	if !strings.Contains(logBuf.String(), "signed NTP is no longer served") {
+		t.Errorf("the degradation was not announced:\n%s", logBuf.String())
+	}
+}
+
 // TestSuperviseSignalWithRealProcesses exercises the one path fakes cannot
 // cover: real fork/exec, real signal delivery and real reaping.
 func TestSuperviseSignalWithRealProcesses(t *testing.T) {
 	dir := t.TempDir()
 	orderLog := filepath.Join(dir, "order.log")
+	// Each stand-in announces itself only once its TERM trap is installed,
+	// so the test waits for a fact instead of guessing a duration: a signal
+	// delivered before the trap exists would kill the shell outright and
+	// the ordering assertion below would test nothing.
+	readyFile := func(name string) string { return filepath.Join(dir, name+".ready") }
 	sleeper := func(name string) string {
 		path := filepath.Join(dir, name+".sh")
 		script := "#!/bin/sh\n" +
 			"trap 'echo " + name + " >> " + orderLog + "; kill $pid 2>/dev/null; exit 0' TERM\n" +
 			"sleep 30 & pid=$!\n" +
+			": > " + readyFile(name) + "\n" +
 			"wait $pid\n"
 		if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 			t.Fatal(err)
@@ -800,8 +1114,14 @@ func TestSuperviseSignalWithRealProcesses(t *testing.T) {
 	<-ready
 	<-started // chronyd
 	<-started // samba
-	// Give the shells a moment to install their TERM traps.
-	time.Sleep(300 * time.Millisecond)
+	waitFor(t, func() bool {
+		for _, name := range []string{"samba", "chronyd"} {
+			if _, err := os.Stat(readyFile(name)); err != nil {
+				return false
+			}
+		}
+		return true
+	})
 	sigCh <- syscall.SIGTERM
 
 	select {
@@ -842,70 +1162,159 @@ func (c *countingRunner) Start(ctx context.Context, name string, args ...string)
 func TestWithDNSUpdateCommand(t *testing.T) {
 	const line = "\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool"
 	tests := []struct {
-		name        string
-		in          string
-		want        string
-		wantChanged bool
+		name     string
+		in       string
+		want     string
+		wantEdit confEdit
 	}{
 		{
-			name:        "inserted at the top of an existing global section",
-			in:          "[global]\n\trealm = AD.EXAMPLE.COM\n\n[netlogon]\n\tpath = /var/lib/samba/sysvol\n",
-			want:        "[global]\n" + line + "\n\trealm = AD.EXAMPLE.COM\n\n[netlogon]\n\tpath = /var/lib/samba/sysvol\n",
-			wantChanged: true,
+			name:     "inserted at the top of an existing global section",
+			in:       "[global]\n\trealm = AD.EXAMPLE.COM\n\n[netlogon]\n\tpath = /var/lib/samba/sysvol\n",
+			want:     "[global]\n" + line + "\n\trealm = AD.EXAMPLE.COM\n\n[netlogon]\n\tpath = /var/lib/samba/sysvol\n",
+			wantEdit: confAdded,
 		},
 		{
-			name:        "already present is left byte-for-byte alone",
-			in:          "[global]\n\trealm = AD.EXAMPLE.COM\n\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool\n",
-			want:        "[global]\n\trealm = AD.EXAMPLE.COM\n\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool\n",
-			wantChanged: false,
+			name:     "already present is left byte-for-byte alone",
+			in:       "[global]\n\trealm = AD.EXAMPLE.COM\n\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool\n",
+			want:     "[global]\n\trealm = AD.EXAMPLE.COM\n\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool\n",
+			wantEdit: confUnchanged,
 		},
 		{
-			name:        "recognized despite odd spacing and case",
-			in:          "[global]\n   DNS Update Command   =   /usr/sbin/samba_dnsupdate --use-samba-tool\n",
-			want:        "[global]\n   DNS Update Command   =   /usr/sbin/samba_dnsupdate --use-samba-tool\n",
-			wantChanged: false,
+			name:     "recognized despite odd spacing and case",
+			in:       "[global]\n   DNS Update Command   =   /usr/sbin/samba_dnsupdate --use-samba-tool\n",
+			want:     "[global]\n   DNS Update Command   =   /usr/sbin/samba_dnsupdate --use-samba-tool\n",
+			wantEdit: confUnchanged,
 		},
 		{
-			name:        "global section header is matched case-insensitively",
-			in:          "[Global]\n\trealm = AD.EXAMPLE.COM\n",
-			want:        "[Global]\n" + line + "\n\trealm = AD.EXAMPLE.COM\n",
-			wantChanged: true,
+			name:     "global section header is matched case-insensitively",
+			in:       "[Global]\n\trealm = AD.EXAMPLE.COM\n",
+			want:     "[Global]\n" + line + "\n\trealm = AD.EXAMPLE.COM\n",
+			wantEdit: confAdded,
 		},
 		{
-			name:        "a file without a global section gets one",
-			in:          "[netlogon]\n\tpath = /var/lib/samba/sysvol\n",
-			want:        "[netlogon]\n\tpath = /var/lib/samba/sysvol\n\n[global]\n" + line + "\n",
-			wantChanged: true,
+			name:     "a file without a global section gets one",
+			in:       "[netlogon]\n\tpath = /var/lib/samba/sysvol\n",
+			want:     "[netlogon]\n\tpath = /var/lib/samba/sysvol\n\n[global]\n" + line + "\n",
+			wantEdit: confAdded,
 		},
 		{
-			name:        "an empty file gets a global section",
-			in:          "",
-			want:        "[global]\n" + line + "\n",
-			wantChanged: true,
+			name:     "an empty file gets a global section",
+			in:       "",
+			want:     "[global]\n" + line + "\n",
+			wantEdit: confAdded,
 		},
 		{
-			name:        "a commented-out option does not count as present",
-			in:          "[global]\n\t# dns update command = /usr/sbin/samba_dnsupdate\n",
-			want:        "[global]\n" + line + "\n\t# dns update command = /usr/sbin/samba_dnsupdate\n",
-			wantChanged: true,
+			name:     "a commented-out option does not count as present",
+			in:       "[global]\n\t# dns update command = /usr/sbin/samba_dnsupdate\n",
+			want:     "[global]\n" + line + "\n\t# dns update command = /usr/sbin/samba_dnsupdate\n",
+			wantEdit: confAdded,
+		},
+		{
+			// The samba default calls nsupdate, which this image does not
+			// ship: a wrong value is worse than a missing one.
+			name:     "a different value in global is replaced",
+			in:       "[global]\n\trealm = AD.EXAMPLE.COM\n\tdns update command = /usr/sbin/samba_dnsupdate\n",
+			want:     "[global]\n\trealm = AD.EXAMPLE.COM\n" + line + "\n",
+			wantEdit: confReplaced,
+		},
+		{
+			name:     "a value pointing somewhere else entirely is replaced",
+			in:       "[global]\n\tdns update command = /usr/local/bin/my-updater --flag\n",
+			want:     "[global]\n" + line + "\n",
+			wantEdit: confReplaced,
+		},
+		{
+			// Only [global] configures the DC: the same key in another
+			// section must not be mistaken for the setting.
+			name:     "the key in another section does not count",
+			in:       "[global]\n\trealm = AD.EXAMPLE.COM\n\n[custom]\n\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool\n",
+			want:     "[global]\n" + line + "\n\trealm = AD.EXAMPLE.COM\n\n[custom]\n\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool\n",
+			wantEdit: confAdded,
+		},
+		{
+			name:     "the setting is found further down the global section",
+			in:       "[global]\n\trealm = AD.EXAMPLE.COM\n\tworkgroup = AD\n\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool\n\n[netlogon]\n",
+			want:     "[global]\n\trealm = AD.EXAMPLE.COM\n\tworkgroup = AD\n\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool\n\n[netlogon]\n",
+			wantEdit: confUnchanged,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, changed := withDNSUpdateCommand(tc.in)
+			got, edit := withDNSUpdateCommand(tc.in)
 			if got != tc.want {
 				t.Errorf("withDNSUpdateCommand()\n got %q\nwant %q", got, tc.want)
 			}
-			if changed != tc.wantChanged {
-				t.Errorf("changed = %v, want %v", changed, tc.wantChanged)
+			if edit != tc.wantEdit {
+				t.Errorf("edit = %v, want %v", edit, tc.wantEdit)
 			}
 			// Applying it twice must be a no-op: joins repeat on restart.
-			again, changedAgain := withDNSUpdateCommand(got)
-			if again != got || changedAgain {
+			again, editAgain := withDNSUpdateCommand(got)
+			if again != got || editAgain != confUnchanged {
 				t.Errorf("second application changed the file (idempotence broken)")
 			}
 		})
+	}
+}
+
+func TestEnsureDNSUpdateCommandWritesAtomically(t *testing.T) {
+	e, logBuf := newTestExecutor(t, newFakeRunner())
+	dir := filepath.Dir(e.SMBConfPath)
+	if err := os.WriteFile(e.SMBConfPath, []byte("[global]\n\trealm = AD.EXAMPLE.COM\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if ref := e.ensureDNSUpdateCommand(); ref != nil {
+		t.Fatalf("unexpected refusal: %s", ref.Msg)
+	}
+	data, err := os.ReadFile(e.SMBConfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), dnsUpdateCommand) {
+		t.Errorf("smb.conf does not carry the option:\n%s", data)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != filepath.Base(e.SMBConfPath) {
+			t.Errorf("the rewrite left %q behind; it must be temp file + rename", entry.Name())
+		}
+	}
+	info, err := os.Stat(e.SMBConfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Errorf("smb.conf permissions = %o, want 644 (samba must read it)", perm)
+	}
+	if !strings.Contains(logBuf.String(), "added") {
+		t.Errorf("the edit was not announced:\n%s", logBuf.String())
+	}
+}
+
+func TestEnsureDNSUpdateCommandReplacesAWrongValue(t *testing.T) {
+	e, logBuf := newTestExecutor(t, newFakeRunner())
+	if err := os.WriteFile(e.SMBConfPath, []byte("[global]\n\tdns update command = /usr/sbin/samba_dnsupdate\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ref := e.ensureDNSUpdateCommand(); ref != nil {
+		t.Fatalf("unexpected refusal: %s", ref.Msg)
+	}
+	data, err := os.ReadFile(e.SMBConfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(data), dnsUpdateKey) != 1 {
+		t.Errorf("the wrong value was not replaced but duplicated:\n%s", data)
+	}
+	if !strings.Contains(string(data), dnsUpdateValue) {
+		t.Errorf("smb.conf does not carry this image's command:\n%s", data)
+	}
+	if !strings.Contains(logBuf.String(), "replaced") {
+		t.Errorf("the replacement was not announced:\n%s", logBuf.String())
 	}
 }
 
@@ -1075,4 +1484,44 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatal("condition never held")
+}
+
+// The `ad dc functional level` parameter defaults to 2008_R2 since Samba
+// 4.19 and provision refuses any domain/forest level above it, so the
+// requested level has to be mirrored onto that parameter — but only for the
+// values the parameter actually accepts. Getting this wrong is not a
+// cosmetic difference: either provision refuses (level too high) or it
+// refuses on an invalid parameter value (level too low).
+func TestProvisionMirrorsTheFunctionLevelOntoTheDCParameter(t *testing.T) {
+	for _, tc := range []struct {
+		functionLevel string
+		wantOption    string // empty means the option must not be passed
+	}{
+		{"2016", "--option=ad dc functional level = 2016"},
+		{"2012_R2", "--option=ad dc functional level = 2012_R2"},
+		{"2012", "--option=ad dc functional level = 2012"},
+		{"2008_R2", ""},
+		{"2008", ""},
+		{"2003", ""},
+		{"2000", ""},
+	} {
+		t.Run(tc.functionLevel, func(t *testing.T) {
+			cfg := provisionConfig(t)
+			cfg.FunctionLevel = tc.functionLevel
+			args := redactArgs(provisionArgs(cfg, testSecret))
+
+			if !hasArg(args, "--function-level="+tc.functionLevel) {
+				t.Fatalf("args %v do not carry the requested function level", args)
+			}
+			got := ""
+			for _, a := range args {
+				if strings.HasPrefix(a, "--option="+dcFunctionalLevelKey) {
+					got = a
+				}
+			}
+			if got != tc.wantOption {
+				t.Errorf("dc functional level option = %q, want %q (args %v)", got, tc.wantOption, args)
+			}
+		})
+	}
 }

@@ -24,20 +24,27 @@ import (
 // The probes talk to the loopback address only: the health check asks whether
 // this container serves, never whether the network around it works.
 const (
-	dnsAddr  = "127.0.0.1:53"
-	ldapURL  = "ldap://127.0.0.1:389"
-	smbHost  = "127.0.0.1"
-	smbShare = "-L"
+	dnsAddr     = "127.0.0.1:53"
+	ldapURL     = "ldap://127.0.0.1:389"
+	smbHost     = "127.0.0.1"
+	smbListFlag = "-L"
 )
 
 // defaultSMBConf is where samba-tool writes the configuration this package
 // reads the realm from.
 const defaultSMBConf = "/etc/samba/smb.conf"
 
-// probeTimeout bounds a single probe when the caller sets no deadline. The
-// HEALTHCHECK gives the whole command 10 s (Task 6), so each probe gets a
-// slice of that rather than the lot.
+// probeTimeout bounds a probe when the caller set no deadline of its own.
+// When the caller did set one — the HEALTHCHECK gives the whole command 10 s
+// (Task 6) — every probe runs under that one deadline, so the time an earlier
+// probe spends comes out of the same budget rather than extending the total.
 const probeTimeout = 3 * time.Second
+
+// minProbeTimeout keeps a probe from being handed a zero or negative
+// deadline when the caller's budget is already spent: a non-positive dialer
+// timeout means "no timeout" to net.Dialer, which would hang the health
+// check instead of failing it.
+const minProbeTimeout = 100 * time.Millisecond
 
 // Prober runs the three probes. DNSProbe and LDAPProbe are fields so unit
 // tests can exercise the orchestration — the order, the short-circuit and the
@@ -95,11 +102,19 @@ func (p *Prober) Check(ctx context.Context) error {
 		return fmt.Errorf("LDAP probe failed: the rootDSE cannot be read on %s (%s); the directory is not accepting queries — check the samba log",
 			ldapURL, oneLine(err.Error()))
 	}
-	if err := p.Runner.Run(ctx, p.Smbclient, smbShare, smbHost, "-N"); err != nil {
+	if err := p.smbProbe(ctx); err != nil {
 		return fmt.Errorf("SMB probe failed: shares cannot be listed on %s (%s); the file server is not exporting SYSVOL and NETLOGON — check the samba log",
 			smbHost, oneLine(err.Error()))
 	}
 	return nil
+}
+
+// smbProbe lists the shares this DC exports. It is bounded like the other
+// two probes: a hung smbclient must fail the health check, not outlive it.
+func (p *Prober) smbProbe(ctx context.Context) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	return p.Runner.Run(ctx, p.Smbclient, smbListFlag, smbHost, "-N")
 }
 
 // parseRealm extracts the realm from a smb.conf. It is a small hand-rolled
@@ -158,10 +173,7 @@ func ldapProbe(ctx context.Context) error {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()
 
-	timeout := probeTimeout
-	if deadline, ok := ctx.Deadline(); ok {
-		timeout = time.Until(deadline)
-	}
+	timeout := remaining(ctx)
 	conn, err := ldap.DialURL(ldapURL, ldap.DialWithDialer(&net.Dialer{Timeout: timeout}))
 	if err != nil {
 		return err
@@ -169,9 +181,12 @@ func ldapProbe(ctx context.Context) error {
 	defer conn.Close()
 	conn.SetTimeout(timeout)
 
+	// The server-side time limit is whole seconds, and 0 means "no limit"
+	// to an LDAP server: a sub-second budget must round up to 1, never
+	// truncate to unlimited.
 	req := ldap.NewSearchRequest(
 		"", ldap.ScopeBaseObject, ldap.NeverDerefAliases,
-		1, int(timeout.Seconds()), false,
+		1, max(1, int(timeout.Seconds())), false,
 		"(objectClass=*)", []string{"defaultNamingContext"}, nil,
 	)
 	res, err := conn.Search(req)
@@ -190,6 +205,20 @@ func withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, probeTimeout)
+}
+
+// remaining is how long a probe may take, never zero or negative: a
+// non-positive timeout disables the timeout in net.Dialer, which would turn
+// an exhausted budget into an unbounded wait.
+func remaining(ctx context.Context) time.Duration {
+	timeout := probeTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+	if timeout < minProbeTimeout {
+		return minProbeTimeout
+	}
+	return timeout
 }
 
 // oneLine collapses an error so a health message stays one line.

@@ -31,7 +31,16 @@ import (
 // bind9-dnsutils (Phase 1 ruling), so without this option every dynamic DNS
 // update inside the DC fails. It is passed to provision with --option and
 // written into the smb.conf that a join generates.
-const dnsUpdateCommand = "dns update command = /usr/sbin/samba_dnsupdate --use-samba-tool"
+const (
+	dnsUpdateKey     = "dns update command"
+	dnsUpdateValue   = "/usr/sbin/samba_dnsupdate --use-samba-tool"
+	dnsUpdateCommand = dnsUpdateKey + " = " + dnsUpdateValue
+)
+
+// dcFunctionalLevelKey is the smb.conf parameter that sets the functional
+// level this DC itself advertises. See dcFunctionalLevel for why provision
+// has to set it.
+const dcFunctionalLevelKey = "ad dc functional level"
 
 // Default paths and programs.
 const (
@@ -41,8 +50,9 @@ const (
 	// defaultShutdownGrace bounds the orderly stop of each daemon (§6.3:
 	// samba then chrony within 10 s).
 	defaultShutdownGrace = 10 * time.Second
-	// killGrace bounds the wait after escalating to SIGKILL.
-	killGrace = 2 * time.Second
+	// defaultKillGrace bounds the wait after escalating to SIGKILL. It is
+	// shared by both daemons, like the grace window itself.
+	defaultKillGrace = 2 * time.Second
 )
 
 // runtimeDirs are created before the daemons start. They live on tmpfs at
@@ -86,6 +96,7 @@ type Executor struct {
 	Notify        func(c chan<- os.Signal, sig ...os.Signal)
 	Stop          func(c chan<- os.Signal)
 	ShutdownGrace time.Duration
+	KillGrace     time.Duration
 }
 
 // New returns an Executor wired for the container.
@@ -101,6 +112,7 @@ func New(r Runner) *Executor {
 		Notify:        signal.Notify,
 		Stop:          signal.Stop,
 		ShutdownGrace: defaultShutdownGrace,
+		KillGrace:     defaultKillGrace,
 	}
 }
 
@@ -122,6 +134,16 @@ func Supervise(ctx context.Context, r Runner, cfg *config.Config) *config.Refusa
 // that fails halfway must leave the volume looking uninitialized, so the next
 // start retries instead of starting a broken domain (§6.2).
 func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.Plan, stateDir, imageVersion string) *config.Refusal {
+	// Before anything shells out, not just before the daemons start:
+	// samba-tool domain provision writes into /var/lock/samba (a symlink
+	// into the tmpfs /run) while it works, and on a read-only rootfs with a
+	// fresh /run that directory does not exist yet. Supervise creates them
+	// too — MkdirAll is idempotent — so the Supervise-only entry point
+	// keeps working unchanged.
+	if ref := e.makeRuntimeDirs(); ref != nil {
+		return ref
+	}
+
 	switch plan.Kind {
 	case modes.ActProvision:
 		if ref := e.provision(ctx, cfg); ref != nil {
@@ -155,7 +177,7 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.P
 		if ref := e.dbcheck(ctx, false); ref != nil {
 			return ref
 		}
-		if ref := e.writeMarker(stateDir, imageVersion, string(config.ModeRun)); ref != nil {
+		if ref := e.refreshMarker(stateDir, imageVersion); ref != nil {
 			return ref
 		}
 		if plan.AdoptMarker {
@@ -249,11 +271,36 @@ func (e *Executor) dbcheck(ctx context.Context, repair bool) *config.Refusal {
 	return nil
 }
 
-// writeMarker records that this image now owns the volume.
+// writeMarker records that this image now owns the volume, stamping the
+// current time as the moment the volume was initialized.
 func (e *Executor) writeMarker(stateDir, imageVersion, lastMode string) *config.Refusal {
+	return e.putMarker(stateDir, imageVersion, lastMode, e.now())
+}
+
+// refreshMarker moves an existing marker forward to this image version after
+// a successful database check. initialized_at answers "when was this domain
+// created", not "when was it last checked", so the original value is carried
+// over; a volume being adopted has no original and is stamped now.
+func (e *Executor) refreshMarker(stateDir, imageVersion string) *config.Refusal {
+	initializedAt := ""
+	obs, err := state.Observe(stateDir)
+	if err != nil {
+		return asRefusal(err, config.CodeConfigError)
+	}
+	if obs.Marker != nil {
+		initializedAt = strings.TrimSpace(obs.Marker.InitializedAt)
+	}
+	if initializedAt == "" {
+		initializedAt = e.now()
+	}
+	return e.putMarker(stateDir, imageVersion, string(config.ModeRun), initializedAt)
+}
+
+// putMarker writes the marker with an explicit initialized_at.
+func (e *Executor) putMarker(stateDir, imageVersion, lastMode, initializedAt string) *config.Refusal {
 	m := state.Marker{
 		SambaVersion:  imageVersion,
-		InitializedAt: e.Now().UTC().Format(time.RFC3339),
+		InitializedAt: initializedAt,
 		LastMode:      lastMode,
 	}
 	if err := state.WriteMarker(stateDir, m); err != nil {
@@ -261,6 +308,9 @@ func (e *Executor) writeMarker(stateDir, imageVersion, lastMode string) *config.
 	}
 	return nil
 }
+
+// now renders the current time in the marker's format.
+func (e *Executor) now() string { return e.Now().UTC().Format(time.RFC3339) }
 
 // ensureDNSUpdateCommand makes sure the smb.conf generated by a join carries
 // the samba-tool DNS update command. provision receives it as --option;
@@ -273,16 +323,25 @@ func (e *Executor) ensureDNSUpdateCommand() *config.Refusal {
 			"the configuration file %q that samba-tool domain join should have written cannot be read (%s); check that /etc/samba is writable and inspect the join output above",
 			e.SMBConfPath, oneLine(err.Error()))
 	}
-	updated, changed := withDNSUpdateCommand(string(data))
-	if !changed {
+	updated, edit := withDNSUpdateCommand(string(data))
+	if edit == confUnchanged {
 		return nil
 	}
-	if err := os.WriteFile(e.SMBConfPath, []byte(updated), 0o644); err != nil {
+	// smb.conf is the configuration the DC reads on every start: replace it
+	// atomically so a failed write cannot leave samba with a truncated file.
+	if err := writeFileAtomic(e.SMBConfPath, []byte(updated), 0o644); err != nil {
 		return config.Refuse(config.CodeRuntimeFailure,
 			"the DNS update command cannot be written into %q (%s); mount /etc/samba read-write",
 			e.SMBConfPath, oneLine(err.Error()))
 	}
-	e.logf("added %q to %s: this image ships no nsupdate, so samba_dnsupdate must use samba-tool", dnsUpdateCommand, e.SMBConfPath)
+	switch edit {
+	case confReplaced:
+		e.logf("replaced the %q setting in %s with %q: this image ships no nsupdate, so samba_dnsupdate must use samba-tool",
+			dnsUpdateKey, e.SMBConfPath, dnsUpdateValue)
+	default:
+		e.logf("added %q to %s: this image ships no nsupdate, so samba_dnsupdate must use samba-tool",
+			dnsUpdateCommand, e.SMBConfPath)
+	}
 	return nil
 }
 
@@ -299,10 +358,16 @@ func (e *Executor) Supervise(ctx context.Context, cfg *config.Config) *config.Re
 	e.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	defer e.Stop(sigs)
 
+	// The daemons are started under a context that cannot be cancelled:
+	// this function owns every signal they receive. Handing them ctx would
+	// let its cancellation SIGTERM both of them at once, behind the back of
+	// the ordered shutdown below — samba would lose its head start.
+	daemonCtx := context.WithoutCancel(ctx)
+
 	var chrony Proc
 	var chronyDone chan error
 	if cfg.Chrony {
-		p, err := e.Runner.Start(ctx, e.Bin.Chronyd, chronyArgs(e.ChronyConf)...)
+		p, err := e.Runner.Start(daemonCtx, e.Bin.Chronyd, chronyArgs(e.ChronyConf)...)
 		if err != nil {
 			return config.Refuse(config.CodeRuntimeFailure,
 				"chronyd could not be started (%s); set SAMBA_CHRONY=off to run without the MS-SNTP time service, or fix the reported cause",
@@ -311,9 +376,9 @@ func (e *Executor) Supervise(ctx context.Context, cfg *config.Config) *config.Re
 		chrony, chronyDone = p, waitChan(p)
 	}
 
-	samba, err := e.Runner.Start(ctx, e.Bin.Samba, sambaArgs(cfg.LogLevel)...)
+	samba, err := e.Runner.Start(daemonCtx, e.Bin.Samba, sambaArgs(cfg.LogLevel)...)
 	if err != nil {
-		e.stopProc(ctx, "chronyd", chrony, chronyDone)
+		e.stopOne(ctx, "chronyd", chrony, chronyDone)
 		return config.Refuse(config.CodeRuntimeFailure,
 			"samba could not be started (%s); this is a fault of the image or of the mounted configuration, check the output above",
 			oneLine(err.Error()))
@@ -323,7 +388,7 @@ func (e *Executor) Supervise(ctx context.Context, cfg *config.Config) *config.Re
 	for {
 		select {
 		case err := <-sambaDone:
-			e.stopProc(ctx, "chronyd", chrony, chronyDone)
+			e.stopOne(ctx, "chronyd", chrony, chronyDone)
 			if err != nil {
 				return config.Refuse(config.CodeRuntimeFailure,
 					"samba exited unexpectedly (%s); read the samba log above — the container is restarted by its restart policy, the state volume is untouched",
@@ -351,17 +416,56 @@ func (e *Executor) Supervise(ctx context.Context, cfg *config.Config) *config.Re
 
 // shutdown stops the daemons in order and reports a clean exit: a container
 // asked to stop has not failed.
+//
+// The two stops share one budget rather than each getting their own: §6.3
+// gives the container 10 s to stop samba AND chrony, so per-daemon windows
+// would add up to more than the contract allows and the container would be
+// SIGKILLed by the runtime mid-shutdown. samba gets whatever it needs of the
+// budget first, and chronyd gets the rest.
 func (e *Executor) shutdown(ctx context.Context, samba Proc, sambaDone chan error, chrony Proc, chronyDone chan error) *config.Refusal {
-	e.stopProc(ctx, "samba", samba, sambaDone)
-	e.stopProc(ctx, "chronyd", chrony, chronyDone)
+	term, kill := e.shutdownBudget(ctx)
+	defer term.stop()
+	defer kill.stop()
+	e.stopProc(term.ctx, kill.ctx, "samba", samba, sambaDone)
+	e.stopProc(term.ctx, kill.ctx, "chronyd", chrony, chronyDone)
 	return nil
 }
 
-// stopProc asks one daemon to stop and waits for it to be reaped. The grace
-// window deliberately survives a cancelled parent context: when cancellation
-// is what triggered the shutdown, an already-expired context would turn the
+// budget is a deadline with its cancel function.
+type budget struct {
+	ctx  context.Context
+	stop context.CancelFunc
+}
+
+// shutdownBudget derives the two shared deadlines of one shutdown: the grace
+// window for the polite SIGTERM, and a slightly longer one that bounds the
+// SIGKILL escalation for both daemons together.
+//
+// Both deliberately survive a cancelled parent context: when cancellation is
+// what triggered the shutdown, an already-expired context would turn the
 // orderly stop into an immediate kill.
-func (e *Executor) stopProc(ctx context.Context, name string, p Proc, done chan error) {
+func (e *Executor) shutdownBudget(ctx context.Context) (budget, budget) {
+	base := context.WithoutCancel(ctx)
+	termCtx, termCancel := context.WithTimeout(base, e.grace())
+	killCtx, killCancel := context.WithTimeout(base, e.grace()+e.killGrace())
+	return budget{termCtx, termCancel}, budget{killCtx, killCancel}
+}
+
+// stopOne stops a single daemon on its own budget. It is used on the paths
+// where only one daemon is left running (samba failed to start, or samba
+// exited by itself), so there is nothing to share the budget with.
+func (e *Executor) stopOne(ctx context.Context, name string, p Proc, done chan error) {
+	term, kill := e.shutdownBudget(ctx)
+	defer term.stop()
+	defer kill.stop()
+	e.stopProc(term.ctx, kill.ctx, name, p, done)
+}
+
+// stopProc asks one daemon to stop and waits for it to be reaped, within the
+// shared budgets. A daemon that ignores SIGTERM is killed once the grace
+// window is spent; one that cannot even be reaped is left to the init
+// process (tini) rather than blocking the shutdown of the other.
+func (e *Executor) stopProc(termCtx, killCtx context.Context, name string, p Proc, done chan error) {
 	if p == nil {
 		return
 	}
@@ -369,8 +473,6 @@ func (e *Executor) stopProc(ctx context.Context, name string, p Proc, done chan 
 		e.logf("could not signal %s (%v); waiting for it anyway", name, err)
 	}
 
-	graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.grace())
-	defer cancel()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -379,15 +481,14 @@ func (e *Executor) stopProc(ctx context.Context, name string, p Proc, done chan 
 			e.logf("%s stopped", name)
 		}
 		return
-	case <-graceCtx.Done():
+	case <-termCtx.Done():
 	}
 
-	e.logf("%s did not stop within %s: killing it", name, e.grace())
+	e.logf("%s did not stop within the %s shutdown budget: killing it", name, e.grace())
 	_ = p.Signal(os.Kill)
-	killCtx, cancelKill := context.WithTimeout(context.WithoutCancel(ctx), killGrace)
-	defer cancelKill()
 	select {
 	case <-done:
+		e.logf("%s killed", name)
 	case <-killCtx.Done():
 		e.logf("%s could not be reaped; leaving it to the init process", name)
 	}
@@ -418,6 +519,14 @@ func (e *Executor) grace() time.Duration {
 	return e.ShutdownGrace
 }
 
+// killGrace returns the configured post-SIGKILL reap window, defaulted.
+func (e *Executor) killGrace() time.Duration {
+	if e.KillGrace <= 0 {
+		return defaultKillGrace
+	}
+	return e.KillGrace
+}
+
 // logf writes one operator-facing line to the container log (§6.4).
 func (e *Executor) logf(format string, args ...any) {
 	if e.Log == nil {
@@ -444,11 +553,43 @@ func provisionArgs(cfg *config.Config, secret string) []string {
 		"--domain=" + cfg.Domain,
 		"--function-level=" + cfg.FunctionLevel,
 	}
+	if v, ok := dcFunctionalLevel(cfg.FunctionLevel); ok {
+		args = append(args, "--option="+dcFunctionalLevelKey+" = "+v)
+	}
 	if cfg.DNSForwarder != "" {
 		args = append(args, "--option=dns forwarder="+cfg.DNSForwarder)
 	}
 	args = append(args, "--option="+dnsUpdateCommand)
 	return append(args, "--adminpass="+secret)
+}
+
+// dcFunctionalLevel maps a requested domain/forest function level onto the
+// value the `ad dc functional level` smb.conf parameter must carry, and
+// reports whether the parameter has to be set at all.
+//
+// Since Samba 4.19 that parameter defaults to 2008_R2 and provision refuses
+// outright when the requested domain and forest level is higher than it
+// ("You want to run SAMBA 4 on a domain and forest function level which
+// itself is higher than its actual DC function level"). The default
+// SAMBA_FUNCTION_LEVEL of 2016 therefore cannot provision without also
+// raising this parameter — which is why it is passed as --option, so
+// provision writes it into the generated smb.conf and every later start of
+// the container keeps the level the domain was created at.
+//
+// Levels at or below the default need nothing: the parameter does not
+// accept 2000, 2003 or 2008 as values, so setting it for those would turn a
+// working provision into a configuration error.
+func dcFunctionalLevel(functionLevel string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(functionLevel)) {
+	case "2012":
+		return "2012", true
+	case "2012_R2":
+		return "2012_R2", true
+	case "2016":
+		return "2016", true
+	default:
+		return "", false
+	}
 }
 
 // joinArgs builds the samba-tool domain join command line.
@@ -476,24 +617,64 @@ func chronyArgs(conf string) []string {
 	return []string{"-d", "-x", "-f", conf}
 }
 
-// withDNSUpdateCommand returns conf with the DNS update command present in
-// its [global] section, and reports whether anything changed. It is pure and
-// idempotent: a join that repeats must not append the option twice.
-func withDNSUpdateCommand(conf string) (string, bool) {
-	if hasDNSUpdateCommand(conf) {
-		return conf, false
-	}
+// confEdit says what withDNSUpdateCommand did to a file.
+type confEdit int
+
+const (
+	confUnchanged confEdit = iota
+	confAdded
+	confReplaced
+)
+
+// withDNSUpdateCommand returns conf with the DNS update command set to this
+// image's value in the [global] section, and says what it changed. It is pure
+// and idempotent: a join that repeats must not append the option twice.
+//
+// Detection is scoped to [global] and matches the value, not only the key:
+// the same key in another section does not configure the DC, and a [global]
+// entry pointing at a different command — for instance the samba default,
+// which shells out to the nsupdate this image does not ship — is worse than
+// no entry at all, so it is replaced rather than trusted.
+func withDNSUpdateCommand(conf string) (string, confEdit) {
+	lines := strings.Split(conf, "\n")
 	entry := "\t" + dnsUpdateCommand
 
-	lines := strings.Split(conf, "\n")
-	for i, l := range lines {
-		if strings.EqualFold(strings.TrimSpace(l), "[global]") {
-			out := make([]string, 0, len(lines)+1)
-			out = append(out, lines[:i+1]...)
-			out = append(out, entry)
-			out = append(out, lines[i+1:]...)
-			return strings.Join(out, "\n"), true
+	section := ""
+	globalAt := -1
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, ";") {
+			continue
 		}
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			section = strings.ToLower(strings.TrimSpace(t[1 : len(t)-1]))
+			if section == "global" && globalAt < 0 {
+				globalAt = i
+			}
+			continue
+		}
+		if section != "global" {
+			continue
+		}
+		k, v, ok := strings.Cut(t, "=")
+		if !ok || !strings.EqualFold(normalize(k), dnsUpdateKey) {
+			continue
+		}
+		if normalize(v) == dnsUpdateValue {
+			return conf, confUnchanged
+		}
+		out := make([]string, len(lines))
+		copy(out, lines)
+		out[i] = entry
+		return strings.Join(out, "\n"), confReplaced
+	}
+
+	if globalAt >= 0 {
+		out := make([]string, 0, len(lines)+1)
+		out = append(out, lines[:globalAt+1]...)
+		out = append(out, entry)
+		out = append(out, lines[globalAt+1:]...)
+		return strings.Join(out, "\n"), confAdded
 	}
 
 	// No [global] section at all: create one at the end rather than guess
@@ -502,27 +683,43 @@ func withDNSUpdateCommand(conf string) (string, bool) {
 	if out != "" {
 		out += "\n\n"
 	}
-	return out + "[global]\n" + entry + "\n", true
+	return out + "[global]\n" + entry + "\n", confAdded
 }
 
-// hasDNSUpdateCommand reports whether conf already sets the option. Comments
-// do not count: a commented-out line is exactly the case where the option
-// must be added.
-func hasDNSUpdateCommand(conf string) bool {
-	for _, l := range strings.Split(conf, "\n") {
-		t := strings.TrimSpace(l)
-		if t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, ";") {
-			continue
-		}
-		k, _, ok := strings.Cut(t, "=")
-		if !ok {
-			continue
-		}
-		if strings.EqualFold(strings.Join(strings.Fields(k), " "), "dns update command") {
-			return true
-		}
+// normalize collapses the whitespace of one smb.conf key or value so that
+// spacing never decides whether a setting is recognized.
+func normalize(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// writeFileAtomic replaces path with data through a temp file and a rename,
+// so a reader (samba, on its next start) sees either the old file or the new
+// one and never a half-written one. No temp file survives a failure.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp")
+	if err != nil {
+		return err
 	}
-	return false
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }()
+
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 // asRefusal recovers the *config.Refusal an inner package returned, or wraps
