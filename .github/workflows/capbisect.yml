@@ -60,6 +60,13 @@ jobs:
           # go.sum; setup-go's cache wants one and warns without it.
           cache: false
 
+      - name: Pin consistency
+        # Parity with the CI build job. A catalog that disagrees with the
+        # Dockerfile builds a different image than the one anybody thinks
+        # is under test, and this workflow's whole output is a claim about
+        # a specific image.
+        run: sh scripts/check-pins-consistency.sh
+
       - name: Build image
         run: |
           # Same build the CI build job does, including the package-index
@@ -78,20 +85,55 @@ jobs:
           # make the baseline look slower than every run after it.
           docker build -t samba-ad-dc-e2e-client:dev test/client
 
+      - name: Clear committed reports from the workspace
+        # The repository CARRIES a committed record for one architecture
+        # (test/capbisect/results-arm64.txt). On that leg the checkout puts
+        # it in the workspace before the bisection has measured anything,
+        # and an artifact step could then upload a file from git history as
+        # if it were this run's result. Deleting it first means every file
+        # uploaded below was necessarily produced by this run.
+        run: rm -f test/capbisect/results-*.txt
+
       - name: Bisect
-        timeout-minutes: 60
+        # 90, not 60: two of the drop-one verdicts are reached only by
+        # letting a health wait expire, and each of those is now run twice
+        # (the confirmation re-run that keeps a flake from becoming a
+        # verdict). The per-run `go test -timeout` inside the driver is 40
+        # minutes, so a budget below that could cut a single run in half
+        # and report it as an infrastructure failure.
+        timeout-minutes: 90
         run: sh test/capbisect/bisect.sh
 
-      - name: Upload report
-        # Runs even when the bisection failed: a bisection that aborted
-        # midway still wrote the verdicts it had reached, and those are the
-        # first thing anyone debugging the failure will want.
+      - name: Upload this run's report
+        # Runs even when the bisection failed — which is exactly when it
+        # matters. The driver writes the report incrementally: the header
+        # lands before the first container starts and every verdict is
+        # appended the moment it is measured, so a cancelled, timed-out or
+        # aborted run still leaves the verdicts it reached.
+        #
+        # The path is the DATED file, which only exists once a run has
+        # begun writing, and it is scoped to this leg's architecture. Both
+        # details make `if-no-files-found: error` mean something: it fails
+        # when this leg produced nothing, instead of passing quietly
+        # because the repository happens to carry a committed report from
+        # another architecture.
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
-          name: capbisect-report-${{ matrix.arch }}
-          path: |
-            test/capbisect/capbisect-report-*.txt
-            test/capbisect/results-*.txt
+          name: capbisect-run-${{ matrix.arch }}
+          path: test/capbisect/results-${{ matrix.arch }}-*.txt
           if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload the stable copy
+        # Separate step, separate artifact: this is the file a PR would
+        # commit as the new record, and it must not be able to satisfy the
+        # guard above. `warn` rather than `error` because the driver writes
+        # it last — a run that died mid-bisection legitimately has none.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: capbisect-stable-${{ matrix.arch }}
+          path: test/capbisect/results-${{ matrix.arch }}.txt
+          if-no-files-found: warn
           retention-days: 90

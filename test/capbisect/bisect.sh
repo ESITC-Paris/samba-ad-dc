@@ -12,18 +12,20 @@
 # that a capability is REQUIRED is to take it away and watch the image
 # break.
 #
-# So that is what this does, against the real image, over four phases:
+# So that is what this does, against the real image, over five phases:
 #
-#   1. baseline      the default set must pass (else the measurement has
-#                    no reference point and the script aborts)
-#   2. drop-one      for each capability C: run with (default - C).
+#   1. baseline      the set under test must pass (else the measurement
+#                    has no reference point and the script aborts)
+#   2. drop-one      for each capability C: run with (set - C).
 #                    fail => C is REQUIRED.  pass => C is DROPPABLE.
+#                    Every failure is re-run once before it is recorded,
+#                    so a flake cannot quietly become a "required".
 #   3. verify-min    run with only the required ones. This is the step
 #                    that turns a list of individually-necessary
 #                    capabilities into a jointly-sufficient set: dropping
 #                    two capabilities at once can break what dropping
 #                    either alone did not.
-#   4. add-one       candidate capabilities outside the default set
+#   4. add-one       candidate capabilities outside the set under test
 #                    (DAC_READ_SEARCH per B.2). A candidate cannot be
 #                    required if phase 3 passed without it — that is a
 #                    measurement, recorded as such, not a guess.
@@ -41,10 +43,16 @@
 #                    whether NET_BIND_SERVICE is retained on top of the
 #                    measured minimal set.
 #
+# It then COMPARES its own recommendation to what the image actually
+# ships (harness.DefaultCaps) and EXITS NON-ZERO if they differ. That is
+# what makes a scheduled or dispatched run worth having: without the
+# comparison a green run means "the bisection completed", with it a green
+# run means "B.2 is still true".
+#
 # The lever is the harness's E2E_CAPS override (unset => DefaultCaps,
-# set-but-empty => no capabilities, comma list => that list). The default
-# set is read out of the harness itself with `go doc`, so this script and
-# the suite can never disagree about what is being tested.
+# set-but-empty => no capabilities, comma list => that list). The set to
+# bisect is read out of the harness itself with `go doc`, so this script
+# and the suite can never disagree about what is being tested.
 #
 # The subset is the smoke triple, not the whole suite: provision (writes
 # security.* xattrs, binds privileged ports, chowns), kinit (proves the
@@ -52,13 +60,29 @@
 # up) and restart (the signal and ordered-shutdown path). A full-suite
 # bisection would cost hours per capability and probe the same syscalls.
 #
-# Runtime: about 7 runs. A passing run is a few minutes; a FAILING run is
-# slower, because a capability-starved DC is discovered by a health wait
-# that has to expire. Budget an hour.
+# Runtime: 9 runs or more — baseline, one per capability, a confirmation
+# re-run of every failure, verify-minimal — plus two sub-second port
+# probes. A passing run is a few minutes; a FAILING run can be much
+# slower, because a capability-starved DC is sometimes only discovered by
+# a health wait that has to expire. Budget an hour and a half.
 #
-# Output: a report file (table capability -> verdict, with the subset, the
-# image digest and per-run timings) plus the stable, committed copy
-# test/capbisect/results-<arch>.txt.
+# The report is written INCREMENTALLY: the header lands before the first
+# run and every verdict is appended the moment it is measured. A run that
+# is cancelled, times out or dies halfway therefore still leaves a report
+# holding every verdict it reached — which is the whole reason CI uploads
+# the file even when the job failed.
+#
+# Output: test/capbisect/results-<arch>-<date>.txt (this run) and the
+# stable copy test/capbisect/results-<arch>.txt (committed record).
+#
+# Environment:
+#   E2E_IMAGE          image under test (default samba-ad-dc:dev)
+#   CAPBISECT_TIMEOUT  per-run `go test -timeout` (default 40m)
+#   CAPBISECT_SET      comma list to bisect INSTEAD of harness.DefaultCaps.
+#                      The way to re-measure a capability that a previous
+#                      bisection removed: a run that starts from the
+#                      shipped set can only ever re-confirm the shipped
+#                      set, never rediscover what is no longer in it.
 set -eu
 
 # --- knobs ------------------------------------------------------------
@@ -78,7 +102,7 @@ export E2E_IMAGE
 # TestProvisionOverStateRefused, which is a negative test with a different
 # purpose and a much shorter runtime.
 SUBSET='TestProvision$|TestKerberosKinit|TestIdempotentRestart'
-# Capabilities NOT in the default set that B.2 names as candidates.
+# Capabilities NOT in the set under test that B.2 names as candidates.
 CANDIDATES='DAC_READ_SEARCH'
 
 REPORT=''
@@ -104,11 +128,16 @@ case $(uname -m) in
     *)             arch=$(uname -m) ;;
 esac
 date_utc=$(date -u +%Y-%m-%d)
-[ -n "$REPORT" ] || REPORT=$outdir/capbisect-report-$arch-$date_utc.txt
+[ -n "$REPORT" ] || REPORT=$outdir/results-$arch-$date_utc.txt
 STABLE=$outdir/results-$arch.txt
 
 log() { printf '%s\n' "$*" >&2; }
 die() { printf '\n!! %s\n' "$*" >&2; exit 1; }
+# emit appends to the report. Everything the report says goes through
+# here, so the file on disk is always complete up to the last thing
+# measured — never a buffer that only exists if the script reaches its
+# own end.
+emit() { printf '%s\n' "$*" >>"$REPORT"; }
 
 # --- preflight --------------------------------------------------------
 command -v docker >/dev/null 2>&1 || die "the docker CLI is not on PATH"
@@ -123,19 +152,41 @@ docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 ||
 # a report nobody can re-check.
 image_id=$(docker image inspect --format '{{.Id}}' "$E2E_IMAGE")
 docker_version=$(docker version --format '{{.Server.Version}}')
+# Read once, up front, so it can go in the header: this number is the
+# reason the NET_BIND_SERVICE verdict says what it says, and a header is
+# where a reader looks before believing a table.
+port_start=$(docker run --rm --cap-drop ALL --entrypoint cat "$E2E_IMAGE" \
+    /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo unknown)
 
-# The default set comes from the harness, not from a copy kept here: the
-# two drifting apart would make every verdict below a statement about a
-# set nothing actually runs.
-default_caps=$(cd "$root/test/e2e" && go doc ./harness DefaultCaps) ||
+# read_caps_var <GoVarName> -> one capability per line.
+#
+# The set comes from the harness, not from a copy kept here: the two
+# drifting apart would make every verdict below a statement about a set
+# nothing actually runs.
+read_caps_var() {
+    _doc=$(cd "$root/test/e2e" && go doc ./harness "$1") || return 1
+    printf '%s\n' "$_doc" | awk -v v="$1" '
+        $0 ~ "^var " v " " { inblock = 1; next }
+        inblock && /^}/    { exit }
+        inblock            { gsub(/[",[:space:]]/, ""); if ($0 != "") print }
+    '
+}
+
+shipped_caps=$(read_caps_var DefaultCaps) ||
     die "could not read harness.DefaultCaps (go doc failed)"
-default_caps=$(printf '%s\n' "$default_caps" | awk '
-    /^var DefaultCaps/ { inblock = 1; next }
-    inblock && /^}/    { exit }
-    inblock            { gsub(/[",[:space:]]/, ""); if ($0 != "") print }
-')
-[ -n "$default_caps" ] || die "harness.DefaultCaps parsed as empty; refusing to bisect nothing"
-log "default set: $(echo "$default_caps" | tr '\n' ' ')"
+[ -n "$shipped_caps" ] ||
+    die "harness.DefaultCaps parsed as empty; refusing to measure against nothing"
+
+if [ -n "${CAPBISECT_SET:-}" ]; then
+    bisect_caps=$(printf '%s' "$CAPBISECT_SET" | tr ',' '\n' |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true)
+    set_source="CAPBISECT_SET override (NOT harness.DefaultCaps)"
+    [ -n "$bisect_caps" ] || die "CAPBISECT_SET is set but parsed as empty"
+else
+    bisect_caps=$shipped_caps
+    set_source="harness.DefaultCaps"
+fi
+log "set under test ($set_source): $(echo "$bisect_caps" | tr '\n' ' ')"
 
 # --- helpers ----------------------------------------------------------
 
@@ -189,11 +240,11 @@ port_bind_probe() {
 
 # run_subset <label> <caps-comma-list-or-empty>
 #
-# Sets RUN_VERDICT (pass|fail) and RUN_SECONDS. A run that fails for a
-# reason that is not the image — no daemon, a build error, a stale
-# container — is NOT data, and scoring it as "capability required" would
-# quietly fabricate a finding. Such a run is retried once and, if it fails
-# the same way again, aborts the bisection.
+# Sets RUN_VERDICT (pass|fail|infra), RUN_SECONDS and RUN_EVIDENCE. A run
+# that fails for a reason that is not the image — no daemon, a build
+# error, a stale container — is NOT data, and scoring it as "capability
+# required" would quietly fabricate a finding. Such a run is retried once
+# and, if it fails the same way again, aborts the bisection.
 RUN_VERDICT=''
 RUN_SECONDS=0
 RUN_EVIDENCE=''
@@ -232,17 +283,41 @@ run_subset() {
         # non-zero without ever running a test.
         if grep -q '^--- FAIL\|^ *--- FAIL\|^panic: test timed out' "$_logfile"; then
             RUN_VERDICT=fail
-            # The first denial in the log, verbatim (trimmed). A verdict of
-            # "required" with no mechanism behind it is an assertion; the
-            # mechanism is what makes it reviewable, and it is what tells a
-            # future reader whether a Samba upgrade could change the answer.
+            # Up to three lines of the actual denial, verbatim. A verdict
+            # of "required" with no mechanism behind it is an assertion;
+            # the mechanism is what makes it reviewable, and it is what
+            # tells a future reader whether a Samba upgrade could change
+            # the answer.
+            #
+            # Lines naming the specific operation are preferred over the
+            # generic ones, because several capabilities fail through the
+            # SAME generic line ("{Access Denied}") and a report whose
+            # rows are byte-identical distinguishes nothing. The
+            # distinguishing line is usually further down the log than
+            # the generic one, so ranking, not first-match, is what
+            # picks it.
             RUN_EVIDENCE=$(awk '
-                /INTERNAL ERROR: |ERROR\(runtime\)|Permission denied|Operation not permitted|Access Denied/ {
-                    sub(/^[[:space:]]+/, ""); print substr($0, 1, 96); exit
+                {
+                    line = $0
+                    sub(/^[[:space:]]+/, "", line)
+                    sub(/[[:space:]]+$/, "", line)
+                    if (line == "") next
+                    if (line ~ /setntacl|set_nt_acl|security\.NTACL|xattr|sys_setgroups|failed to set uid|token stack underflow/) {
+                        if (!(line in seen) && np < 3) { seen[line] = 1; pref[np++] = line }
+                        next
+                    }
+                    if (line ~ /INTERNAL ERROR: |ERROR\(runtime\)|Permission denied|Operation not permitted|Access Denied/) {
+                        if (!(line in seen) && ng < 3) { seen[line] = 1; gen[ng++] = line }
+                    }
+                }
+                END {
+                    n = 0
+                    for (i = 0; i < np && n < 3; i++) { print substr(pref[i], 1, 96); n++ }
+                    for (i = 0; i < ng && n < 3; i++) { print substr(gen[i], 1, 96); n++ }
                 }' "$_logfile")
             _kept=$outdir/.fail-$(printf '%s' "$_label" | tr -cs 'A-Za-z0-9' '-').log
             log "   -> FAIL in ${RUN_SECONDS}s (test verdict; kept: $_kept)"
-            [ -z "$RUN_EVIDENCE" ] || log "      $RUN_EVIDENCE"
+            [ -z "$RUN_EVIDENCE" ] || log "$RUN_EVIDENCE"
             mv "$_logfile" "$_kept"
             return 0
         fi
@@ -260,49 +335,108 @@ environment (docker daemon, image, leftover containers) and re-run."
     done
 }
 
-# --- report -----------------------------------------------------------
-rows=''            # "CAP<TAB>VERDICT<TAB>NOTE" lines, accumulated
-row() { rows=$(printf '%s\n%s\t%s\t%s' "$rows" "$1" "$2" "$3"); }
+# emit_row <name> <verdict> <seconds> [evidence-block]
+emit_row() {
+    printf '  %-18s %-11s %5ss\n' "$1" "$2" "$3" >>"$REPORT"
+    if [ -n "${4:-}" ]; then
+        printf '%s\n' "$4" | sed 's/^/                                   | /' >>"$REPORT"
+    fi
+}
 
+# --- report header ----------------------------------------------------
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 total_start=$(date +%s)
 
+: >"$REPORT"
+emit "capability bisection report"
+emit "==========================="
+emit ""
+emit "date (UTC)     : $started_at"
+emit "architecture   : $arch ($(uname -s) $(uname -m))"
+emit "image          : $E2E_IMAGE"
+emit "image digest   : $image_id"
+emit "docker server  : $docker_version"
+emit "subset         : go test -run '$SUBSET'"
+emit "per-run timeout: $CAPBISECT_TIMEOUT"
+emit "ip_unpriv_port_start (inside a container of this image): $port_start"
+emit ""
+emit "method: baseline with the set under test, then one run per capability"
+emit "with that capability removed (every failure re-run once to confirm),"
+emit "then one run with only the capabilities that proved required. Every"
+emit "run is the same subset against the same image; the only variable is"
+emit "E2E_CAPS. cap_drop ALL is the floor in all of them."
+emit ""
+emit "set under test, from $set_source:"
+printf '%s\n' "$bisect_caps" | sed 's/^/  /' >>"$REPORT"
+emit ""
+emit "measurements"
+emit "------------"
+emit "(appended as each run finishes, so an interrupted run still leaves"
+emit "every verdict it reached; evidence lines are quoted from the run log)"
+emit ""
+
 # --- phase 1: baseline ------------------------------------------------
-run_subset "baseline (full default set)" "$(join_caps "$default_caps")"
+run_subset "baseline (full set under test)" "$(join_caps "$bisect_caps")"
 baseline_seconds=$RUN_SECONDS
-[ "$RUN_VERDICT" = pass ] || die "BASELINE FAILED with the full default set.
+emit_row "baseline" "$(printf '%s' "$RUN_VERDICT" | tr '[:lower:]' '[:upper:]')" "$baseline_seconds"
+[ "$RUN_VERDICT" = pass ] || die "BASELINE FAILED with the full set under test.
 The bisection has no reference point: every later verdict would be
 'required' for the wrong reason. Fix the suite or the image first."
 
 # --- phase 2: drop-one ------------------------------------------------
 required=''
 droppable=''
-timings=$(printf 'baseline\t%ss' "$baseline_seconds")
-for cap in $default_caps; do
-    run_subset "drop $cap" "$(join_caps "$(without "$default_caps" "$cap")")"
-    timings=$(printf '%s\ndrop %s\t%ss' "$timings" "$cap" "$RUN_SECONDS")
-    case $RUN_VERDICT in
+flaky=''
+for cap in $bisect_caps; do
+    caps_minus=$(join_caps "$(without "$bisect_caps" "$cap")")
+    run_subset "drop $cap" "$caps_minus"
+    cap_seconds=$RUN_SECONDS
+    cap_verdict=$RUN_VERDICT
+    cap_evidence=$RUN_EVIDENCE
+    cap_note=''
+    # A single red run is not a capability verdict; it is one observation
+    # of a suite that talks to a container runtime over a network. The
+    # confirmation run costs one repeat per required capability and buys
+    # the difference between "this broke" and "this breaks".
+    if [ "$cap_verdict" = fail ]; then
+        run_subset "drop $cap (confirmation)" "$caps_minus"
+        cap_seconds=$((cap_seconds + RUN_SECONDS))
+        if [ "$RUN_VERDICT" = fail ]; then
+            [ -n "$cap_evidence" ] || cap_evidence=$RUN_EVIDENCE
+        else
+            # Kept REQUIRED: the conservative direction. But a capability
+            # whose removal fails only sometimes is a fact about this
+            # suite that must not disappear into a clean-looking table.
+            flaky=$(printf '%s\n%s' "$flaky" "$cap")
+            cap_note="FLAKE SUSPECT: the confirmation run PASSED. Verdict kept REQUIRED (conservative); investigate before trusting it."
+        fi
+    fi
+    case $cap_verdict in
         fail)
             required=$(printf '%s\n%s' "$required" "$cap")
-            row "$cap" REQUIRED "${RUN_EVIDENCE:-suite fails without it}"
+            if [ -n "$cap_note" ]; then
+                cap_evidence=$(printf '%s\n%s' "$cap_note" "$cap_evidence")
+            fi
+            emit_row "$cap" REQUIRED "$cap_seconds" "$cap_evidence"
             ;;
         pass)
             droppable=$(printf '%s\n%s' "$droppable" "$cap")
-            row "$cap" DROPPABLE "suite passes without it"
+            emit_row "$cap" DROPPABLE "$cap_seconds" "the subset passes without it"
             ;;
         *)
-            row "$cap" UNKNOWN "infrastructure failure; not measured"
+            emit_row "$cap" UNKNOWN "$cap_seconds" "infrastructure failure; NOT measured"
             ;;
     esac
 done
 required=$(printf '%s\n' "$required" | grep -v '^$' || true)
 droppable=$(printf '%s\n' "$droppable" | grep -v '^$' || true)
+flaky=$(printf '%s\n' "$flaky" | grep -v '^$' || true)
 
 # --- phase 3: verify the required set is jointly sufficient ------------
 minimal=$(join_caps "$required")
 if [ -z "$droppable" ]; then
-    # Nothing was droppable, so "the required ones only" IS the default
-    # set: the baseline already ran exactly this and re-running it would
+    # Nothing was droppable, so "the required ones only" IS the set under
+    # test: the baseline already ran exactly this and re-running it would
     # measure nothing new.
     verify=pass
     verify_seconds=$baseline_seconds
@@ -312,19 +446,23 @@ else
     verify=$RUN_VERDICT
     verify_seconds=$RUN_SECONDS
     verify_note="measured directly"
-    timings=$(printf '%s\nverify-minimal\t%ss' "$timings" "$verify_seconds")
-    [ "$verify" = pass ] || log "!! VERIFY-MINIMAL FAILED: the individually-required
-capabilities are not jointly sufficient. Some interaction needs a
-capability that looked droppable on its own. The minimal set below is NOT
-established; treat the default set as the answer and investigate."
+fi
+emit_row "verify-minimal" "$(printf '%s' "$verify" | tr '[:lower:]' '[:upper:]')" \
+    "$verify_seconds" "$verify_note"
+if [ "$verify" != pass ]; then
+    log "!! VERIFY-MINIMAL FAILED: the individually-required capabilities are
+not jointly sufficient. Some interaction needs a capability that looked
+droppable on its own. The minimal set is NOT established; treat the set
+under test as the answer and investigate."
 fi
 
-# --- phase 4: candidates outside the default set ----------------------
+# --- phase 4: candidates outside the set under test -------------------
 for cand in $CANDIDATES; do
     if [ "$verify" = pass ]; then
-        row "$cand" "NOT NEEDED" "absent from the verified minimal set, which passes"
+        emit_row "$cand" "NOT NEEDED" 0 \
+            "candidate named by B.2; absent from the verified minimal set, which passes"
     else
-        row "$cand" UNKNOWN "not probed: the minimal set is unverified"
+        emit_row "$cand" UNKNOWN 0 "not probed: the minimal set is unverified"
     fi
 done
 
@@ -334,8 +472,6 @@ done
 # required: the number this reads is the reason the drop-one verdict for
 # that capability says what it says, and a report that omits it invites
 # the next reader to draw the wrong conclusion from a green run.
-port_start=$(docker run --rm --cap-drop ALL --entrypoint cat "$E2E_IMAGE" \
-    /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo unknown)
 if port_bind_probe; then
     probe_without=bound
 else
@@ -357,22 +493,22 @@ fi
 log ""
 log "== privileged-port cross-check"
 log "   ip_unprivileged_port_start in a container of this image: $port_start"
-log "   bind :389 at floor 1024, no NET_BIND_SERVICE  -> $probe_without"
+log "   bind :389 at floor 1024, no NET_BIND_SERVICE   -> $probe_without"
 log "   bind :389 at floor 1024, with NET_BIND_SERVICE -> $probe_with"
 
 # The set the image should actually ship with: what the suite proved
 # necessary, plus any capability phase 5 proved necessary outside the
-# suite's reach. Emitted in the default set's order so it can be compared
-# to harness.DefaultCaps by eye.
+# suite's reach. Emitted in the set-under-test's order so it can be
+# compared to harness.DefaultCaps by eye.
 recommended=''
-for cap in $default_caps; do
-    _keep=no
+for cap in $bisect_caps; do
+    keep=no
     if printf '%s\n' "$required" | grep -q -x -e "$cap"; then
-        _keep=yes
+        keep=yes
     elif [ "$cap" = NET_BIND_SERVICE ] && [ "$retain_nbs" = yes ]; then
-        _keep=yes
+        keep=yes
     fi
-    if [ "$_keep" = yes ]; then
+    if [ "$keep" = yes ]; then
         recommended=$(printf '%s\n%s' "$recommended" "$cap")
     fi
 done
@@ -381,97 +517,118 @@ recommended=$(printf '%s\n' "$recommended" | grep -v '^$' || true)
 sweep
 total_seconds=$(($(date +%s) - total_start))
 
-{
-    echo "capability bisection report"
-    echo "==========================="
-    echo
-    echo "date (UTC)     : $started_at"
-    echo "architecture   : $arch ($(uname -s) $(uname -m))"
-    echo "image          : $E2E_IMAGE"
-    echo "image digest   : $image_id"
-    echo "docker server  : $docker_version"
-    echo "subset         : go test -run '$SUBSET'"
-    echo "per-run timeout: $CAPBISECT_TIMEOUT"
-    echo "ip_unpriv_port_start (inside a container of this image): $port_start"
-    echo
-    echo "method: baseline with the harness default set, then one run per"
-    echo "capability with that capability removed, then one run with only"
-    echo "the capabilities the drop-one phase proved required. Every run is"
-    echo "the same subset against the same image; the only variable is"
-    echo "E2E_CAPS. cap_drop ALL is the floor in all of them."
-    echo
-    echo "default set under test (harness.DefaultCaps):"
-    printf '%s\n' "$default_caps" | sed 's/^/  /'
-    echo
-    echo "verdicts"
-    echo "--------"
-    printf '%s\n' "$rows" | grep -v '^$' |
-        awk -F'\t' '{ printf "  %-18s %-11s %s\n", $1, $2, $3 }'
-    echo
-    echo "verify-minimal : $verify ($verify_note)"
-    echo
-    echo "MEASURED MINIMAL SET"
-    echo "--------------------"
-    if [ "$verify" = pass ]; then
-        printf '%s\n' "$required" | sed 's/^/  /'
-        echo
-        echo "  as E2E_CAPS: $minimal"
-    else
-        echo "  NOT ESTABLISHED (verify-minimal did not pass)"
-    fi
-    echo
-    echo "PRIVILEGED-PORT CROSS-CHECK"
-    echo "---------------------------"
-    echo "  Docker sets net.ipv4.ip_unprivileged_port_start=0 in the network"
-    echo "  namespace it creates for a container, which makes 53/88/389/445"
-    echo "  unprivileged there. Under the E2E suite (a user-defined bridge)"
-    echo "  NET_BIND_SERVICE therefore measures droppable no matter what the"
-    echo "  image needs. SPEC B.3 also supports HOST networking, where the"
-    echo "  container inherits the host's value — 1024 on any ordinary Linux"
-    echo "  system. The probe below forces the floor back to 1024 and binds"
-    echo "  :389 in this image, with the capability and without it:"
-    echo
-    echo "    without NET_BIND_SERVICE : $probe_without"
-    echo "    with    NET_BIND_SERVICE : $probe_with"
-    echo
-    if [ "$retain_nbs" = yes ]; then
-        echo "  => NET_BIND_SERVICE is REQUIRED wherever the port floor is at the"
-        echo "     kernel default. Its 'droppable' verdict above is a property of"
-        echo "     the test runtime, not of the image, and it is RETAINED in the"
-        echo "     shipped profile."
-    else
-        echo "  => the probe did not show NET_BIND_SERVICE making the difference;"
-        echo "     it is not retained on this evidence."
-    fi
-    echo
-    echo "RECOMMENDED PROFILE SET (what harness.DefaultCaps and B.2 carry)"
-    echo "----------------------------------------------------------------"
-    if [ "$verify" = pass ]; then
-        printf '%s\n' "$recommended" | sed 's/^/  /'
-        echo
-        echo "  = the measured minimal set, plus any capability the cross-check"
-        echo "    proved necessary outside the suite's reach."
-    else
-        echo "  NOT ESTABLISHED (verify-minimal did not pass)"
-    fi
-    echo
-    echo "recorded, not measured"
-    echo "----------------------"
-    echo "  CAP_KILL      NOT APPLICABLE  chronyd runs as root in this image"
-    echo "                                (B.6), so no privilege-dropping"
-    echo "                                child has to be signalled across a"
-    echo "                                uid boundary. CAP_KILL is the named"
-    echo "                                alternative IF chronyd is ever made"
-    echo "                                to drop privileges; while it does"
-    echo "                                not, there is nothing to measure."
-    echo
-    echo "timings"
-    echo "-------"
-    printf '%s\n' "$timings" | awk -F'\t' '{ printf "  %-22s %s\n", $1, $2 }'
-    printf '  %-22s %ss\n' total "$total_seconds"
-} | tee "$REPORT"
+# --- conclusions ------------------------------------------------------
+emit ""
+emit "MEASURED MINIMAL SET (what the suite alone proves)"
+emit "-------------------------------------------------"
+if [ "$verify" = pass ]; then
+    printf '%s\n' "$required" | sed 's/^/  /' >>"$REPORT"
+    emit ""
+    emit "  as E2E_CAPS: $minimal"
+else
+    emit "  NOT ESTABLISHED (verify-minimal did not pass)"
+fi
+emit ""
+emit "PRIVILEGED-PORT CROSS-CHECK"
+emit "---------------------------"
+emit "  Docker sets net.ipv4.ip_unprivileged_port_start=0 in the network"
+emit "  namespace it creates for a container, which makes 53/88/389/445"
+emit "  unprivileged there. Under the E2E suite (a user-defined bridge)"
+emit "  NET_BIND_SERVICE therefore measures droppable no matter what the"
+emit "  image needs. SPEC B.3 also supports HOST networking, where the"
+emit "  container inherits the host's value — 1024 on any ordinary Linux"
+emit "  system. The probe below forces the floor back to 1024 and binds"
+emit "  :389 in this image, with the capability and without it:"
+emit ""
+emit "    without NET_BIND_SERVICE : $probe_without"
+emit "    with    NET_BIND_SERVICE : $probe_with"
+emit ""
+if [ "$retain_nbs" = yes ]; then
+    emit "  => NET_BIND_SERVICE is REQUIRED wherever the port floor is at the"
+    emit "     kernel default. Its 'droppable' verdict above is a property of"
+    emit "     the test runtime, not of the image, and it is RETAINED in the"
+    emit "     shipped profile."
+else
+    emit "  => the probe did not show NET_BIND_SERVICE making the difference;"
+    emit "     it is not retained on this evidence."
+fi
+emit ""
+emit "RECOMMENDED PROFILE SET (what harness.DefaultCaps and B.2 should carry)"
+emit "----------------------------------------------------------------------"
+if [ "$verify" = pass ]; then
+    printf '%s\n' "$recommended" | sed 's/^/  /' >>"$REPORT"
+    emit ""
+    emit "  = the measured minimal set, plus any capability the cross-check"
+    emit "    proved necessary outside the suite's reach."
+else
+    emit "  NOT ESTABLISHED (verify-minimal did not pass)"
+fi
+emit ""
+if [ -n "$flaky" ]; then
+    emit "FLAKE SUSPECTS"
+    emit "--------------"
+    printf '%s\n' "$flaky" | sed 's/^/  /' >>"$REPORT"
+    emit "  (removal failed once and passed on the confirmation run; the"
+    emit "   verdict was kept REQUIRED, which is the conservative direction,"
+    emit "   but these are NOT clean measurements)"
+    emit ""
+fi
+emit "recorded, not measured"
+emit "----------------------"
+emit "  CAP_KILL      NOT APPLICABLE  chronyd runs as root in this image"
+emit "                                (B.6), so no privilege-dropping"
+emit "                                child has to be signalled across a"
+emit "                                uid boundary. CAP_KILL is the named"
+emit "                                alternative IF chronyd is ever made"
+emit "                                to drop privileges; while it does"
+emit "                                not, there is nothing to measure."
+emit ""
 
-cp "$REPORT" "$STABLE"
+# --- the gate ---------------------------------------------------------
+#
+# Everything above is a measurement. This is the part that can fail a
+# CI job: does what was just measured still agree with what the image
+# ships? Without this, a dispatched run could only ever report "the
+# bisection completed" — with it, a green run reports "B.2 is still true"
+# and a red one names the drift.
+recommended_sorted=$(printf '%s\n' "$recommended" | sort)
+shipped_sorted=$(printf '%s\n' "$shipped_caps" | sort)
+emit "SHIPPED-SET COMPARISON"
+emit "----------------------"
+emit "  harness.DefaultCaps : $(join_caps "$shipped_caps")"
+emit "  recommended by run  : $(join_caps "$recommended")"
+gate=0
+if [ "$verify" != pass ]; then
+    emit "  => INCONCLUSIVE: verify-minimal did not pass, so this run"
+    emit "     recommends nothing and cannot confirm the shipped set."
+    gate=1
+elif [ "$recommended_sorted" = "$shipped_sorted" ]; then
+    emit "  => AGREE. The shipped capability set is confirmed by measurement"
+    emit "     on this architecture, against this image."
+else
+    emit "  => DIVERGED. What the image ships is no longer what measurement"
+    emit "     says it needs: adaptation-profile B.2 and harness.DefaultCaps"
+    emit "     are stale and must be updated to the recommended set above."
+    gate=1
+fi
+emit ""
+emit "total runtime: ${total_seconds}s"
+
+# The stable copy is the committed record of the latest run; the dated
+# file is this run. When -o already names the stable path the two are the
+# same file, and `cp` onto itself is an error -- which would fail the
+# script AFTER a completely successful bisection.
+if [ "$REPORT" != "$STABLE" ]; then
+    cp "$REPORT" "$STABLE"
+fi
+
+cat "$REPORT"
 log ""
 log "report: $REPORT"
 log "stable: $STABLE"
+if [ "$gate" -ne 0 ]; then
+    die "the shipped capability set does not match this measurement (see
+SHIPPED-SET COMPARISON in $REPORT). This is the finding, not a crash:
+update harness.DefaultCaps and adaptation-profile B.2, or explain in B.2
+why a capability is retained despite measuring droppable."
+fi

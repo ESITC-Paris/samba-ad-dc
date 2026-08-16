@@ -67,19 +67,47 @@ them.
   smoke subset (provision, `kinit`, restart) against that image, and what
   broke is what makes it "required". `test/e2e/harness.DefaultCaps`
   carries exactly this list, so every E2E run re-proves that the set is
-  sufficient.
+  sufficient, and the driver fails when its own recommendation stops
+  matching `DefaultCaps` — which is what lets a CI run report "B.2 is
+  still true" rather than merely "the bisection completed".
+
+  **What CI confirmation will and will not re-measure.** A bisection
+  starts from the set the harness ships and removes one capability at a
+  time, so a run of the shipped six-capability set re-measures those six
+  and nothing else. `DAC_OVERRIDE`'s droppability was established against
+  the older seven-capability set and is *not* revisited by such a run: a
+  capability that is no longer in the set cannot be dropped from it. To
+  re-open that question — after a Samba major, say, or a change to what
+  the entrypoint does at boot — run the driver with the older set
+  restored:
+
+  ```
+  CAPBISECT_SET='SYS_ADMIN,NET_BIND_SERVICE,CHOWN,FOWNER,DAC_OVERRIDE,SETUID,SETGID' \
+      sh test/capbisect/bisect.sh
+  ```
+
+  which is exactly how the committed report was produced.
 
   | capability | verdict | what removing it does |
   | --- | --- | --- |
-  | `SYS_ADMIN` | required | provision aborts in `setntacl` → `smbd.set_nt_acl` — the `security.NTACL` xattr on sysvol cannot be written |
+  | `SYS_ADMIN` | required | provision aborts setting the sysvol NT ACL: `set_nt_acl_conn: fset_nt_acl returned NT_STATUS_ACCESS_DENIED`, raised through `samba/provision/__init__.py:_setntacl` — the `security.NTACL` xattr cannot be written |
   | `CHOWN` | required | provision aborts, `INTERNAL ERROR: Security context active token stack underflow` |
-  | `FOWNER` | required | provision aborts, `ERROR(runtime): uncaught exception - (3221225506, '{Access Denied} ...')` |
+  | `FOWNER` | required | the same operation and the same denial (`fset_nt_acl … NT_STATUS_ACCESS_DENIED`), surfacing one frame out in `samba/ntacls.py:setntacl` |
   | `SETUID` | required | `smbd: INTERNAL ERROR: failed to set uid`; SYSVOL/NETLOGON are never exported and the container never turns healthy |
   | `SETGID` | required | `smbd: INTERNAL ERROR: sys_setgroups failed`, samba exits |
   | `NET_BIND_SERVICE` | droppable **under the suite** — **retained** | see below |
   | `DAC_OVERRIDE` | droppable — **removed** | was in the pre-bisection hypothesis; the suite passes without it. Every process in the container runs as uid 0 over paths the entrypoint has already chowned to itself, so no discretionary check is left to override |
   | `DAC_READ_SEARCH` | not needed | the candidate named by the previous hypothesis; the verified minimal set passes without it |
   | `CAP_KILL` | not applicable | recorded, not measured: chronyd runs as root (B.6), so nothing has to be signalled across a uid boundary. It becomes measurable only if chronyd is made to drop privileges |
+
+  `SYS_ADMIN` and `FOWNER` are consumed by the **same** operation —
+  writing the NT ACL onto sysvol during provision — and removing either
+  one alone breaks it with the same `NT_STATUS_ACCESS_DENIED`. They are
+  two capabilities, not two mechanisms, and the table above records the
+  denial each removal *produced*, not a kernel-level attribution of which
+  permission check fired. That matters for maintenance: a Samba change to
+  how sysvol ACLs are applied could plausibly move both verdicts at once,
+  so neither should be reasoned about in isolation.
 
   **`NET_BIND_SERVICE` is the one entry the E2E suite cannot decide, and
   it is kept deliberately.** Docker sets
@@ -535,6 +563,9 @@ it is harmless: Kerberos falls back to its built-in defaults.
   closed with the ruling unchanged: `CAP_KILL` is not applicable while
   chronyd does not drop privileges, so it is recorded rather than
   measured. `harness.DefaultCaps` now carries the established set, so
-  every E2E run re-proves its sufficiency. CI confirmation on both
+  every E2E run re-proves its sufficiency, and the driver ends by
+  comparing its own recommendation to `DefaultCaps` and exiting non-zero
+  when they differ — so a dispatched CI run answers "is B.2 still true",
+  not merely "did the bisection finish". CI confirmation on both
   architectures awaits the first `workflow_dispatch` run of
   `.github/workflows/capbisect.yml`.
