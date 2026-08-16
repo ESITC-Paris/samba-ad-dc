@@ -1278,15 +1278,15 @@ func TestWithDNSUpdateCommand(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, edit := withDNSUpdateCommand(tc.in)
+			got, edit := withGlobalSetting(tc.in, dnsUpdateKey, dnsUpdateValue)
 			if got != tc.want {
-				t.Errorf("withDNSUpdateCommand()\n got %q\nwant %q", got, tc.want)
+				t.Errorf("withGlobalSetting()\n got %q\nwant %q", got, tc.want)
 			}
 			if edit != tc.wantEdit {
 				t.Errorf("edit = %v, want %v", edit, tc.wantEdit)
 			}
 			// Applying it twice must be a no-op: joins repeat on restart.
-			again, editAgain := withDNSUpdateCommand(got)
+			again, editAgain := withGlobalSetting(got, dnsUpdateKey, dnsUpdateValue)
 			if again != got || editAgain != confUnchanged {
 				t.Errorf("second application changed the file (idempotence broken)")
 			}
@@ -1294,14 +1294,110 @@ func TestWithDNSUpdateCommand(t *testing.T) {
 	}
 }
 
-func TestEnsureDNSUpdateCommandWritesAtomically(t *testing.T) {
+// The `ad dc functional level` entry is the second thing a join has to force
+// into the generated smb.conf, and the one samba refuses to start without
+// when it is below the domain's level. It goes through the same editor, so
+// what is tested here is that editor applied to THAT setting: a missing
+// entry is added, this image's value is left alone, and a value samba would
+// refuse to boot with is replaced rather than kept.
+func TestWithGlobalSettingFunctionalLevel(t *testing.T) {
+	const line = "\tad dc functional level = 2016"
+	tests := []struct {
+		name     string
+		in       string
+		want     string
+		wantEdit confEdit
+	}{
+		{
+			name:     "a join-generated file without the setting gets it",
+			in:       "[global]\n\trealm = AD.EXAMPLE.COM\n\tworkgroup = AD\n",
+			want:     "[global]\n" + line + "\n\trealm = AD.EXAMPLE.COM\n\tworkgroup = AD\n",
+			wantEdit: confAdded,
+		},
+		{
+			name:     "already at this image's level is left byte-for-byte alone",
+			in:       "[global]\n\tad dc functional level = 2016\n",
+			want:     "[global]\n\tad dc functional level = 2016\n",
+			wantEdit: confUnchanged,
+		},
+		{
+			// samba's default since 4.19: a DC carrying it cannot start in a
+			// domain provisioned at 2016.
+			name:     "the samba default below the domain level is replaced",
+			in:       "[global]\n\trealm = AD.EXAMPLE.COM\n\tad dc functional level = 2008_R2\n",
+			want:     "[global]\n\trealm = AD.EXAMPLE.COM\n" + line + "\n",
+			wantEdit: confReplaced,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, edit := withGlobalSetting(tc.in, dcFunctionalLevelKey, "2016")
+			if got != tc.want {
+				t.Errorf("withGlobalSetting()\n got %q\nwant %q", got, tc.want)
+			}
+			if edit != tc.wantEdit {
+				t.Errorf("edit = %v, want %v", edit, tc.wantEdit)
+			}
+			again, editAgain := withGlobalSetting(got, dcFunctionalLevelKey, "2016")
+			if again != got || editAgain != confUnchanged {
+				t.Errorf("second application changed the file (idempotence broken)")
+			}
+		})
+	}
+}
+
+// joinedConfSettings decides WHICH settings the post-join edit forces in.
+// The functional level is conditional in exactly the way provisionArgs is:
+// the parameter has no value for levels at or below samba's 2008_R2 default,
+// so setting it there would turn a working join into a configuration error.
+func TestJoinedConfSettings(t *testing.T) {
+	tests := []struct {
+		functionLevel string
+		wantLevel     string // "" means the level must not be set at all
+	}{
+		{"2016", "2016"},
+		{"2012_R2", "2012_R2"},
+		{"2012", "2012"},
+		{"2008_R2", ""},
+		{"2003", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.functionLevel, func(t *testing.T) {
+			cfg := joinConfig(t)
+			cfg.FunctionLevel = tc.functionLevel
+
+			var gotLevel string
+			var gotDNS bool
+			for _, s := range joinedConfSettings(cfg) {
+				switch s.key {
+				case dcFunctionalLevelKey:
+					gotLevel = s.value
+				case dnsUpdateKey:
+					gotDNS = s.value == dnsUpdateValue
+				}
+				if s.why == "" {
+					t.Errorf("setting %q carries no reason to log", s.key)
+				}
+			}
+			if !gotDNS {
+				t.Errorf("the DNS update command is not among the settings a join forces in")
+			}
+			if gotLevel != tc.wantLevel {
+				t.Errorf("%q = %q, want %q", dcFunctionalLevelKey, gotLevel, tc.wantLevel)
+			}
+		})
+	}
+}
+
+func TestEnsureJoinedConfWritesAtomically(t *testing.T) {
 	e, logBuf := newTestExecutor(t, newFakeRunner())
 	dir := filepath.Dir(e.SMBConfPath)
 	if err := os.WriteFile(e.SMBConfPath, []byte("[global]\n\trealm = AD.EXAMPLE.COM\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	if ref := e.ensureDNSUpdateCommand(); ref != nil {
+	if ref := e.ensureJoinedConf(joinConfig(t)); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 	data, err := os.ReadFile(e.SMBConfPath)
@@ -1310,6 +1406,11 @@ func TestEnsureDNSUpdateCommandWritesAtomically(t *testing.T) {
 	}
 	if !strings.Contains(string(data), dnsUpdateCommand) {
 		t.Errorf("smb.conf does not carry the option:\n%s", data)
+	}
+	// Both settings land in ONE rewrite: a joined DC that got the DNS
+	// command but not the functional level does not start at all.
+	if !strings.Contains(string(data), dcFunctionalLevelKey+" = 2016") {
+		t.Errorf("smb.conf does not carry the functional level:\n%s", data)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1332,12 +1433,12 @@ func TestEnsureDNSUpdateCommandWritesAtomically(t *testing.T) {
 	}
 }
 
-func TestEnsureDNSUpdateCommandReplacesAWrongValue(t *testing.T) {
+func TestEnsureJoinedConfReplacesAWrongValue(t *testing.T) {
 	e, logBuf := newTestExecutor(t, newFakeRunner())
 	if err := os.WriteFile(e.SMBConfPath, []byte("[global]\n\tdns update command = /usr/sbin/samba_dnsupdate\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if ref := e.ensureDNSUpdateCommand(); ref != nil {
+	if ref := e.ensureJoinedConf(joinConfig(t)); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 	data, err := os.ReadFile(e.SMBConfPath)
@@ -1355,10 +1456,10 @@ func TestEnsureDNSUpdateCommandReplacesAWrongValue(t *testing.T) {
 	}
 }
 
-func TestEnsureDNSUpdateCommandMissingFileRefuses(t *testing.T) {
+func TestEnsureJoinedConfMissingFileRefuses(t *testing.T) {
 	e, _ := newTestExecutor(t, newFakeRunner())
 	e.SMBConfPath = filepath.Join(t.TempDir(), "absent", "smb.conf")
-	ref := e.ensureDNSUpdateCommand()
+	ref := e.ensureJoinedConf(joinConfig(t))
 	if ref == nil {
 		t.Fatal("expected a refusal when the generated smb.conf is missing")
 	}
