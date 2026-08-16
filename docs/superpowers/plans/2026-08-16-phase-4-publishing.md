@@ -142,7 +142,10 @@ Structure (binding; exact YAML authored in-task, actions SHA-pinned):
   with QEMU setup (identical steps otherwise — no gate waived);
   environment: `release`. Steps: full lint + unit + build with ARGs
   from prepare outputs (VCS_REF=github.sha, CREATED=run timestamp,
-  PKG_INDEX_HASH) + secrets gate + trivy gate + full E2E
+  PKG_INDEX_HASH — MANDATORY: resolve via
+  `check-pins-consistency.sh --print pkg_index_hash` exactly as ci.yml
+  does; the Dockerfile default is a bootstrap fallback and a published
+  image must never carry it) + secrets gate + trivy gate + full E2E
   (`go test ./test/e2e/`) + login GHCR (GITHUB_TOKEN packages:write) +
   push by digest only (`docker push --quiet` of a per-arch tag then
   capture digest, or buildx `--output type=registry,push-by-digest`),
