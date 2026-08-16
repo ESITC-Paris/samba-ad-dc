@@ -1002,17 +1002,18 @@ func TestSuperviseGivesUpOnAnUnreapableDaemon(t *testing.T) {
 	}
 }
 
-// TestSuperviseShutdownSharesOneBudget pins the §6.3 contract: the 10 s is
-// for the whole shutdown, not for each daemon. Two daemons that never
-// respond must still be given up on inside one grace window plus one kill
-// window, not two of each.
+// TestSuperviseShutdownSharesOneBudget pins the §6.3 ceiling: the 10 s is
+// the total an orderly stop may take — both daemons, SIGTERM phase and
+// SIGKILL escalation included. Two daemons that never respond must still be
+// given up on inside that one window, because past it the container runtime
+// kills the container itself.
 func TestSuperviseShutdownSharesOneBudget(t *testing.T) {
 	r := newFakeRunner()
 	chrony, samba := unreapableProc(t), unreapableProc(t)
 	r.procs["chronyd"], r.procs["samba"] = chrony, samba
 
-	e, _ := newTestExecutor(t, r)
-	e.ShutdownGrace = 200 * time.Millisecond
+	e, logBuf := newTestExecutor(t, r)
+	e.ShutdownGrace = 300 * time.Millisecond
 	e.KillGrace = 100 * time.Millisecond
 
 	sigCh, done := supervising(t, context.Background(), e, r, runConfig(config.ModeRun))
@@ -1021,13 +1022,49 @@ func TestSuperviseShutdownSharesOneBudget(t *testing.T) {
 	awaitClean(t, done, 5*time.Second)
 	elapsed := time.Since(start)
 
-	// Shared: ~300ms. Per-daemon budgets would take ~600ms.
-	const shared = 300 * time.Millisecond
-	if elapsed >= 2*shared-50*time.Millisecond {
-		t.Errorf("shutdown took %s: the two daemons each got their own budget instead of sharing one", elapsed)
+	// The whole shutdown fits in ShutdownGrace. Anything that adds the kill
+	// window on top (400ms), or gives each daemon its own (600ms+), busts
+	// the contract. The slack is for scheduling, not for another phase.
+	const slack = 80 * time.Millisecond
+	if elapsed > e.ShutdownGrace+slack {
+		t.Errorf("shutdown took %s: the %s budget is the total, escalation included", elapsed, e.ShutdownGrace)
 	}
-	if elapsed < e.ShutdownGrace {
-		t.Errorf("shutdown took %s: the grace window was not honoured at all", elapsed)
+	// It must still have waited: the SIGTERM phase is the budget minus the
+	// reap window held back for SIGKILL.
+	if want := e.ShutdownGrace - e.KillGrace; elapsed < want {
+		t.Errorf("shutdown took %s, less than the %s SIGTERM phase: samba was not given its window", elapsed, want)
+	}
+	// Both daemons were escalated on, and chronyd's message says how much
+	// of the shared budget was actually left for it.
+	for _, want := range []string{"samba did not stop", "chronyd did not stop", "could not be reaped"} {
+		if !strings.Contains(logBuf.String(), want) {
+			t.Errorf("log does not contain %q:\n%s", want, logBuf.String())
+		}
+	}
+	if !strings.Contains(logBuf.String(), "shared") {
+		t.Errorf("the log does not say the budget was shared:\n%s", logBuf.String())
+	}
+}
+
+// TestSuperviseShutdownFitsTheGraceWithDefaultRatio checks the same ceiling
+// with a kill window larger than the whole grace: the phases must still add
+// up to no more than the total.
+func TestSuperviseShutdownFitsTheGraceWithDefaultRatio(t *testing.T) {
+	r := newFakeRunner()
+	chrony, samba := unreapableProc(t), unreapableProc(t)
+	r.procs["chronyd"], r.procs["samba"] = chrony, samba
+
+	e, _ := newTestExecutor(t, r)
+	e.ShutdownGrace = 200 * time.Millisecond
+	e.KillGrace = 400 * time.Millisecond // absurd: larger than the total
+
+	sigCh, done := supervising(t, context.Background(), e, r, runConfig(config.ModeRun))
+	start := time.Now()
+	sigCh <- syscall.SIGTERM
+	awaitClean(t, done, 5*time.Second)
+
+	if elapsed := time.Since(start); elapsed > e.ShutdownGrace+80*time.Millisecond {
+		t.Errorf("shutdown took %s: a kill window wider than the budget must not extend it", elapsed)
 	}
 }
 

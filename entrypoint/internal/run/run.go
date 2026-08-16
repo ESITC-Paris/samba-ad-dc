@@ -47,11 +47,16 @@ const (
 	defaultSMBConf    = "/etc/samba/smb.conf"
 	defaultChronyConf = "/etc/chrony/chrony.conf"
 	defaultRoot       = "/"
-	// defaultShutdownGrace bounds the orderly stop of each daemon (§6.3:
-	// samba then chrony within 10 s).
+	// defaultShutdownGrace is the TOTAL an orderly stop may take: samba and
+	// chrony together, SIGTERM phase and SIGKILL escalation included (§6.3:
+	// samba then chrony within 10 s). Nothing in a shutdown is allowed to
+	// push past it — after it the container runtime kills the container
+	// itself, and a samba killed mid-write is the outcome the ordered
+	// shutdown exists to avoid.
 	defaultShutdownGrace = 10 * time.Second
-	// defaultKillGrace bounds the wait after escalating to SIGKILL. It is
-	// shared by both daemons, like the grace window itself.
+	// defaultKillGrace is the slice of that total held back to reap what
+	// SIGKILL leaves behind. It is subtracted from the grace window, not
+	// added to it.
 	defaultKillGrace = 2 * time.Second
 )
 
@@ -421,7 +426,8 @@ func (e *Executor) Supervise(ctx context.Context, cfg *config.Config) *config.Re
 // gives the container 10 s to stop samba AND chrony, so per-daemon windows
 // would add up to more than the contract allows and the container would be
 // SIGKILLed by the runtime mid-shutdown. samba gets whatever it needs of the
-// budget first, and chronyd gets the rest.
+// budget first, and chronyd gets the rest — which may be none of it, in
+// which case chronyd is killed at once rather than the shutdown overrunning.
 func (e *Executor) shutdown(ctx context.Context, samba Proc, sambaDone chan error, chrony Proc, chronyDone chan error) *config.Refusal {
 	term, kill := e.shutdownBudget(ctx)
 	defer term.stop()
@@ -437,18 +443,31 @@ type budget struct {
 	stop context.CancelFunc
 }
 
-// shutdownBudget derives the two shared deadlines of one shutdown: the grace
-// window for the polite SIGTERM, and a slightly longer one that bounds the
-// SIGKILL escalation for both daemons together.
+// shutdownBudget derives the two shared deadlines of one shutdown. The kill
+// deadline is the hard total — the whole grace window, for both daemons and
+// both phases together — and the term deadline sits earlier by the reap
+// window, so escalating to SIGKILL still leaves time to collect the corpse
+// inside the same total. Nothing here may outlive e.grace().
 //
 // Both deliberately survive a cancelled parent context: when cancellation is
 // what triggered the shutdown, an already-expired context would turn the
 // orderly stop into an immediate kill.
 func (e *Executor) shutdownBudget(ctx context.Context) (budget, budget) {
 	base := context.WithoutCancel(ctx)
-	termCtx, termCancel := context.WithTimeout(base, e.grace())
-	killCtx, killCancel := context.WithTimeout(base, e.grace()+e.killGrace())
+	termCtx, termCancel := context.WithTimeout(base, e.termWindow())
+	killCtx, killCancel := context.WithTimeout(base, e.grace())
 	return budget{termCtx, termCancel}, budget{killCtx, killCancel}
+}
+
+// termWindow is how long the polite SIGTERM phase may last: the total budget
+// minus the reap window held back for the escalation. A configured grace no
+// larger than the kill window splits the total in half instead, so the
+// SIGTERM phase always ends strictly before the total does.
+func (e *Executor) termWindow() time.Duration {
+	if w := e.grace() - e.killGrace(); w > 0 {
+		return w
+	}
+	return e.grace() / 2
 }
 
 // stopOne stops a single daemon on its own budget. It is used on the paths
@@ -462,13 +481,18 @@ func (e *Executor) stopOne(ctx context.Context, name string, p Proc, done chan e
 }
 
 // stopProc asks one daemon to stop and waits for it to be reaped, within the
-// shared budgets. A daemon that ignores SIGTERM is killed once the grace
-// window is spent; one that cannot even be reaped is left to the init
-// process (tini) rather than blocking the shutdown of the other.
+// shared budgets. A daemon that ignores SIGTERM is killed once the SIGTERM
+// phase is spent; one that cannot even be reaped is left to the init process
+// (tini) rather than blocking the shutdown of the other.
+//
+// The window this daemon actually gets is whatever the previous one left, so
+// the messages report it: "chronyd was killed immediately" is a fact about
+// samba having eaten the budget, not about chronyd misbehaving.
 func (e *Executor) stopProc(termCtx, killCtx context.Context, name string, p Proc, done chan error) {
 	if p == nil {
 		return
 	}
+	window := until(termCtx)
 	if err := p.Signal(syscall.SIGTERM); err != nil {
 		e.logf("could not signal %s (%v); waiting for it anyway", name, err)
 	}
@@ -484,15 +508,32 @@ func (e *Executor) stopProc(termCtx, killCtx context.Context, name string, p Pro
 	case <-termCtx.Done():
 	}
 
-	e.logf("%s did not stop within the %s shutdown budget: killing it", name, e.grace())
+	e.logf("%s did not stop in the %s it had of the shared %s shutdown budget: killing it",
+		name, round(window), e.grace())
 	_ = p.Signal(os.Kill)
 	select {
 	case <-done:
 		e.logf("%s killed", name)
 	case <-killCtx.Done():
-		e.logf("%s could not be reaped; leaving it to the init process", name)
+		e.logf("%s could not be reaped before the shared %s shutdown budget ran out; leaving it to the init process",
+			name, e.grace())
 	}
 }
+
+// until is how much of a budget is left, never negative.
+func until(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	if left := time.Until(deadline); left > 0 {
+		return left
+	}
+	return 0
+}
+
+// round renders a window for an operator, without spurious precision.
+func round(d time.Duration) time.Duration { return d.Round(time.Millisecond) }
 
 // makeRuntimeDirs creates the directories the daemons expect under /run.
 func (e *Executor) makeRuntimeDirs() *config.Refusal {
