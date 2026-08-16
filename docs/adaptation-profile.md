@@ -84,6 +84,11 @@ initialization), `maintenance` (database check/repair without starting the
 daemon). Version guard: refuses to open state written by a newer Samba;
 on upgrade, runs the database consistency check automatically.
 
+*Implemented in Phase 2.* The binding, operator-facing form of this state
+machine — variables, semantics, exit codes and the health check — is the
+**Runtime contract** section below; it is the contract the code is tested
+against, and B.4 above is its summary.
+
 ### B.5 Documented use cases → E2E matrix (§8.2)
 
 Nominal: provision; Kerberos authentication (kinit) and Kerberized SMB;
@@ -155,6 +160,132 @@ not claimed, and pinning every apt version in the Dockerfile is explicitly
 rejected — it would make security rebuilds a manual edit instead of a
 rebuild.
 
+## Runtime contract
+
+What the image accepts, what it does with it, and how it reports failure.
+This section is the contract: the entrypoint's unit tests assert these
+semantics and these exit codes, and the E2E matrix (B.5) exercises them
+against a running container. Exit codes are **immutable once released**.
+
+### Environment variables
+
+| Variable | Modes | Default | Meaning |
+|---|---|---|---|
+| `SAMBA_MODE` | all | `auto` | `auto|provision|join|run|maintenance` |
+| `SAMBA_REALM` | provision, join (and auto reaching them) | — required | Kerberos realm / AD DNS domain, e.g. `AD.EXAMPLE.COM` |
+| `SAMBA_DOMAIN` | provision | first label of realm | NetBIOS domain name |
+| `SAMBA_ADMIN_PASSWORD_FILE` | provision | — required | file with the initial Administrator password |
+| `SAMBA_JOIN_USERNAME` | join | `Administrator` | account used to join |
+| `SAMBA_JOIN_PASSWORD_FILE` | join | — required | file with the join account password |
+| `SAMBA_DNS_FORWARDER` | provision | none | upstream DNS forwarder IP |
+| `SAMBA_DNS_BACKEND` | provision, join | `SAMBA_INTERNAL` | only `SAMBA_INTERNAL` supported in v1 |
+| `SAMBA_FUNCTION_LEVEL` | provision | `2016` | AD functional level |
+| `SAMBA_LOG_LEVEL` | all | `1` | samba debug level |
+| `SAMBA_CHRONY` | auto/provision/join/run | `on` | serve MS-SNTP signed time (`on|off`) |
+| `SAMBA_MAINTENANCE_OP` | maintenance | `check` | `check` (dbcheck) or `repair` (dbcheck --fix --yes) |
+
+Secrets are accepted **only** through the `*_FILE` variables (§6.1).
+Setting a plain `SAMBA_ADMIN_PASSWORD` or `SAMBA_JOIN_PASSWORD` in the
+environment is refused with exit 10 and a message naming the `_FILE`
+variant; no secret value is ever logged.
+
+### Mode semantics (B.4)
+
+- `auto`: state present → behave as `run`; state absent → `join` if
+  `SAMBA_JOIN_PASSWORD_FILE` is set, else `provision`.
+- `provision`: state present → exit 20. Else `samba-tool domain
+  provision`, write marker, start daemons.
+- `join`: state present → exit 20. Else `samba-tool domain join ... DC`,
+  write marker, start daemons.
+- `run`: state absent → exit 21 ("volume missing or not mounted —
+  mount the /var/lib/samba volume, or run an initialization mode").
+  Else guards, then start daemons.
+- `maintenance`: state absent → exit 21. Else run dbcheck (or --fix),
+  print summary, exit without starting daemons (0 on clean, 23 on
+  failure).
+
+### State & guards
+
+- State present ⇔ `/var/lib/samba/private/sam.ldb` exists.
+- Marker `/var/lib/samba/.image-state.json`:
+  `{"samba_version": "4.24.6", "initialized_at": "<RFC3339>", "last_mode": "provision"}`.
+- Marker version > image version ⇒ exit 22 ("state was written by Samba
+  X — deploy image tag X or newer, or restore a backup taken on this
+  version").
+- Marker version < image version ⇒ upgrade path: `samba-tool dbcheck`
+  first; failure ⇒ exit 23; success ⇒ marker updated to image version,
+  then start.
+- State present but marker absent (foreign/pre-existing volume): log a
+  warning, run dbcheck (failure ⇒ 23), adopt by writing the marker.
+- Timestamps come from the clock at runtime; version from a var set at
+  build (`-ldflags -X main.sambaVersion=<v>`).
+- A restart never modifies existing state (§6.2): the marker is written
+  only after a successful initialization or a successful upgrade check.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | success |
+| `10` | configuration error |
+| `11` | missing/unreadable secret file |
+| `20` | provision/join refused over existing state |
+| `21` | run mode with absent state |
+| `22` | downgrade refusal |
+| `23` | database consistency check failure |
+| `30` | samba runtime failure |
+
+Every failure message carries a cause and a remedy, one line each, on
+stderr, prefixed `ERROR: ` (§6.5). Logs go to stdout/stderr exclusively
+(§6.4); samba runs `--foreground --no-process-group --debug-stdout`.
+
+### Process model and shutdown
+
+`tini` is PID 1 (`ENTRYPOINT ["/usr/bin/tini", "--",
+"/usr/local/bin/entrypoint"]`) and reaps what Samba's process model
+leaves behind. The entrypoint starts `chronyd` first and `samba` second;
+SIGTERM (or SIGINT) stops **samba first, then chronyd**, and a container
+asked to stop exits `0` (§6.3).
+
+The two stops share **one 10 s budget**, they do not each get their own:
+§6.3 gives the container 10 s to stop samba *and* chrony, so per-daemon
+windows would add up past what the contract allows and the container
+would be SIGKILLed by the runtime mid-shutdown. samba takes whatever it
+needs of the budget first and chronyd gets the remainder. **Everything
+fits inside that one budget**, the SIGKILL escalation for a daemon that
+ignored SIGTERM included; a daemon that cannot even be reaped is left to
+the init process rather than blocking the other's stop.
+
+Losing chronyd alone does not take the DC down — signed NTP stops being
+served and the event is logged.
+
+### Health check
+
+```
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3
+    CMD ["/usr/local/bin/entrypoint", "healthcheck"]
+```
+
+`entrypoint healthcheck` is an **application-level** probe, not a process
+check (§5.5). It reads the realm from `/etc/samba/smb.conf` and then, on
+the loopback address only, asks the three protocols a domain member uses,
+in the order it uses them: the `_ldap._tcp.<realm>` SRV record on
+`127.0.0.1:53`, an anonymous rootDSE read on `ldap://127.0.0.1:389`, and
+a share enumeration with `smbclient -L 127.0.0.1 -N`. It exits `0` only
+when all three answer and `1` otherwise — docker's healthy/unhealthy
+values, never the refusal codes above. The 180 s start period is
+deliberate: a first-boot provision on a cold volume legitimately takes
+minutes, and a container declared unhealthy mid-provision would be
+restarted into a half-initialized state.
+
+### Time service
+
+`chronyd` is started with `-d -x -f /etc/chrony/chrony.conf`: `-x` so it
+never disciplines the host's clock (B.3), `-d` so it logs to the
+container's stderr. The configuration is baked into the image (read-only
+rootfs) and wires `ntpsigndsocket /var/lib/samba/ntp_signd` for MS-SNTP
+signing; 123/udp is exposed. `SAMBA_CHRONY=off` runs the DC without it.
+
 ## Profile changelog
 
 - 2026-08-16: created from SPEC.md v1.2 Annex B; B.6 shell-entrypoint
@@ -168,3 +299,15 @@ rebuild.
   SMB-over-QUIC, SambaGPG (`--without-gpgme`) and no-`nsupdate`
   limitations; new B.8 states the §4.3 reproducibility interpretation
   (pinned inputs, SBOM-recorded resolved versions).
+- 2026-08-16: Phase 2 — the entrypoint state machine of B.4 is
+  implemented and wired as the image's ENTRYPOINT and HEALTHCHECK. New
+  **Runtime contract** section records the binding form of that contract
+  (environment variables, mode semantics, state and version guards, exit
+  codes, process model and shutdown order, health check, time service);
+  it is copied verbatim from the Phase 2 plan's behavior contract, and the
+  unit suite is what holds code and profile to it. Two facts learned from
+  the first real provision are folded in: `python3-markdown` is a runtime
+  dependency of `samba-tool domain provision` (ForestUpdate/DomainUpdate
+  read the MS update tables out of markdown), and chronyd runs as root
+  because the B.2 capability set excludes CAP_KILL — a privilege-dropping
+  chronyd cannot be stopped in order, nor reach samba's signing socket.

@@ -6,6 +6,10 @@
 # stay in sync. Nothing here resolves a "latest" anything.
 ARG BUILDER_BASE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 ARG RUNTIME_BASE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+# golang:1.24-trixie — entrypoint/go.mod declares `go 1.24.0`, so 1.24 is
+# the floor, and trixie matches the runtime base so the toolchain and the
+# image agree on their libc even though the binary is built CGO_ENABLED=0.
+ARG GOBUILD_BASE=golang:1.24-trixie@sha256:5835f052b784aa39f2fe9070def3568605c8bc3fcd810f10402066348b61e716
 
 # ---------------------------------------------------------------------------
 # builder — compiles Samba with bundled Heimdal into DESTDIR=/dest
@@ -201,6 +205,47 @@ RUN set -eux; \
     rmdir /dest/var/lock /dest/var/run/samba /dest/var/run
 
 # ---------------------------------------------------------------------------
+# gobuild — compiles and unit-tests the Go entrypoint
+# ---------------------------------------------------------------------------
+# The §6.7 gate travels with the image: gofmt, go vet and the whole unit
+# suite run here, so an image can only exist if the state machine's
+# transition/refusal matrix passed. CI runs the same commands on the host
+# (the `unit` job) for a fast, readable failure; this stage is what makes it
+# impossible to ship around them.
+FROM ${GOBUILD_BASE} AS gobuild
+
+ARG SAMBA_VERSION=4.24.6
+
+WORKDIR /src
+
+# Manifests first: the module download layer is then reused across every
+# source-only change.
+COPY entrypoint/go.mod entrypoint/go.sum ./
+RUN go mod download
+
+COPY entrypoint/ ./
+
+# CGO_ENABLED=0: the binary must run as PID 1's payload with no dependency
+# on the runtime image's libc version. -trimpath keeps build paths out of
+# it; -s -w drop the symbol table and DWARF (the entrypoint is debugged from
+# its logs, not from a core dump inside a container).
+# The Samba version is injected here and nowhere else: the version guard
+# compares the marker on the state volume against this value, so a binary
+# built without the flag must — and does — refuse to start.
+RUN set -eux; \
+    unformatted="$(gofmt -l .)"; \
+    if [ -n "${unformatted}" ]; then \
+      echo "FATAL: gofmt would rewrite these files:" >&2; \
+      echo "${unformatted}" >&2; \
+      exit 1; \
+    fi; \
+    go vet ./...; \
+    go test ./...; \
+    CGO_ENABLED=0 go build -trimpath \
+      -ldflags "-s -w -X main.sambaVersion=${SAMBA_VERSION}" \
+      -o /out/entrypoint ./cmd/entrypoint
+
+# ---------------------------------------------------------------------------
 # runtime — the shipped image: base + derived package closure + /dest
 # ---------------------------------------------------------------------------
 FROM ${RUNTIME_BASE} AS runtime
@@ -250,6 +295,28 @@ RUN samba --version \
     && samba-tool --version \
     && samba-tool --help > /dev/null
 
+COPY --from=gobuild /out/entrypoint /usr/local/bin/entrypoint
+
+# The chrony configuration is static and read-only-friendly, so it is baked
+# in. /etc/chrony is NOT a volume (only /etc/samba and /var/lib/samba are),
+# which is exactly why this file can live here and survive.
+# Nothing is created under /var/lib/samba at build time: it is a volume, and
+# anything baked there is masked the moment one is mounted. The entrypoint
+# creates the runtime directories (/run/samba, /run/lock/samba, /run/chrony)
+# and /var/lib/samba/chrony itself, at startup.
+COPY chrony/chrony.conf /etc/chrony/chrony.conf
+
+# Smoke the entrypoint, and with it the -ldflags injection: a binary that
+# reported the wrong Samba version would pass every unit test and then
+# refuse to open the state volume at the worst possible moment.
+RUN set -eux; \
+    reported="$(/usr/local/bin/entrypoint --version)"; \
+    echo "${reported}"; \
+    case "${reported}" in \
+      *"${SAMBA_VERSION}"*) ;; \
+      *) echo "FATAL: entrypoint reports '${reported}', expected samba ${SAMBA_VERSION}" >&2; exit 1 ;; \
+    esac
+
 LABEL org.opencontainers.image.source="https://github.com/esitc-paris/samba-ad-dc" \
       org.opencontainers.image.version="${SAMBA_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
@@ -262,10 +329,21 @@ LABEL org.opencontainers.image.source="https://github.com/esitc-paris/samba-ad-d
 
 VOLUME ["/var/lib/samba", "/etc/samba"]
 
-# DNS(53), Kerberos(88), EPM(135), NetBIOS(137-139), LDAP(389),
+# DNS(53), Kerberos(88), NTP(123), EPM(135), NetBIOS(137-139), LDAP(389),
 # SMB(445), kpasswd(464), LDAPS(636), Global Catalog(3268/3269).
-EXPOSE 53 53/udp 88 88/udp 135 137/udp 138/udp 139 389 389/udp 445 464 464/udp 636 3268 3269
+# 123/udp is the MS-SNTP signed time service chrony serves to domain
+# members (adaptation profile B.3).
+EXPOSE 53 53/udp 88 88/udp 123/udp 135 137/udp 138/udp 139 389 389/udp 445 464 464/udp 636 3268 3269
 
-# The Go entrypoint arrives in Phase 2; until then the image only proves
-# it can run what it ships.
-CMD ["samba", "--version"]
+# tini is PID 1 and reaps the zombies Samba's process model leaves behind;
+# `--` makes it forward signals to the entrypoint, which turns SIGTERM into
+# the orderly stop of samba then chronyd (§6.3).
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint"]
+
+# An application-level probe, not a process check: it asks DNS, LDAP and SMB
+# on the loopback address whether this container is actually serving the
+# domain (§5.5). The start period is generous because a first-boot provision
+# legitimately takes minutes on a cold volume, and a container declared
+# unhealthy mid-provision would be restarted into a half-initialized state.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD ["/usr/local/bin/entrypoint", "healthcheck"]

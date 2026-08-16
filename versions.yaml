@@ -20,4 +20,7 @@ branches:
     base:
       builder: "debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
       runtime: "debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
+      # Toolchain for the Go entrypoint stage; entrypoint/go.mod declares
+      # `go 1.24.0`, so 1.24 is the floor.
+      gobuild: "golang:1.24-trixie@sha256:5835f052b784aa39f2fe9070def3568605c8bc3fcd810f10402066348b61e716"
     pkg_index_hash: "bootstrap"  # replaced by the watcher from Phase 6 on

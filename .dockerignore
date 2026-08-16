@@ -1,13 +1,14 @@
 # Build context exclusions.
 #
-# The build COPYs exactly two paths from the context:
+# The build COPYs exactly these paths from the context:
 #   keys/samba-release-key.asc   (GPG verification of the Samba tarball)
 #   runtime-packages.txt         (the runtime package manifest)
+#   entrypoint/                  (the Go entrypoint, built in-image)
+#   chrony/chrony.conf           (the baked MS-SNTP configuration)
 # Everything excluded below is either irrelevant to the build or pure
 # documentation churn that would otherwise invalidate the context on
 # every prose commit. Deliberately conservative: files a later phase may
-# need in the context (versions.yaml, scripts/, entrypoint sources) are
-# left in.
+# need in the context (versions.yaml, scripts/) are left in.
 
 # Source control and CI metadata
 .git

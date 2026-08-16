@@ -87,6 +87,7 @@ libzstd1  # pulled in by libarchive13t64 and libssl3t64
 python3  # /usr/bin/python3 shebang of samba-tool and the samba_* admin scripts; must stay 3.13 so /usr/lib/python3.13/site-packages (where Samba installed its modules and where its scripts sys.path.insert) is the live interpreter's
 python3-dnspython  # samba_dnsupdate, samba_upgradedns, samba.dnsresolver import dns.resolver unguarded
 python3-cryptography  # unguarded import in samba/netcmd/computer_generate_csr.py (also gkdi, key_credential_link); samba-tool loads its whole subcommand tree at startup, so WITHOUT it plain `samba-tool --help` exits 1 with ModuleNotFoundError
+python3-markdown  # samba/forest_update.py and samba/domain_update.py read the MS forest/domain update tables out of markdown, and `samba-tool domain provision` runs ForestUpdate/DomainUpdate on every full provision; WITHOUT it provision dies at "Fixing provision GUIDs" with ModuleNotFoundError: No module named 'markdown' (observed, Phase 2 smoke). Listed as deliberately absent until Phase 2 exercised a real provision — a doc-generator-only justification that the code did not support
 # Deliberately NOT installed, verified by test rather than assumed:
 #   python3-gpg          - guarded import; the SambaGPG password store it
 #                          serves is compiled out entirely (the builder
@@ -94,7 +95,6 @@ python3-cryptography  # unguarded import in samba/netcmd/computer_generate_csr.p
 #                          libgpgme and the GnuPG suite stays out of the image)
 #   python3-setproctitle - guarded import; only hides passwords typed on the
 #                          command line, which this image's tooling does not do
-#   python3-markdown     - only samba.ms_schema_markdown, a doc generator
 
 # --- service-level requirements -------------------------------------------
 chrony  # MS-SNTP signed time service for domain members (adaptation profile B.3)

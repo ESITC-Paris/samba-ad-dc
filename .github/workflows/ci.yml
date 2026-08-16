@@ -83,9 +83,41 @@ jobs:
         run: |
           docker run --rm -v "${PWD}:/repo:ro" -w /repo "${ACTIONLINT_IMAGE}" -color
 
+  unit:
+    name: Unit (entrypoint)
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          # The toolchain is chosen by entrypoint/go.mod, so this job and
+          # the Dockerfile's gobuild stage cannot drift apart.
+          go-version-file: entrypoint/go.mod
+          cache-dependency-path: entrypoint/go.sum
+
+      - name: gofmt, vet and unit tests
+        working-directory: entrypoint
+        run: |
+          # The same three gates the gobuild stage runs inside the image
+          # (SPEC §6.7). They live here as well because a failure on the
+          # runner is readable in seconds, while the same failure inside a
+          # 90-minute image build is not.
+          unformatted=$(gofmt -l .)
+          if [ -n "${unformatted}" ]; then
+            echo "::error::gofmt would rewrite: ${unformatted}"
+            exit 1
+          fi
+          go vet ./...
+          go test ./...
+
   build:
     name: Build (${{ matrix.arch }})
-    needs: lint
+    needs: [lint, unit]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -119,8 +151,11 @@ jobs:
 
       - name: Smoke
         run: |
+          # --entrypoint is required from Phase 2 on: the image's ENTRYPOINT
+          # is the Go state machine, which (correctly) refuses arguments it
+          # does not understand instead of running them.
           expected=$(sh scripts/check-pins-consistency.sh --print samba_version)
-          actual=$(docker run --rm samba-ad-dc:ci samba --version)
+          actual=$(docker run --rm --entrypoint samba samba-ad-dc:ci --version)
           echo "${actual} (versions.yaml pins ${expected})"
           case "${actual}" in
             *"${expected}"*) ;;
@@ -129,7 +164,30 @@ jobs:
               exit 1
               ;;
           esac
-          docker run --rm samba-ad-dc:ci samba-tool --help > /dev/null
+          docker run --rm --entrypoint samba-tool samba-ad-dc:ci --help > /dev/null
+
+          # The entrypoint's own report of the Samba version comes from the
+          # -ldflags injection in the gobuild stage; the version guard on the
+          # state volume is only as trustworthy as this value.
+          reported=$(docker run --rm samba-ad-dc:ci --version)
+          echo "${reported}"
+          case "${reported}" in
+            *"${expected}"*) ;;
+            *)
+              echo "::error::entrypoint reports '${reported}', versions.yaml pins ${expected}"
+              exit 1
+              ;;
+          esac
+
+          # An unconfigured container must refuse with the documented
+          # configuration exit code, not start something.
+          code=0
+          docker run --rm -e SAMBA_MODE=run samba-ad-dc:ci || code=$?
+          echo "run mode without a state volume exited ${code}"
+          if [ "${code}" -ne 21 ]; then
+            echo "::error::run mode without state exited ${code}, expected 21"
+            exit 1
+          fi
 
       - name: Label assertion
         run: |

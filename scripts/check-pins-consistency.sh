@@ -16,6 +16,7 @@
 #   ARG SAMBA_TARBALL_SHA256   == branches[b].tarball_sha256
 #   ARG BUILDER_BASE           == branches[b].base.builder
 #   ARG RUNTIME_BASE           == branches[b].base.runtime
+#   ARG GOBUILD_BASE           == branches[b].base.gobuild
 #   ARG BASE_DIGEST            == digest(RUNTIME_BASE) == digest(base.runtime)
 #   ARG BASE_NAME              == RUNTIME_BASE with the @sha256:... cut off
 #
@@ -62,6 +63,7 @@ print("samba_version=%s" % entry["samba_version"])
 print("tarball_sha256=%s" % entry["tarball_sha256"])
 print("base_builder=%s" % entry["base"]["builder"])
 print("base_runtime=%s" % entry["base"]["runtime"])
+print("base_gobuild=%s" % entry["base"]["gobuild"])
 print("pkg_index_hash=%s" % entry["pkg_index_hash"])
 PY
 }
@@ -88,6 +90,7 @@ read_versions_awk() {
         /^    pkg_index_hash:/ { print "pkg_index_hash=" val($0) }
         inbase && /^      builder:/ { print "base_builder=" val($0) }
         inbase && /^      runtime:/ { print "base_runtime=" val($0) }
+        inbase && /^      gobuild:/ { print "base_gobuild=" val($0) }
     ' "$VERSIONS"
 }
 
@@ -108,6 +111,7 @@ v_samba_version=$(get samba_version)
 v_tarball_sha256=$(get tarball_sha256)
 v_base_builder=$(get base_builder)
 v_base_runtime=$(get base_runtime)
+v_base_gobuild=$(get base_gobuild)
 v_pkg_index_hash=$(get pkg_index_hash)
 
 for pair in \
@@ -116,6 +120,7 @@ for pair in \
     "tarball_sha256:$v_tarball_sha256" \
     "base.builder:$v_base_builder" \
     "base.runtime:$v_base_runtime" \
+    "base.gobuild:$v_base_gobuild" \
     "pkg_index_hash:$v_pkg_index_hash"
 do
     if [ -z "${pair#*:}" ]; then
@@ -132,7 +137,7 @@ if [ "${1:-}" = "--print" ]; then
     value=$(get "$key")
     if [ -z "$value" ]; then
         echo "unknown pin: ${key:-<missing>}" >&2
-        echo "known: default_branch samba_version tarball_sha256 base_builder base_runtime pkg_index_hash" >&2
+        echo "known: default_branch samba_version tarball_sha256 base_builder base_runtime base_gobuild pkg_index_hash" >&2
         exit 2
     fi
     printf '%s\n' "$value"
@@ -197,6 +202,7 @@ check_arg SAMBA_VERSION "$v_samba_version"
 check_arg SAMBA_TARBALL_SHA256 "$v_tarball_sha256"
 check_arg BUILDER_BASE "$v_base_builder"
 check_arg RUNTIME_BASE "$v_base_runtime"
+check_arg GOBUILD_BASE "$v_base_gobuild"
 
 # The catalog's base refs must themselves be digest-pinned; a floating tag
 # here would make every other assertion meaningless.
@@ -206,6 +212,9 @@ if [ -z "$runtime_digest" ]; then
 fi
 if [ -z "$(digest_of "$v_base_builder")" ]; then
     fail "versions.yaml base.builder ($v_base_builder) is not digest-pinned"
+fi
+if [ -z "$(digest_of "$v_base_gobuild")" ]; then
+    fail "versions.yaml base.gobuild ($v_base_gobuild) is not digest-pinned"
 fi
 
 # BASE_DIGEST (the OCI label) must equal the digest already carried by
