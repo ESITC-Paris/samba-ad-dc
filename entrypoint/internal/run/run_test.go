@@ -1196,7 +1196,11 @@ func (c *countingRunner) Start(ctx context.Context, name string, args ...string)
 // smb.conf editing (pure)
 // ---------------------------------------------------------------------------
 
-func TestWithDNSUpdateCommand(t *testing.T) {
+// withGlobalSetting is one editor used for every setting a join has to force
+// in; the three TestWithGlobalSetting* tests exercise it per setting. This
+// one carries the general cases — sections, spacing, comments, replacement —
+// and the other two the specifics of their own parameter.
+func TestWithGlobalSettingDNSUpdateCommand(t *testing.T) {
 	const line = "\tdns update command = /usr/sbin/samba_dnsupdate --use-samba-tool"
 	tests := []struct {
 		name     string
@@ -1348,31 +1352,44 @@ func TestWithGlobalSettingFunctionalLevel(t *testing.T) {
 }
 
 // joinedConfSettings decides WHICH settings the post-join edit forces in.
-// The functional level is conditional in exactly the way provisionArgs is:
-// the parameter has no value for levels at or below samba's 2008_R2 default,
-// so setting it there would turn a working join into a configuration error.
+// Both conditional ones are conditional in exactly the way provisionArgs is:
+// the functional level has no value for levels at or below samba's 2008_R2
+// default (setting it there would turn a working join into a configuration
+// error), and the forwarder is only written when the operator asked for one.
 func TestJoinedConfSettings(t *testing.T) {
 	tests := []struct {
+		name          string
 		functionLevel string
+		forwarder     string
 		wantLevel     string // "" means the level must not be set at all
+		wantForwarder string // "" means the forwarder must not be set at all
 	}{
-		{"2016", "2016"},
-		{"2012_R2", "2012_R2"},
-		{"2012", "2012"},
-		{"2008_R2", ""},
-		{"2003", ""},
+		{"2016", "2016", "", "2016", ""},
+		{"2012_R2", "2012_R2", "", "2012_R2", ""},
+		{"2012", "2012", "", "2012", ""},
+		{"2008_R2 needs no level option", "2008_R2", "", "", ""},
+		{"2003 needs no level option", "2003", "", "", ""},
+		{"forwarder set", "2016", "10.0.0.53", "2016", "10.0.0.53"},
+		// A DC that resolves through itself is unusable without one, so the
+		// forwarder has to survive to the joined DC's smb.conf whatever else
+		// is configured.
+		{"forwarder with no level option", "2008_R2", "10.0.0.53", "", "10.0.0.53"},
+		{"blank forwarder is not written", "2016", "   ", "2016", ""},
 	}
 	for _, tc := range tests {
-		t.Run(tc.functionLevel, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			cfg := joinConfig(t)
 			cfg.FunctionLevel = tc.functionLevel
+			cfg.DNSForwarder = tc.forwarder
 
-			var gotLevel string
+			var gotLevel, gotForwarder string
 			var gotDNS bool
 			for _, s := range joinedConfSettings(cfg) {
 				switch s.key {
 				case dcFunctionalLevelKey:
 					gotLevel = s.value
+				case dnsForwarderKey:
+					gotForwarder = s.value
 				case dnsUpdateKey:
 					gotDNS = s.value == dnsUpdateValue
 				}
@@ -1386,6 +1403,58 @@ func TestJoinedConfSettings(t *testing.T) {
 			if gotLevel != tc.wantLevel {
 				t.Errorf("%q = %q, want %q", dcFunctionalLevelKey, gotLevel, tc.wantLevel)
 			}
+			if gotForwarder != tc.wantForwarder {
+				t.Errorf("%q = %q, want %q", dnsForwarderKey, gotForwarder, tc.wantForwarder)
+			}
+		})
+	}
+}
+
+// The forwarder goes through the same editor as everything else, so what is
+// tested here is that editor applied to THAT setting: added when absent, left
+// alone when already this DC's upstream, and replaced when it points
+// somewhere else — a wrong forwarder is worse than none, because the DC then
+// waits on an upstream that will never answer.
+func TestWithGlobalSettingDNSForwarder(t *testing.T) {
+	const line = "\tdns forwarder = 10.0.0.53"
+	tests := []struct {
+		name     string
+		in       string
+		want     string
+		wantEdit confEdit
+	}{
+		{
+			name:     "a join-generated file without the setting gets it",
+			in:       "[global]\n\trealm = AD.EXAMPLE.COM\n",
+			want:     "[global]\n" + line + "\n\trealm = AD.EXAMPLE.COM\n",
+			wantEdit: confAdded,
+		},
+		{
+			name:     "the same upstream is left byte-for-byte alone",
+			in:       "[global]\n\tdns forwarder = 10.0.0.53\n",
+			want:     "[global]\n\tdns forwarder = 10.0.0.53\n",
+			wantEdit: confUnchanged,
+		},
+		{
+			name:     "a different upstream is replaced",
+			in:       "[global]\n\tdns forwarder = 192.0.2.1\n",
+			want:     "[global]\n" + line + "\n",
+			wantEdit: confReplaced,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, edit := withGlobalSetting(tc.in, dnsForwarderKey, "10.0.0.53")
+			if got != tc.want {
+				t.Errorf("withGlobalSetting()\n got %q\nwant %q", got, tc.want)
+			}
+			if edit != tc.wantEdit {
+				t.Errorf("edit = %v, want %v", edit, tc.wantEdit)
+			}
+			again, editAgain := withGlobalSetting(got, dnsForwarderKey, "10.0.0.53")
+			if again != got || editAgain != confUnchanged {
+				t.Errorf("second application changed the file (idempotence broken)")
+			}
 		})
 	}
 }
@@ -1397,20 +1466,26 @@ func TestEnsureJoinedConfWritesAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ref := e.ensureJoinedConf(joinConfig(t)); ref != nil {
+	cfg := joinConfig(t)
+	cfg.DNSForwarder = "10.0.0.53"
+	if ref := e.ensureJoinedConf(cfg); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 	data, err := os.ReadFile(e.SMBConfPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), dnsUpdateCommand) {
-		t.Errorf("smb.conf does not carry the option:\n%s", data)
-	}
-	// Both settings land in ONE rewrite: a joined DC that got the DNS
-	// command but not the functional level does not start at all.
-	if !strings.Contains(string(data), dcFunctionalLevelKey+" = 2016") {
-		t.Errorf("smb.conf does not carry the functional level:\n%s", data)
+	// Every setting lands in ONE rewrite: a joined DC that got the DNS
+	// command but not the functional level does not start at all, and one
+	// that got both but not the forwarder cannot replicate.
+	for _, want := range []string{
+		dnsUpdateCommand,
+		dcFunctionalLevelKey + " = 2016",
+		dnsForwarderKey + " = 10.0.0.53",
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("smb.conf does not carry %q:\n%s", want, data)
+		}
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {

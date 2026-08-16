@@ -327,6 +327,27 @@ LABEL org.opencontainers.image.source="https://github.com/esitc-paris/samba-ad-d
       org.opencontainers.image.base.digest="${BASE_DIGEST}" \
       org.esitc-paris.spec-version="1.2"
 
+# Both `samba-tool domain provision` and `samba-tool domain join` generate a
+# Kerberos configuration for the realm at this path and print where they put
+# it. Nothing reads it unless it is pointed at: the image ships no
+# /etc/krb5.conf, so without this every Kerberos bind made INSIDE the
+# container falls back to DNS realm discovery — the bundled Heimdal walks
+# `_kerberos.` up the parent domains of the host name, none of which the
+# directory is authoritative for. On a DC that resolves through its own
+# internal DNS (which a multi-DC domain requires) those queries take seconds
+# instead of milliseconds, and the Kerberos-sealed DRSUAPI bind that carries
+# replication times out before the walk finishes; `samba-tool drs showrepl`
+# run by an operator in the container simply hangs. The generated file sets
+# `dns_lookup_realm = false`, which removes the walk entirely.
+#
+# It is an image ENV rather than something the entrypoint exports, because
+# `docker exec` inherits the image environment and NOT the environment of
+# PID 1: this is the only form that also reaches an operator's own commands.
+# Pointing at a file that does not exist yet (before the first provision) is
+# harmless — Kerberos falls back to its built-in defaults, which is what it
+# does today with no file at all.
+ENV KRB5_CONFIG=/var/lib/samba/private/krb5.conf
+
 VOLUME ["/var/lib/samba", "/etc/samba"]
 
 # DNS(53), Kerberos(88), NTP(123), EPM(135), NetBIOS(137-139), LDAP(389),

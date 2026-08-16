@@ -81,6 +81,18 @@ them.
   dynamic RPC reference it. Supported topologies: dedicated IP per DC via
   macvlan/ipvlan, or host networking. Port publishing on a bridge network
   is unsupported.
+- **DNS: a DC resolves through a DC, and its own DNS needs an upstream.**
+  Both halves are required together on a multi-DC domain. A replication
+  partner is addressed by a `<objectGUID>._msdcs.<realm>` CNAME that only
+  the directory's own DNS answers, so a DC pointed at anything else cannot
+  replicate *from* its partners. And samba's internal DNS with no forwarder
+  takes seconds — not milliseconds — to fail a name it does not serve,
+  which is long enough to time out Kerberos and with it replication; set
+  `SAMBA_DNS_FORWARDER` to a resolver that is not this DC. In-container
+  Kerberos tooling depends on the same wiring (see Runtime contract:
+  **In-container Kerberos**), and `KRB5_CONFIG` is set in the image so that
+  an operator's `docker exec ... samba-tool` inherits the realm's Kerberos
+  configuration rather than rediscovering it over DNS.
 - **Filesystem:** the volume backing `/var/lib/samba` requires xattr and
   POSIX ACL support (ext4/xfs); NFS unsupported.
 - **Time:** the container serves signed NTP (MS-SNTP via chrony, wired to
@@ -163,6 +175,14 @@ with the read-only rootfs configuration.
   available. Decision per SPEC §5.1: dropping it removes the entire GnuPG
   suite — including a network-capable daemon (`dirmngr`) — from the image
   closure, which is worth more than an opt-in password-store variant.
+- **The MS-SNTP signed-reply path is not exercised in CI.**
+  `TestSignedNTPWiring` proves the wiring and the service: samba creates and
+  serves the signing socket, chrony is configured against that same
+  directory, and a client on the domain network gets a usable time
+  measurement out of the DC. It does **not** prove a signed exchange — that
+  needs a client authenticating as a domain machine account, which the
+  protocol test-client is not. A regression in the signing path itself
+  would therefore surface as a chrony log error rather than as a red test.
 - **No `nsupdate` in the image** (`bind9-dnsutils` is not installed).
   Dynamic DNS updates therefore run through
   `samba_dnsupdate --use-samba-tool`, which the entrypoint pins (Phase 2);
@@ -206,9 +226,9 @@ against a running container. Exit codes are **immutable once released**.
 | `SAMBA_ADMIN_PASSWORD_FILE` | provision | — required | file with the initial Administrator password |
 | `SAMBA_JOIN_USERNAME` | join | `Administrator` | account used to join |
 | `SAMBA_JOIN_PASSWORD_FILE` | join | — required | file with the join account password |
-| `SAMBA_DNS_FORWARDER` | provision | none | upstream DNS forwarder IP |
+| `SAMBA_DNS_FORWARDER` | provision, join | none | upstream DNS forwarder IP (see below — not optional for a DC that resolves through itself) |
 | `SAMBA_DNS_BACKEND` | provision, join | `SAMBA_INTERNAL` | only `SAMBA_INTERNAL` supported in v1 |
-| `SAMBA_FUNCTION_LEVEL` | provision | `2016` | AD functional level; provision also mirrors it onto the `ad dc functional level` smb.conf parameter for `2012`, `2012_R2` and `2016` (see below) |
+| `SAMBA_FUNCTION_LEVEL` | provision, join | `2016` | AD functional level; also mirrored onto the `ad dc functional level` smb.conf parameter for `2012`, `2012_R2` and `2016` — by provision through `--option`, by join through the post-join edit (see below) |
 | `SAMBA_LOG_LEVEL` | all | `1` | samba debug level |
 | `SAMBA_CHRONY` | auto/provision/join/run | `on` | serve MS-SNTP signed time (`on|off`) |
 | `SAMBA_MAINTENANCE_OP` | maintenance | `check` | `check` (dbcheck) or `repair` (dbcheck --fix --yes) |
@@ -229,6 +249,36 @@ image's `2016` default fails without the mirror. Levels at or below the
 default get no `--option` at all: the parameter does not accept `2000`,
 `2003` or `2008` as values, and setting it there would turn a working
 provision into a configuration error.
+
+**A join gets the same settings, through the generated `smb.conf`.**
+`samba-tool domain join` renders its own configuration file from a template
+and has no `--option` passthrough, so the entrypoint edits that file once,
+atomically, immediately after the join and before any daemon starts. Three
+settings are forced in — `dns update command`, `ad dc functional level` (on
+the same levels provision mirrors) and `dns forwarder` (whenever
+`SAMBA_DNS_FORWARDER` is set) — each announced on its own log line with the
+reason. Every edit is idempotent and scoped to `[global]`, and a `[global]`
+entry carrying a *different* value is replaced rather than trusted: a
+functional level below the domain's stops samba from starting at all, and a
+forwarder pointing at an upstream that never answers is worse than none.
+Without this, `SAMBA_DNS_FORWARDER` and `SAMBA_FUNCTION_LEVEL` would be
+silently ignored on exactly the DC an operator cannot fix them on
+afterwards.
+
+**`SAMBA_DNS_FORWARDER` is not a nicety on a multi-DC domain.** Samba's
+internal DNS with no upstream takes *seconds* to fail a query it is not
+authoritative for (measured at 4-8 s against this image) instead of
+answering immediately. A DC that resolves through itself — which a multi-DC
+domain requires, because a replication partner is addressed by a `_msdcs`
+CNAME only the directory's own DNS can answer — then pays that stall on
+every Kerberos bind, and the sealed DRSUAPI bind that carries replication
+times out before it completes. Set it to a resolver that is **not** this
+DC, or the domain replicates erratically or not at all.
+
+**`KRB5_CONFIG` is set in the image** to
+`/var/lib/samba/private/krb5.conf`, the Kerberos configuration both
+provision and join generate for the realm. See the Runtime contract's
+**In-container Kerberos** below.
 
 ### Argv
 
@@ -347,6 +397,29 @@ never disciplines the host's clock (B.3), `-d` so it logs to the
 container's stderr. The configuration is baked into the image (read-only
 rootfs) and wires `ntpsigndsocket /var/lib/samba/ntp_signd` for MS-SNTP
 signing; 123/udp is exposed. `SAMBA_CHRONY=off` runs the DC without it.
+
+### In-container Kerberos
+
+The image ships **no `/etc/krb5.conf`** and sets
+`KRB5_CONFIG=/var/lib/samba/private/krb5.conf` instead — the file both
+`samba-tool domain provision` and `samba-tool domain join` generate for the
+realm and print the location of.
+
+This matters for anything Kerberos run *inside* the container, including an
+operator's own `docker exec ... samba-tool drs showrepl`. Without it the
+bundled Heimdal discovers the realm through DNS, walking `_kerberos.` up
+the parent domains of the host name — names the directory is not
+authoritative for. On a DC that resolves through its own internal DNS those
+queries take seconds each (see `SAMBA_DNS_FORWARDER` above), several per
+bind, and the Kerberos-sealed DRSUAPI bind that carries replication times
+out before they finish. The generated file sets `dns_lookup_realm = false`
+and removes the walk.
+
+It is an image `ENV`, not something the entrypoint exports, because
+`docker exec` inherits the image environment and **not** the environment of
+PID 1 — that is the only form which also reaches commands an operator runs
+in the container. Pointing at the file before the first provision created
+it is harmless: Kerberos falls back to its built-in defaults.
 
 ## Profile changelog
 

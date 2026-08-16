@@ -42,6 +42,12 @@ const (
 // has to set it, and joinedConfSettings for why a join has to as well.
 const dcFunctionalLevelKey = "ad dc functional level"
 
+// dnsForwarderKey is the smb.conf parameter naming the upstream this DC's
+// internal DNS sends the names it does not serve to. See joinedConfSettings
+// for why a DC without one is not merely less useful but slow enough to
+// break Kerberos.
+const dnsForwarderKey = "dns forwarder"
+
 // Default paths and programs.
 const (
 	defaultSMBConf    = "/etc/samba/smb.conf"
@@ -329,10 +335,11 @@ func (e *Executor) now() string { return e.Now().UTC().Format(time.RFC3339) }
 type smbConfSetting struct{ key, value, why string }
 
 // joinedConfSettings lists what the smb.conf written by `samba-tool domain
-// join` is missing. provision passes both of these with --option;
+// join` is missing. provision passes every one of these with --option;
 // samba-tool domain join has no equivalent passthrough — it renders its own
 // configuration file from a template — so the generated file is edited once,
-// right after the join.
+// right after the join. Without this, three variables an operator sets would
+// silently do nothing on a joined DC.
 //
 // The functional level is not cosmetic: samba's dsdb_check_and_update_fl
 // REFUSES to start a DC whose smb.conf level is below the domain's ("Refusing
@@ -342,6 +349,16 @@ type smbConfSetting struct{ key, value, why string }
 // level of 2016 joins successfully and then cannot boot — which is exactly
 // what an E2E two-DC run observed. Mirroring SAMBA_FUNCTION_LEVEL here is the
 // join-side half of what provisionArgs already does.
+//
+// Nor is the DNS forwarder: samba's internal DNS with no upstream takes
+// SECONDS to fail a query it is not authoritative for, rather than answering
+// immediately (measured at 4-8 s against this image). A domain controller
+// that resolves through itself — which a multi-DC domain requires, because a
+// replication partner is addressed by a `_msdcs` CNAME only the directory's
+// own DNS can answer — then pays that stall on every Kerberos bind, and the
+// sealed DRSUAPI bind that carries replication times out before it finishes.
+// SAMBA_DNS_FORWARDER is therefore load-bearing for a joined DC, and it is
+// exactly the DC an operator would have had no way to set it on.
 func joinedConfSettings(cfg *config.Config) []smbConfSetting {
 	settings := []smbConfSetting{{
 		key:   dnsUpdateKey,
@@ -353,6 +370,13 @@ func joinedConfSettings(cfg *config.Config) []smbConfSetting {
 			key:   dcFunctionalLevelKey,
 			value: v,
 			why:   "samba refuses to start a domain controller whose own functional level is below the domain's",
+		})
+	}
+	if f := strings.TrimSpace(cfg.DNSForwarder); f != "" {
+		settings = append(settings, smbConfSetting{
+			key:   dnsForwarderKey,
+			value: f,
+			why:   "without an upstream, this DC's DNS stalls for seconds on every name it does not serve, which times out Kerberos and replication",
 		})
 	}
 	return settings
@@ -648,7 +672,7 @@ func provisionArgs(cfg *config.Config, secret string) []string {
 		args = append(args, "--option="+dcFunctionalLevelKey+" = "+v)
 	}
 	if cfg.DNSForwarder != "" {
-		args = append(args, "--option=dns forwarder="+cfg.DNSForwarder)
+		args = append(args, "--option="+dnsForwarderKey+"="+cfg.DNSForwarder)
 	}
 	args = append(args, "--option="+dnsUpdateCommand)
 	return append(args, "--adminpass="+secret)
