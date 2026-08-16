@@ -350,16 +350,35 @@ git commit -m "feat: runtime stage with derived package closure, OCI labels, pac
 - Modify: `.github/workflows/ci.yml` (append `build` job; harden `lint`)
 - Create: `scripts/check-pins-consistency.sh`
 
-Carried review debt from Phase 0 (fold in while touching ci.yml):
-- Pin the hadolint image by digest in the lint step (resolve with
-  `docker buildx imagetools inspect ghcr.io/hadolint/hadolint:v2.14.0`
-  or current release tag; use `tag@sha256:...` with the tag in a
-  comment) — and use the SAME pinned reference in every local hadolint
-  command in this plan.
-- Pin yamllint: `pipx run yamllint==<current version> --strict .`
-  (resolve current with `pipx run yamllint --version` locally).
+Carried review debt from Phase 0 (fold in while touching ci.yml —
+these are ENTRY CONDITIONS from the Phase 0 final review):
+- **Fail-on-empty lint gate:** from this phase on a Dockerfile exists,
+  so the lint job MUST fail when it finds nothing to lint. Replace the
+  hadolint step's `if [ -f Dockerfile ]` guard with discovery+assert:
+  `mapfile -t dfs < <(git ls-files '*Dockerfile*')`, exit 1 with an
+  explanatory message if empty, lint every entry. Widen the shellcheck
+  selector to `git ls-files '*.sh' 'scripts/*' 'test/**/*.sh'` and
+  fail if it matches nothing (scripts/ exists from this phase).
+- Pin the hadolint image by digest (current release v2.15.1; resolve
+  digest with `docker buildx imagetools inspect
+  ghcr.io/hadolint/hadolint:v2.15.1`; use `tag@sha256:...` with the tag
+  in a comment) — same pinned reference in every local hadolint command
+  in this plan.
+- Pin yamllint: `pipx run yamllint==1.38.0 --strict .`.
+- Pin shellcheck by assertion: a step line
+  `shellcheck --version | grep -q '^version: 0.10'` (adjust to the
+  runner's actual major.minor once observed) so silent runner-image
+  drift is loud.
+- Add `actionlint` to the lint job (Actions schema validation, which
+  yamllint cannot do): run the official
+  `docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:<current
+  tag>@sha256:<digest>` (resolve and pin like hadolint).
 - Add `timeout-minutes: 10` to the `lint` job and `timeout-minutes: 90`
   to the `build` job.
+- Add workflow-level
+  `concurrency: {group: "ci-${{ github.ref }}", cancel-in-progress: true}`.
+- Create `.github/dependabot.yml` with a `github-actions` ecosystem
+  entry (weekly) so SHA pins are maintained by bot PRs (§4.1 spirit).
 
 **Interfaces:**
 - Consumes: workflow `CI` / job `lint` from Phase 0.
