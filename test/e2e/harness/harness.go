@@ -236,6 +236,13 @@ func firstLine(s string) string {
 // there the members live outside the docker host.
 func Network(t *testing.T) string {
 	t.Helper()
+	return newNetwork(t, t.Cleanup)
+}
+
+// newNetwork is Network with the teardown registration left to the caller,
+// so that SharedNetwork can hand it AtExit instead of t.Cleanup.
+func newNetwork(t *testing.T, registerCleanup func(func())) string {
+	t.Helper()
 	name := uniq("e2e-net")
 	// Pick a /24 out of a private range that docker's default pool does
 	// not hand out, retrying on the (rare) collision with a leftover.
@@ -248,7 +255,7 @@ func Network(t *testing.T) string {
 			"--driver", "bridge", "--subnet", subnet, name)
 		cancel()
 		if err == nil && code == 0 {
-			t.Cleanup(func() { quietDocker("network", "rm", name) })
+			registerCleanup(func() { quietDocker("network", "rm", name) })
 			return name
 		}
 		last = out
@@ -304,6 +311,7 @@ type spec struct {
 	tmpfs      []string
 	dns        []string
 	ip         string
+	shared     bool
 	runArgs    []string
 	entrypoint string
 	cmd        []string
@@ -454,15 +462,24 @@ func startDC(t *testing.T, net, name, mode string, env map[string]string, opts .
 	}
 	stateVol, confVol, ownVolumes := s.stateVol, s.confVol, s.ownVolumes
 
-	t.Cleanup(func() {
-		if t.Failed() {
-			t.Logf("--- docker logs %s ---\n%s", name, Logs(t, name))
-		}
+	teardown := func() {
 		quietDocker("rm", "-f", name)
 		if ownVolumes {
 			quietDocker("volume", "rm", "-f", stateVol, confVol)
 		}
-	})
+	}
+	if s.shared {
+		// A package-lifetime container outlives the test that started it,
+		// so its teardown cannot log through that test's t (see Shared).
+		AtExit(teardown)
+	} else {
+		t.Cleanup(func() {
+			if t.Failed() {
+				t.Logf("--- docker logs %s ---\n%s", name, Logs(t, name))
+			}
+			teardown()
+		})
+	}
 
 	args := []string{"run", "-d", "--name", name, "--network", net, "--hostname", s.hostname}
 	for _, a := range append([]string{FQDN(name)}, s.aliases...) {

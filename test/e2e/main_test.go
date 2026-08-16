@@ -16,10 +16,17 @@ import (
 // create itself are present: a working docker CLI and the image under
 // test. Failing here, once, beats every test failing with an obscure
 // docker error.
+//
+// It creates no fixture: the shared provisioned DC is built lazily by
+// provisionedDC(), so a run that selects only tests which do not need it
+// never pays for it. TestMain only tears down what such a package-lifetime
+// fixture left behind, at the one moment no test can still be using it.
 func TestMain(m *testing.M) {
 	if err := harness.Preflight(); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e preflight failed: %v\n", err)
 		os.Exit(1)
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	harness.Cleanup()
+	os.Exit(code)
 }
