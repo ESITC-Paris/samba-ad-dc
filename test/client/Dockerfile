@@ -27,6 +27,11 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 #                     time service actually answers.
 #   ca-certificates   the trust store LDAPS verification starts from.
 #
+# DL3008 (pin apt versions) is ignored deliberately: the FROM digest above
+# pins the package index these names resolve against, which is the same
+# reproducibility interpretation the shipped image documents (B.8). Pinning
+# versions here would only mean editing this file by hand every time Debian
+# moves a client package, for a throwaway test image.
 # hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \

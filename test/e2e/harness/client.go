@@ -68,6 +68,19 @@ func ClientImage(t *testing.T) string {
 
 // Client runs cmd in a one-off test-client container attached to net and
 // returns its combined output, failing the test if it exits non-zero.
+//
+// Secrets go in through env and are read from stdin inside the container,
+// never through argv:
+//
+//	harness.Client(t, net, map[string]string{"E2E_PW": harness.AdminPassword},
+//	    "sh", "-c", `printf %s "$E2E_PW" | kinit --password-file=STDIN `+
+//	        "Administrator@"+harness.Realm)
+//
+// A password in the command line would land in the container's process
+// listing, in `docker inspect`, and — because this function echoes the
+// command it ran into every failure message — in the test output of any
+// failing run. Heimdal's kinit accepts `--password-file=STDIN` precisely
+// so it never has to appear there.
 func Client(t *testing.T, net string, env map[string]string, cmd ...string) string {
 	t.Helper()
 	code, out := ClientErr(t, net, env, cmd...)
@@ -78,12 +91,20 @@ func Client(t *testing.T, net string, env map[string]string, cmd ...string) stri
 }
 
 // ClientErr is Client without the assertion: it returns the exit code and
-// the combined output, for tests that assert on a failing client.
+// the combined output, for tests that assert on a failing client. The
+// secret-handling contract in Client's documentation applies here too.
 func ClientErr(t *testing.T, net string, env map[string]string, cmd ...string) (int, string) {
 	t.Helper()
 	img := ClientImage(t)
 
-	args := []string{"run", "--rm", "--network", net}
+	// `--rm` covers the normal path, but not the one that matters: if this
+	// invocation hits ClientTimeout, the CLI is killed while the container
+	// keeps running. Without a name of our own it would then be anonymous
+	// and unfindable, so it gets one — and a cleanup that removes it.
+	name := UniqueName("e2e-client")
+	t.Cleanup(func() { removeOwned("container", name) })
+
+	args := []string{"run", "--rm", "--name", name, "--label", ownerLabelArg, "--network", net}
 	for _, srv := range splitList(env[ClientDNSEnv]) {
 		args = append(args, "--dns", srv)
 	}

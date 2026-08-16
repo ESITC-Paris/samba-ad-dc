@@ -48,6 +48,24 @@ const (
 // DefaultImage is the image under test unless E2E_IMAGE overrides it.
 const DefaultImage = "samba-ad-dc:dev"
 
+// OwnerLabel marks every container, volume and network this package
+// creates, and OwnerLabelValue is the value it carries.
+//
+// It exists so the harness can never destroy something it did not create.
+// The suite works with fixed, meaningful container names (`dc1`,
+// `nominal-dc1`), and a leftover from an interrupted run has to be
+// force-removed before the name can be reused — but `dc1` is also a name
+// a developer might have given their own container on the same machine.
+// Every removal path therefore inspects this label first and refuses to
+// touch anything that does not carry it.
+const (
+	OwnerLabel      = "e2e.harness"
+	OwnerLabelValue = "1"
+)
+
+// ownerLabelArg is the `--label` argument every create path passes.
+const ownerLabelArg = OwnerLabel + "=" + OwnerLabelValue
+
 // Timeouts. Generous on purpose: a first-boot provision on a cold volume
 // legitimately takes minutes, and CI runners are slower than a laptop.
 const (
@@ -55,6 +73,19 @@ const (
 	// image's healthcheck has a 180 s start period, so anything shorter
 	// than that would only ever measure the start period.
 	HealthTimeout = 5 * time.Minute
+	// HealthTransitionTimeout is the budget for a container that should
+	// become healthy on an already-initialized volume — a restart, an
+	// upgrade, a restored backup — where no provision has to happen first.
+	//
+	// It MUST stay above the image's healthcheck `--start-period` (180 s)
+	// and is 4 minutes for that reason. Docker never reports `unhealthy`
+	// while a container is inside its start period: it keeps saying
+	// `starting`. A budget at or below 180 s can therefore never observe
+	// a health verdict at all — it can only ever expire mid-start-period
+	// and report "did not become healthy in time", which measures the
+	// start period rather than the container. Shorten this and the tests
+	// that use it stop testing anything.
+	HealthTransitionTimeout = 4 * time.Minute
 	// ExitTimeout is how long RunDCExpectExit waits for a container that
 	// is expected to terminate on its own.
 	ExitTimeout = 5 * time.Minute
@@ -147,9 +178,17 @@ func Preflight() error {
 	if out, code, err := dockerCmd(ctx, "version", "--format", "{{.Server.Version}}"); err != nil || code != 0 {
 		return fmt.Errorf("the docker daemon is not reachable: %s", firstLine(out))
 	}
-	if _, code, err := dockerCmd(ctx, "image", "inspect", Image()); err != nil || code != 0 {
+	img := Image()
+	if _, code, err := dockerCmd(ctx, "image", "inspect", img); err != nil || code != 0 {
+		// The remedy has to name the image actually looked for, or an
+		// E2E_IMAGE run sends the reader off building the wrong thing.
+		if img != DefaultImage {
+			return fmt.Errorf("image %s not found (E2E_IMAGE points at it); "+
+				"build or pull that image, or unset E2E_IMAGE to test the default %s",
+				img, DefaultImage)
+		}
 		return fmt.Errorf("image %s not found; build the image first: docker build -t %s .",
-			Image(), DefaultImage)
+			img, DefaultImage)
 	}
 	return nil
 }
@@ -208,8 +247,17 @@ func quietDocker(args ...string) {
 
 var nameSeq atomic.Uint64
 
-// uniq builds a name that cannot collide with a parallel or previous run.
-func uniq(prefix string) string {
+// UniqueName builds a docker object name that cannot collide with another
+// run, another test binary, or a leftover: prefix, this process's pid, and
+// a counter.
+//
+// Use it for anything whose name does not have to be predictable. Names
+// that a test *asserts* on — a DC's name is also its DNS name on the test
+// network, so `dc1` becomes `dc1.ad.e2e.test` — are the exception, and
+// those must be unique per test *by construction*: `docker run --name` is
+// one flat namespace, so two tests sharing a fixed name would fight over
+// the same container (see the `fixtureName` note in nominal_test.go).
+func UniqueName(prefix string) string {
 	return fmt.Sprintf("%s-%d-%d", prefix, os.Getpid(), nameSeq.Add(1))
 }
 
@@ -219,6 +267,70 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+func lastLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[i+1:])
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------
+// ownership: the harness only ever destroys what it created
+// ---------------------------------------------------------------------
+
+// ownership reports whether a docker object of that kind and name exists,
+// and whether it carries this harness's ownership label. kind is one of
+// "container", "volume", "network".
+func ownership(kind, name string) (exists, owned bool) {
+	if name == "" {
+		return false, false
+	}
+	// Where the label lives differs per object: a container keeps it under
+	// .Config, a volume and a network at the top level.
+	format := `{{index .Labels "` + OwnerLabel + `"}}`
+	if kind == "container" {
+		format = `{{index .Config.Labels "` + OwnerLabel + `"}}`
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+	out, code, err := dockerCmd(ctx, kind, "inspect", "-f", format, name)
+	if err != nil || code != 0 {
+		return false, false // no such object
+	}
+	return true, strings.TrimSpace(out) == OwnerLabelValue
+}
+
+// requireOwnedOrAbsent fails the test when an object of that name already
+// exists and was not created by this harness. It is the guard in front of
+// every force-removal by a fixed name.
+func requireOwnedOrAbsent(t *testing.T, kind, name string) {
+	t.Helper()
+	if exists, owned := ownership(kind, name); exists && !owned {
+		t.Fatalf("%s %q exists and is not harness-owned (it carries no %s=%s label); "+
+			"the suite refuses to destroy it — remove or rename it yourself, "+
+			"or run the suite where that name is free",
+			kind, name, OwnerLabel, OwnerLabelValue)
+	}
+}
+
+// removeOwned force-removes a docker object, but only if this harness
+// created it. Best-effort and silent: it runs on teardown paths, including
+// package-lifetime ones that have no *testing.T to report to.
+func removeOwned(kind, name string) {
+	if exists, owned := ownership(kind, name); !exists || !owned {
+		return
+	}
+	switch kind {
+	case "container":
+		quietDocker("rm", "-f", name)
+	case "volume":
+		quietDocker("volume", "rm", "-f", name)
+	case "network":
+		quietDocker("network", "rm", name)
+	}
 }
 
 // ---------------------------------------------------------------------
@@ -243,19 +355,23 @@ func Network(t *testing.T) string {
 // so that SharedNetwork can hand it AtExit instead of t.Cleanup.
 func newNetwork(t *testing.T, registerCleanup func(func())) string {
 	t.Helper()
-	name := uniq("e2e-net")
-	// Pick a /24 out of a private range that docker's default pool does
-	// not hand out, retrying on the (rare) collision with a leftover.
+	name := UniqueName("e2e-net")
+	// Pick a /24 from 10.199.0.0/16, which is outside docker's default
+	// address pools (172.17.0.0/12 and 192.168.0.0/16): asking for a
+	// subnet the daemon also hands out automatically would make this
+	// collide with whatever unrelated compose project is running. Start at
+	// a random offset and walk, so two suites on one machine do not fight
+	// over the same first candidate.
 	start := rand.Intn(200) //nolint:gosec // test fixture, not cryptography
 	var last string
 	for i := 0; i < 32; i++ {
-		subnet := fmt.Sprintf("172.28.%d.0/24", (start+i)%200)
+		subnet := fmt.Sprintf("10.199.%d.0/24", (start+i)%200)
 		ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
 		out, code, err := dockerCmd(ctx, "network", "create",
-			"--driver", "bridge", "--subnet", subnet, name)
+			"--driver", "bridge", "--label", ownerLabelArg, "--subnet", subnet, name)
 		cancel()
 		if err == nil && code == 0 {
-			registerCleanup(func() { quietDocker("network", "rm", name) })
+			registerCleanup(func() { removeOwned("network", name) })
 			return name
 		}
 		last = out
@@ -423,11 +539,21 @@ func RunDCExpectExit(t *testing.T, net, name, mode string, env map[string]string
 
 	ctx, cancel := context.WithTimeout(context.Background(), ExitTimeout)
 	defer cancel()
-	if out, code, err := dockerCmd(ctx, "wait", dc.Name); err != nil || code != 0 {
+	out, code, err := dockerCmd(ctx, "wait", dc.Name)
+	logs := Logs(t, dc.Name)
+	if err != nil || code != 0 {
 		t.Fatalf("container %s did not exit within %s (%v): %s\n--- logs ---\n%s",
-			dc.Name, ExitTimeout, err, strings.TrimSpace(out), Logs(t, dc.Name))
+			dc.Name, ExitTimeout, err, strings.TrimSpace(out), logs)
 	}
-	return exitCode(t, dc.Name), Logs(t, dc.Name)
+	// `docker wait` prints the exit status it waited for, so there is no
+	// need to ask again with an inspect — and no window in which something
+	// could remove the container between the two calls.
+	exit, convErr := strconv.Atoi(lastLine(out))
+	if convErr != nil {
+		t.Fatalf("docker wait %s printed %q instead of an exit code\n--- logs ---\n%s",
+			dc.Name, strings.TrimSpace(out), logs)
+	}
+	return exit, logs
 }
 
 func startDC(t *testing.T, net, name, mode string, env map[string]string, opts ...Opt) (*DC, *spec) {
@@ -451,23 +577,28 @@ func startDC(t *testing.T, net, name, mode string, env map[string]string, opts .
 	}
 
 	// A leftover container of the same name from an interrupted run must
-	// not turn every later run red.
-	quietDocker("rm", "-f", name)
+	// not turn every later run red — but only a leftover of *ours* may be
+	// destroyed; a developer's own `dc1` is left strictly alone.
+	requireOwnedOrAbsent(t, "container", name)
+	removeOwned("container", name)
 
 	if s.ownVolumes {
-		s.stateVol = uniq(name + "-state")
-		s.confVol = uniq(name + "-conf")
-		mustDocker(t, "volume", "create", s.stateVol)
-		mustDocker(t, "volume", "create", s.confVol)
+		s.stateVol = UniqueName(name + "-state")
+		s.confVol = UniqueName(name + "-conf")
 	}
 	stateVol, confVol, ownVolumes := s.stateVol, s.confVol, s.ownVolumes
 
 	teardown := func() {
-		quietDocker("rm", "-f", name)
+		removeOwned("container", name)
 		if ownVolumes {
-			quietDocker("volume", "rm", "-f", stateVol, confVol)
+			removeOwned("volume", stateVol)
+			removeOwned("volume", confVol)
 		}
 	}
+	// Registered BEFORE the volumes exist: if the second `volume create`
+	// fails, the first one is already covered by this teardown instead of
+	// being orphaned. removeOwned is a no-op for a volume that was never
+	// created.
 	if s.shared {
 		// A package-lifetime container outlives the test that started it,
 		// so its teardown cannot log through that test's t (see Shared).
@@ -481,7 +612,13 @@ func startDC(t *testing.T, net, name, mode string, env map[string]string, opts .
 		})
 	}
 
-	args := []string{"run", "-d", "--name", name, "--network", net, "--hostname", s.hostname}
+	if ownVolumes {
+		mustDocker(t, "volume", "create", "--label", ownerLabelArg, stateVol)
+		mustDocker(t, "volume", "create", "--label", ownerLabelArg, confVol)
+	}
+
+	args := []string{"run", "-d", "--name", name, "--label", ownerLabelArg,
+		"--network", net, "--hostname", s.hostname}
 	for _, a := range append([]string{FQDN(name)}, s.aliases...) {
 		args = append(args, "--network-alias", a)
 	}
@@ -570,13 +707,25 @@ func WaitHealthy(t *testing.T, name string, within time.Duration) {
 		state, health, _ := strings.Cut(strings.TrimSpace(out), "|")
 
 		switch {
+		// Death first: a container that exited has no healthcheck status
+		// worth reporting, and diagnosing it as "no healthcheck" would send
+		// the reader after the image instead of after the logs.
+		case state != "running" && state != "created" && state != "restarting":
+			t.Fatalf("container %s is %s (exit %d) instead of becoming healthy\n--- logs ---\n%s",
+				name, state, exitCode(t, name), Logs(t, name))
 		case health == "healthy":
 			return
 		case health == "none":
 			t.Fatalf("container %s has no healthcheck; the image under test must define one", name)
-		case state != "running" && state != "created" && state != "restarting":
-			t.Fatalf("container %s is %s (exit %d) instead of becoming healthy\n--- logs ---\n%s",
-				name, state, exitCode(t, name), Logs(t, name))
+		// Docker only ever says `unhealthy` once the start period is over
+		// and the probe has failed `retries` times in a row — inside the
+		// start period it keeps saying `starting`. So this is already a
+		// settled verdict, and waiting out the remaining deadline would
+		// only delay the same failure.
+		case health == "unhealthy":
+			t.Fatalf("container %s went unhealthy (docker's verdict after the start period; "+
+				"waiting longer would not change it)\n--- health probe ---\n%s\n--- logs ---\n%s",
+				name, healthLog(name), Logs(t, name))
 		case time.Now().After(deadline):
 			t.Fatalf("container %s did not become healthy within %s (last health: %s)\n"+
 				"--- health probe ---\n%s\n--- logs ---\n%s",
