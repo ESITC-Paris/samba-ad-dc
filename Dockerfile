@@ -97,3 +97,74 @@ RUN set -eux; \
     fi; \
     LD_LIBRARY_PATH="/dest/usr/lib/$(gcc -dumpmachine):/dest/usr/lib/$(gcc -dumpmachine)/samba" \
       /dest/usr/sbin/samba --version
+
+# The base image ships /var/run and /var/lock as symlinks into /run, while
+# DESTDIR staged them as real (and empty) directories; pouring that tree
+# onto / fails with "cannot copy to non-directory". Fold them into their
+# real location here, so the runtime stage's COPY stays a single,
+# relocation-free /dest/ -> / (nothing but empty directories moves).
+RUN set -eux; \
+    mkdir -p /dest/run/samba /dest/run/lock; \
+    mv /dest/var/lock/samba /dest/run/lock/samba; \
+    rmdir /dest/var/lock /dest/var/run/samba /dest/var/run
+
+# ---------------------------------------------------------------------------
+# runtime — the shipped image: base + derived package closure + /dest
+# ---------------------------------------------------------------------------
+FROM ${RUNTIME_BASE} AS runtime
+
+ARG SAMBA_VERSION=4.24.6
+# Replaced by the watcher (SPEC §9bis.1.c) with the hash of the versioned
+# runtime-package list; "bootstrap" matches versions.yaml until Phase 6.
+ARG PKG_INDEX_HASH=bootstrap
+ARG VCS_REF=dev
+ARG CREATED=1970-01-01T00:00:00Z
+ARG BASE_NAME=debian:trixie-slim
+ARG BASE_DIGEST=sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+
+# The manifest is shipped inside the image so that what an operator can
+# read is exactly what was installed (SPEC §5.1).
+COPY runtime-packages.txt /usr/share/samba-ad-dc/runtime-packages.txt
+
+# PKG_INDEX_HASH is echoed on this RUN and nowhere else: it busts exactly
+# this layer when the watcher detects a runtime-package delta (SPEC §9.3),
+# "nothing more, nothing less".
+# Package versions are not pinned here for the same reason as in the
+# builder: the pin is the base image digest plus PKG_INDEX_HASH.
+# hadolint ignore=DL3008,SC2046
+RUN echo "pkg-index=${PKG_INDEX_HASH}" \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       $(sed 's/#.*//' /usr/share/samba-ad-dc/runtime-packages.txt) \
+    && rm -rf /var/lib/apt/lists/*
+
+# No relocation: the build was configured --prefix=/usr and the binaries
+# carry RPATHs into /usr/lib/<triplet>/samba, so the DESTDIR tree is
+# poured onto / exactly as it was staged.
+COPY --from=builder /dest/ /
+
+# Smoke: both the C binaries and the python tooling must run with nothing
+# but this image's own packages — no LD_LIBRARY_PATH, no PYTHONPATH.
+RUN samba --version \
+    && samba-tool --version \
+    && samba-tool --help > /dev/null
+
+LABEL org.opencontainers.image.source="https://github.com/esitc-paris/samba-ad-dc" \
+      org.opencontainers.image.version="${SAMBA_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.description="Samba Active Directory Domain Controller, built from verified upstream source with bundled Heimdal. Independent community build - not affiliated with the Samba Team." \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.base.name="${BASE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}" \
+      org.esitc-paris.spec-version="1.2"
+
+VOLUME ["/var/lib/samba", "/etc/samba"]
+
+# DNS(53), Kerberos(88), EPM(135), NetBIOS(137-139), LDAP(389),
+# SMB(445), kpasswd(464), LDAPS(636), Global Catalog(3268/3269).
+EXPOSE 53 53/udp 88 88/udp 135 137/udp 138/udp 139 389 389/udp 445 464 464/udp 636 3268 3269
+
+# The Go entrypoint arrives in Phase 2; until then the image only proves
+# it can run what it ships.
+CMD ["samba", "--version"]

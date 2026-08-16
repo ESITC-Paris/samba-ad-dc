@@ -1,0 +1,101 @@
+#!/bin/sh
+# Prove SPEC §5.1 for a built image: every Debian package installed in it
+# is accounted for.
+#
+#   sh scripts/check-image-packages.sh <image> [runtime-base] [manifest]
+#
+# An image's package set must be exactly
+#
+#   packages(base image)  ∪  apt closure of runtime-packages.txt
+#
+# The check computes the first two sets by asking dpkg inside the image
+# and inside the bare base, and the third by asking apt itself, inside the
+# bare base, what installing the manifest would pull in
+# (`apt-get install --dry-run`, whose `Inst` lines are the real resolution
+# including virtual packages and alternatives — a recursive
+# `apt-cache depends` walk both over- and under-approximates that).
+#
+# Anything in the image that none of those sets explains is reported and
+# the script exits 1.
+set -eu
+
+IMAGE=${1:-}
+if [ -z "$IMAGE" ]; then
+    echo "usage: $0 <image> [runtime-base-ref] [manifest]" >&2
+    exit 2
+fi
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+MANIFEST=${3:-$here/runtime-packages.txt}
+[ -f "$MANIFEST" ] || { echo "no manifest: $MANIFEST" >&2; exit 2; }
+
+# The base must be the exact digest-pinned ref the runtime stage uses;
+# take it from the Dockerfile so the two can never drift.
+BASE=${2:-}
+if [ -z "$BASE" ]; then
+    BASE=$(sed -n 's/^ARG RUNTIME_BASE=\(.*\)$/\1/p' "$here/Dockerfile" | head -1)
+fi
+[ -n "$BASE" ] || { echo "cannot determine RUNTIME_BASE" >&2; exit 2; }
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# `--entrypoint` so the check keeps working once Phase 2 installs one.
+pkgs_of() {
+    docker run --rm --entrypoint dpkg-query "$1" \
+        -W -f '${Package} ${db:Status-Status}\n' \
+        | awk '$2 == "installed" { print $1 }' | sort -u
+}
+
+echo "==> package set of image: $IMAGE"
+pkgs_of "$IMAGE" > "$work/image"
+echo "==> package set of base:  $BASE"
+pkgs_of "$BASE" > "$work/base"
+
+# Requested packages, comments stripped.
+sed 's/#.*//' "$MANIFEST" | tr -s '[:space:]' '\n' | grep -v '^$' | sort -u \
+    > "$work/requested"
+
+echo "==> apt closure of $(wc -l < "$work/requested" | tr -d ' ') requested packages"
+# shellcheck disable=SC2046  # word splitting of the package list is wanted
+docker run --rm -i --entrypoint sh "$BASE" -c '
+    set -eu
+    apt-get update -qq >/dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        --dry-run $(cat) 2>&1
+' < "$work/requested" > "$work/dryrun" || {
+    echo "FAIL: apt could not resolve the manifest against the base image:" >&2
+    tail -20 "$work/dryrun" >&2
+    exit 1
+}
+awk '/^Inst /{ print $2 }' "$work/dryrun" | sort -u > "$work/closure"
+
+# Everything the image has that the base did not.
+comm -23 "$work/image" "$work/base" > "$work/added"
+# ... minus what the manifest and its closure explain.
+sort -u "$work/closure" "$work/requested" > "$work/explained"
+comm -23 "$work/added" "$work/explained" > "$work/unexplained"
+
+added=$(wc -l < "$work/added" | tr -d ' ')
+echo "==> $added package(s) added on top of the base image"
+
+if [ -s "$work/unexplained" ]; then
+    echo
+    echo "FAIL: packages installed in $IMAGE that neither the base image nor"
+    echo "      $MANIFEST (or its apt closure) explains — SPEC §5.1:"
+    sed 's/^/        /' "$work/unexplained"
+    exit 1
+fi
+
+# A requested package that never made it into the image means the manifest
+# lies about the image; that is equally a §5.1 failure.
+comm -23 "$work/requested" "$work/image" > "$work/missing"
+if [ -s "$work/missing" ]; then
+    echo
+    echo "FAIL: packages listed in $MANIFEST but absent from $IMAGE:"
+    sed 's/^/        /' "$work/missing"
+    exit 1
+fi
+
+echo "OK: every package in $IMAGE is either in the base image or in the"
+echo "    apt closure of $MANIFEST, and every listed package is present."
