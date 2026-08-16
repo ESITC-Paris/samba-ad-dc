@@ -8,6 +8,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -45,8 +46,10 @@ type Refusal struct {
 // Error implements the error interface.
 func (r *Refusal) Error() string { return r.Msg }
 
-// refuse builds a *Refusal from a format string.
-func refuse(code int, format string, args ...any) *Refusal {
+// Refuse builds a *Refusal from a format string. It is the single
+// constructor every package uses, so refusals are always built the same way
+// and callers never assemble a Refusal literal by hand.
+func Refuse(code int, format string, args ...any) *Refusal {
 	return &Refusal{Code: code, Msg: fmt.Sprintf(format, args...)}
 }
 
@@ -107,7 +110,7 @@ func Load(getenv func(string) string) (*Config, error) {
 		{"SAMBA_JOIN_PASSWORD", "SAMBA_JOIN_PASSWORD_FILE"},
 	} {
 		if get(plain.env) != "" {
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"%s is set in the environment and passwords are never accepted that way; unset %s and pass the password via %s pointing at a mounted secret file",
 				plain.env, plain.env, plain.file)
 		}
@@ -131,7 +134,7 @@ func Load(getenv func(string) string) (*Config, error) {
 	if v := get("SAMBA_MODE"); v != "" {
 		mode := Mode(strings.ToLower(v))
 		if !isValidMode(mode) {
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"SAMBA_MODE=%q is not a supported mode; set SAMBA_MODE to one of %s",
 				v, modeList())
 		}
@@ -147,7 +150,7 @@ func Load(getenv func(string) string) (*Config, error) {
 
 	if v := get("SAMBA_DNS_BACKEND"); v != "" {
 		if !strings.EqualFold(v, DNSBackendInternal) {
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"SAMBA_DNS_BACKEND=%q is not supported by this image; set SAMBA_DNS_BACKEND=%s or leave it unset",
 				v, DNSBackendInternal)
 		}
@@ -157,12 +160,12 @@ func Load(getenv func(string) string) (*Config, error) {
 	if v := get("SAMBA_LOG_LEVEL"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"SAMBA_LOG_LEVEL=%q is not an integer; set SAMBA_LOG_LEVEL to a samba debug level such as 0, 1 or 3",
 				v)
 		}
 		if n < 0 {
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"SAMBA_LOG_LEVEL=%q is negative; set SAMBA_LOG_LEVEL to a samba debug level such as 0, 1 or 3",
 				v)
 		}
@@ -176,7 +179,7 @@ func Load(getenv func(string) string) (*Config, error) {
 		case "off":
 			cfg.Chrony = false
 		default:
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"SAMBA_CHRONY=%q is not a valid toggle; set SAMBA_CHRONY to on or off",
 				v)
 		}
@@ -185,7 +188,7 @@ func Load(getenv func(string) string) (*Config, error) {
 	if v := get("SAMBA_MAINTENANCE_OP"); v != "" {
 		op := strings.ToLower(v)
 		if op != MaintenanceCheck && op != MaintenanceRepair {
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"SAMBA_MAINTENANCE_OP=%q is not a valid operation; set SAMBA_MAINTENANCE_OP to check or repair",
 				v)
 		}
@@ -197,22 +200,22 @@ func Load(getenv func(string) string) (*Config, error) {
 	// been observed, so it is validated in the modes engine, not here.
 	if cfg.Mode == ModeProvision || cfg.Mode == ModeJoin {
 		if cfg.Realm == "" {
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"SAMBA_REALM is required in %s mode but is not set; set SAMBA_REALM to the Kerberos realm, for example AD.EXAMPLE.COM",
 				cfg.Mode)
 		}
 		if !strings.Contains(cfg.Realm, ".") {
-			return nil, refuse(CodeConfigError,
+			return nil, Refuse(CodeConfigError,
 				"SAMBA_REALM=%q is not a dotted DNS domain; set SAMBA_REALM to a fully qualified realm such as AD.EXAMPLE.COM",
 				cfg.Realm)
 		}
 	}
 	if cfg.Mode == ModeProvision && cfg.AdminPasswordFile == "" {
-		return nil, refuse(CodeConfigError,
+		return nil, Refuse(CodeConfigError,
 			"SAMBA_ADMIN_PASSWORD_FILE is required in provision mode but is not set; mount the initial Administrator password as a file and point SAMBA_ADMIN_PASSWORD_FILE at it")
 	}
 	if cfg.Mode == ModeJoin && cfg.JoinPasswordFile == "" {
-		return nil, refuse(CodeConfigError,
+		return nil, Refuse(CodeConfigError,
 			"SAMBA_JOIN_PASSWORD_FILE is required in join mode but is not set; mount the join account password as a file and point SAMBA_JOIN_PASSWORD_FILE at it")
 	}
 
@@ -233,18 +236,18 @@ func Load(getenv func(string) string) (*Config, error) {
 // message.
 func ReadSecret(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
-		return "", refuse(CodeSecretError,
+		return "", Refuse(CodeSecretError,
 			"no secret file path was given; set the matching SAMBA_*_PASSWORD_FILE variable to a mounted secret file")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", refuse(CodeSecretError,
+		return "", Refuse(CodeSecretError,
 			"secret file %q cannot be read (%s); mount the file into the container and make it readable by the container user",
 			path, errReason(err))
 	}
 	secret := strings.TrimSpace(string(data))
 	if secret == "" {
-		return "", refuse(CodeSecretError,
+		return "", Refuse(CodeSecretError,
 			"secret file %q is empty; write the password into the file before starting the container",
 			path)
 	}
@@ -252,9 +255,11 @@ func ReadSecret(path string) (string, error) {
 }
 
 // errReason renders an os error without repeating the path (already quoted by
-// the caller) and without any file content.
+// the caller) and without any file content. Unwrapping goes through errors.As
+// so a wrapped *os.PathError is still recognized.
 func errReason(err error) string {
-	if pe, ok := err.(*os.PathError); ok {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
 		return pe.Err.Error()
 	}
 	return err.Error()

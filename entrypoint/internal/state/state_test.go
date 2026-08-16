@@ -214,6 +214,36 @@ func TestWriteMarkerFailureLeavesNoPartialFile(t *testing.T) {
 		}
 	})
 
+	t.Run("failing rename cleans the temp file up", func(t *testing.T) {
+		// Make os.Rename fail without relying on permission bits, so the
+		// case is exercised as root too (the container runs privileged
+		// enough to ignore mode 0500): renaming a regular file over a
+		// directory is EISDIR/ENOTDIR for every uid.
+		dir := stateDir(t, true)
+		if err := os.Mkdir(filepath.Join(dir, MarkerName), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		err := WriteMarker(dir, Marker{SambaVersion: "4.24.6", InitializedAt: "2026-08-16T10:00:00Z", LastMode: "run"})
+		if err == nil {
+			t.Fatal("expected an error when the marker path is a directory")
+		}
+		var r *config.Refusal
+		if !errors.As(err, &r) {
+			t.Fatalf("expected *config.Refusal, got %T: %v", err, err)
+		}
+
+		entries, readErr := os.ReadDir(dir)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), MarkerName+".tmp") {
+				t.Errorf("failed rename left the temp file %q behind", e.Name())
+			}
+		}
+	})
+
 	t.Run("directory not writable keeps the previous marker intact", func(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("running as root: permission bits do not block writes")

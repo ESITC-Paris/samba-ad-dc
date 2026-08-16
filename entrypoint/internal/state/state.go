@@ -55,11 +55,9 @@ func Observe(dir string) (Observation, error) {
 	if _, err := os.Stat(filepath.Join(dir, stateFile)); err == nil {
 		obs.Present = true
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return Observation{}, &config.Refusal{
-			Code: config.CodeConfigError,
-			Msg: fmt.Sprintf("state directory %q cannot be inspected (%s); check that the volume is mounted and readable by the container user",
-				dir, reason(err)),
-		}
+		return Observation{}, config.Refuse(config.CodeConfigError,
+			"state directory %q cannot be inspected (%s); check that the volume is mounted and readable by the container user",
+			dir, reason(err))
 	}
 
 	markerPath := filepath.Join(dir, MarkerName)
@@ -68,20 +66,16 @@ func Observe(dir string) (Observation, error) {
 	case errors.Is(err, fs.ErrNotExist):
 		return obs, nil
 	case err != nil:
-		return Observation{}, &config.Refusal{
-			Code: config.CodeConfigError,
-			Msg: fmt.Sprintf("marker file %q cannot be read (%s); make %s readable by the container user, or delete it to let the container re-adopt the volume",
-				markerPath, reason(err), MarkerName),
-		}
+		return Observation{}, config.Refuse(config.CodeConfigError,
+			"marker file %q cannot be read (%s); make %s readable by the container user, or delete it to let the container re-adopt the volume",
+			markerPath, reason(err), MarkerName)
 	}
 
 	var m Marker
 	if err := json.Unmarshal(data, &m); err != nil {
-		return Observation{}, &config.Refusal{
-			Code: config.CodeConfigError,
-			Msg: fmt.Sprintf("marker file %q is not valid JSON (%s); restore a backup of the volume, or delete %s to let the container re-adopt it after a database check",
-				markerPath, oneLine(err.Error()), MarkerName),
-		}
+		return Observation{}, config.Refuse(config.CodeConfigError,
+			"marker file %q is not valid JSON (%s); restore a backup of the volume, or delete %s to let the container re-adopt it after a database check",
+			markerPath, oneLine(err.Error()), MarkerName)
 	}
 	obs.Marker = &m
 	return obs, nil
@@ -92,13 +86,21 @@ func Observe(dir string) (Observation, error) {
 // reader therefore sees either the previous marker or the new one, never a
 // half-written file. The marker is mode 0600 and no temp file survives a
 // failure.
+//
+// Atomicity and durability are different guarantees and only the first is
+// provided here: rename(2) is atomic within a filesystem, so no reader ever
+// observes a torn marker. Surviving a host crash would additionally require
+// fsync on the parent directory after the rename; that is deliberately not
+// done. The marker is a cache of a fact the volume itself carries (sam.ldb
+// exists, samba's own data records its version), and a marker lost to a crash
+// costs one dbcheck-and-adopt on the next start — cheaper than an fsync on
+// every write of a file whose loss is recoverable.
 func WriteMarker(dir string, m Marker) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
-		return &config.Refusal{
-			Code: config.CodeRuntimeFailure,
-			Msg:  fmt.Sprintf("marker for %q cannot be encoded (%s); this is a bug in the image, please report it", dir, oneLine(err.Error())),
-		}
+		return config.Refuse(config.CodeRuntimeFailure,
+			"marker for %q cannot be encoded (%s); this is a bug in the image, please report it",
+			dir, oneLine(err.Error()))
 	}
 	data = append(data, '\n')
 
@@ -178,11 +180,9 @@ func parseVersion(v string) ([3]int, error) {
 
 // writeRefusal renders a marker write failure as an actionable refusal.
 func writeRefusal(dir string, err error) error {
-	return &config.Refusal{
-		Code: config.CodeRuntimeFailure,
-		Msg: fmt.Sprintf("marker file %s cannot be written in %q (%s); mount the state volume read-write and make it writable by the container user",
-			MarkerName, dir, reason(err)),
-	}
+	return config.Refuse(config.CodeRuntimeFailure,
+		"marker file %s cannot be written in %q (%s); mount the state volume read-write and make it writable by the container user",
+		MarkerName, dir, reason(err))
 }
 
 // reason renders an os error without repeating the path the caller quotes.

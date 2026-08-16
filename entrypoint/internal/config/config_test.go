@@ -77,6 +77,9 @@ func TestLoadRefusals(t *testing.T) {
 		// wantMsgContains: every fragment must appear in the message
 		// (cause + remedy, naming the variable the operator must fix).
 		wantMsgContains []string
+		// wantMsgOmits: fragments that must NOT appear — secret values
+		// refused out of the environment are still secrets.
+		wantMsgOmits []string
 	}{
 		{
 			name:            "invalid mode",
@@ -89,12 +92,14 @@ func TestLoadRefusals(t *testing.T) {
 			env:             map[string]string{"SAMBA_ADMIN_PASSWORD": "hunter2"},
 			wantCode:        10,
 			wantMsgContains: []string{"SAMBA_ADMIN_PASSWORD_FILE"},
+			wantMsgOmits:    []string{"hunter2"},
 		},
 		{
 			name:            "plain join password in environment",
 			env:             map[string]string{"SAMBA_JOIN_PASSWORD": "hunter2"},
 			wantCode:        10,
 			wantMsgContains: []string{"SAMBA_JOIN_PASSWORD_FILE"},
+			wantMsgOmits:    []string{"hunter2"},
 		},
 		{
 			name: "provision without realm",
@@ -174,6 +179,11 @@ func TestLoadRefusals(t *testing.T) {
 			for _, frag := range tc.wantMsgContains {
 				if !strings.Contains(r.Msg, frag) {
 					t.Errorf("message %q does not contain %q", r.Msg, frag)
+				}
+			}
+			for _, frag := range tc.wantMsgOmits {
+				if strings.Contains(r.Msg, frag) {
+					t.Errorf("message %q leaked the secret value %q", r.Msg, frag)
 				}
 			}
 		})
@@ -391,6 +401,21 @@ func TestReadSecret(t *testing.T) {
 			t.Errorf("refusal message leaked a secret value: %q", r.Msg)
 		}
 	})
+}
+
+func TestRefuse(t *testing.T) {
+	r := Refuse(CodeStateAbsent, "no state in %s; mount the %s volume", "/var/lib/samba", "state")
+	if r.Code != CodeStateAbsent {
+		t.Errorf("Code = %d, want %d", r.Code, CodeStateAbsent)
+	}
+	if r.Msg != "no state in /var/lib/samba; mount the state volume" {
+		t.Errorf("Msg = %q", r.Msg)
+	}
+	var err error = r
+	var got *Refusal
+	if !errors.As(err, &got) || got != r {
+		t.Errorf("errors.As did not recover the refusal built by Refuse")
+	}
 }
 
 func TestRefusalIsAnError(t *testing.T) {

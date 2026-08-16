@@ -79,7 +79,7 @@ func Decide(cfg *config.Config, obs state.Observation, imageVersion string) (Pla
 
 	case config.ModeProvision, config.ModeJoin:
 		if obs.Present {
-			return Plan{}, refuse(config.CodeStateExists,
+			return Plan{}, config.Refuse(config.CodeStateExists,
 				"SAMBA_MODE=%s would initialize a new domain but the volume already holds samba state (%s/private/sam.ldb exists); set SAMBA_MODE=run to keep and start the existing domain, or delete the state volume first if the existing domain is really meant to be discarded",
 				cfg.Mode, stateDir)
 		}
@@ -106,7 +106,7 @@ func Decide(cfg *config.Config, obs state.Observation, imageVersion string) (Pla
 		return Plan{Kind: ActMaintenance, Repair: cfg.MaintenanceOp == config.MaintenanceRepair}, nil
 	}
 
-	return Plan{}, refuse(config.CodeConfigError,
+	return Plan{}, config.Refuse(config.CodeConfigError,
 		"SAMBA_MODE=%q is not a supported mode; set SAMBA_MODE to one of auto, provision, join, run, maintenance",
 		string(cfg.Mode))
 }
@@ -118,26 +118,26 @@ func Decide(cfg *config.Config, obs state.Observation, imageVersion string) (Pla
 // sees one contract whichever mode named the missing variable.
 func initPlan(cfg *config.Config, mode config.Mode) (Plan, *config.Refusal) {
 	if cfg.Realm == "" {
-		return Plan{}, refuse(config.CodeConfigError,
+		return Plan{}, config.Refuse(config.CodeConfigError,
 			"SAMBA_REALM is required in %s mode but is not set; set SAMBA_REALM to the Kerberos realm, for example AD.EXAMPLE.COM",
 			mode)
 	}
 	if !strings.Contains(cfg.Realm, ".") {
-		return Plan{}, refuse(config.CodeConfigError,
+		return Plan{}, config.Refuse(config.CodeConfigError,
 			"SAMBA_REALM=%q is not a dotted DNS domain; set SAMBA_REALM to a fully qualified realm such as AD.EXAMPLE.COM",
 			cfg.Realm)
 	}
 
 	if mode == config.ModeJoin {
 		if cfg.JoinPasswordFile == "" {
-			return Plan{}, refuse(config.CodeConfigError,
+			return Plan{}, config.Refuse(config.CodeConfigError,
 				"SAMBA_JOIN_PASSWORD_FILE is required in join mode but is not set; mount the join account password as a file and point SAMBA_JOIN_PASSWORD_FILE at it")
 		}
 		return Plan{Kind: ActJoin}, nil
 	}
 
 	if cfg.AdminPasswordFile == "" {
-		return Plan{}, refuse(config.CodeConfigError,
+		return Plan{}, config.Refuse(config.CodeConfigError,
 			"SAMBA_ADMIN_PASSWORD_FILE is required in provision mode but is not set; mount the initial Administrator password as a file and point SAMBA_ADMIN_PASSWORD_FILE at it")
 	}
 	return Plan{Kind: ActProvision}, nil
@@ -201,7 +201,7 @@ func compare(markerVersion, imageVersion string) (int, *config.Refusal) {
 	if err != nil {
 		// Unreachable: both operands parsed above. Refuse rather than
 		// guess an ordering.
-		return 0, refuse(config.CodeConfigError,
+		return 0, config.Refuse(config.CodeConfigError,
 			"samba versions %q and %q cannot be compared (%v); this is a bug in the image, please report it",
 			markerVersion, imageVersion, err)
 	}
@@ -211,7 +211,7 @@ func compare(markerVersion, imageVersion string) (int, *config.Refusal) {
 // checkMarkerVersion refuses a marker whose recorded version is not X.Y.Z.
 func checkMarkerVersion(v string) *config.Refusal {
 	if _, err := state.CompareVersions(v, v); err != nil {
-		return refuse(config.CodeConfigError,
+		return config.Refuse(config.CodeConfigError,
 			"marker file %s records samba_version %q, which is not an X.Y.Z version; restore a backup of the volume, or delete %s so the container re-adopts it after a database check",
 			state.MarkerName, v, state.MarkerName)
 	}
@@ -222,7 +222,7 @@ func checkMarkerVersion(v string) *config.Refusal {
 // build injected it, so no operator action can fix it.
 func checkImageVersion(v string) *config.Refusal {
 	if _, err := state.CompareVersions(v, v); err != nil {
-		return refuse(config.CodeConfigError,
+		return config.Refuse(config.CodeConfigError,
 			"this image reports its samba version as %q, which is not an X.Y.Z version; this is a bug in the image build, please report it",
 			v)
 	}
@@ -231,19 +231,14 @@ func checkImageVersion(v string) *config.Refusal {
 
 // downgradeRefusal explains that the volume outranks the image.
 func downgradeRefusal(markerVersion, imageVersion string) *config.Refusal {
-	return refuse(config.CodeDowngrade,
+	return config.Refuse(config.CodeDowngrade,
 		"the state volume was written by Samba %s but this image provides Samba %s; deploy an image tag providing Samba %s or newer, or restore a backup of the volume taken on Samba %s",
 		markerVersion, imageVersion, markerVersion, imageVersion)
 }
 
 // absentRefusal explains that a mode needing state found none.
 func absentRefusal(mode config.Mode) *config.Refusal {
-	return refuse(config.CodeStateAbsent,
+	return config.Refuse(config.CodeStateAbsent,
 		"SAMBA_MODE=%s needs an initialized domain but the volume holds no samba state (%s/private/sam.ldb is missing); mount the %s volume that holds the domain state, or set SAMBA_MODE=provision or join once to initialize it",
 		mode, stateDir, stateDir)
-}
-
-// refuse builds a *Refusal from a format string.
-func refuse(code int, format string, args ...any) *config.Refusal {
-	return &config.Refusal{Code: code, Msg: fmt.Sprintf(format, args...)}
 }
