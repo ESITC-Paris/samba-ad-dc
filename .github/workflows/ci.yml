@@ -4,6 +4,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The security gates below read a vulnerability database that is
+  # refreshed daily, so the same commit is green today and red tomorrow.
+  # A manual trigger is how that is re-checked - and how this workflow is
+  # exercised at all on a branch that has not been pushed to yet - without
+  # inventing an empty commit to carry the run.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,7 +18,11 @@ permissions:
 # than queueing behind it. Never cancels anything on another ref.
 concurrency:
   group: "ci-${{ github.ref }}"
-  cancel-in-progress: true
+  # Pull requests only. Once releases are cut from main, the CI run on a
+  # main commit is the evidence that commit was gated; a second push
+  # cancelling the first run would destroy that evidence, and a cancelled
+  # run is indistinguishable from one that was never asked for.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -28,9 +38,45 @@ jobs:
         ghcr.io/hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
       ACTIONLINT_IMAGE: >-
         rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+      GITLEAKS_IMAGE: >-
+        ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          # Full history, and only in this job: the secret scan below reads
+          # commits, not the working tree. A secret is typically removed
+          # from the tip in the same breath as it is committed, so the tip
+          # is the one place it is never found - the default shallow clone
+          # would make that scan pass by construction.
+          fetch-depth: 0
+
+      - name: gitleaks
+        # SPEC §5.3: a credential that ever reached a commit is disclosed,
+        # whether or not it survives to HEAD, so this is blocking (gitleaks
+        # exits 1 on any finding). --redact keeps the value out of a log
+        # that is public on a public repository, while --verbose still
+        # names the rule, file, line and commit - which is what the person
+        # revoking the credential actually needs.
+        run: |
+          # One accepted finding, pinned by its gitleaks fingerprint rather
+          # than by excluding a path or switching a rule off: the
+          # generic-api-key rule matches the Samba release key's PRIMARY
+          # FINGERPRINT in keys/PINNING.md (SPEC §4.4), which is public by
+          # construction - it is the value every signature check is
+          # verified against. Pinning the fingerprint keeps every other
+          # line of that file, and any future commit touching that line,
+          # in scope: a rotation produces a new fingerprint and turns this
+          # gate red until a human re-reads it.
+          cat > "${RUNNER_TEMP}/gitleaksignore" <<'IGNORE'
+          0033e25d89c638ab61444b481ca631bd4995302c:keys/PINNING.md:generic-api-key:5
+          IGNORE
+          docker run --rm \
+            -v "${PWD}:/repo:ro" \
+            -v "${RUNNER_TEMP}/gitleaksignore:/gitleaksignore:ro" \
+            "${GITLEAKS_IMAGE}" \
+            detect --source /repo --no-banner --redact --verbose \
+            --gitleaks-ignore-path /gitleaksignore
 
       - name: yamllint
         run: pipx run yamllint==1.38.0 --strict .
@@ -72,6 +118,15 @@ jobs:
         # neither Go nor docker — a mismatch is reported in seconds,
         # before an hour of image builds.
         run: sh scripts/check-traceability.sh
+
+      - name: Python unit tests
+        # scripts/catalog.py is what the release watcher edits versions.yaml
+        # with, and scripts/check-cve-exceptions.py is a build gate; both
+        # decide what gets published, so they are tested like the
+        # entrypoint is. `discover` rather than a named list: a new
+        # *_test.py runs because it exists, not because someone remembered
+        # to add it here.
+        run: python3 -m unittest discover -s scripts -p '*_test.py' -v
 
       - name: hadolint
         run: |
@@ -245,6 +300,95 @@ jobs:
 
       - name: Package closure check
         run: sh scripts/check-image-packages.sh samba-ad-dc:ci
+
+      # --- security gates (SPEC §5.3, §5.4) ---
+      # One contiguous block, copied verbatim into release.yml: a tag must
+      # be gated by exactly the checks a pull request was gated by, and the
+      # cheapest way to guarantee that is for both files to run the same
+      # steps in the same order. They sit inside the build matrix rather
+      # than in a job of their own because the package set apt resolves is
+      # per-architecture, and so is the vulnerability set it carries - an
+      # amd64-only scan would state nothing about the arm64 image that is
+      # published under the same tag.
+      #
+      # All three trivy invocations go through the pinned action instead of
+      # a hand-installed binary, for one reason: it caches the
+      # vulnerability database (`cache: true`), and a cold DB download per
+      # scan per architecture is the slow part of this block. `version`
+      # pins the trivy release these gates were proven against locally, so
+      # an upstream trivy release changes this gate's verdict only when
+      # someone bumps it deliberately.
+      - name: Trivy report (full, unfiltered)
+        # Everything trivy can see, kept as evidence and filtered by
+        # nothing: the gate below is deliberately narrow, and the unfixed
+        # and lower-severity findings it lets through are exactly what the
+        # §5.4 exception ledger is written from. JSON because this artifact
+        # is read by tools; the human-readable table is the gate's own
+        # output.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: samba-ad-dc:ci
+          format: json
+          output: trivy-full-${{ matrix.arch }}.json
+          version: v0.71.2
+          cache: true
+
+      - name: Upload trivy report
+        # `always()`: the report is most useful precisely when a gate below
+        # fails, and an upload that only ran on success would withhold it
+        # exactly then. 90 days so an image published today can still be
+        # compared against the scan that gated it a quarter from now.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: trivy-full-${{ matrix.arch }}
+          path: trivy-full-${{ matrix.arch }}.json
+          retention-days: 90
+          # A missing report means the scan above never produced one; that
+          # is a broken gate, not a warning.
+          if-no-files-found: error
+
+      - name: Trivy vulnerability gate (fixable HIGH/CRITICAL)
+        # Blocking (SPEC §5.3). --ignore-unfixed is not leniency: a CVE
+        # with no fixed package cannot be resolved by rebuilding, so
+        # failing on it would only teach people to route around the gate.
+        # Those are handled by the ledger and its review clock (SPEC §5.4,
+        # the last step of this block) and are all present, unfiltered, in
+        # the artifact above.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: samba-ad-dc:ci
+          scanners: vuln
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
+          version: v0.71.2
+          cache: true
+
+      - name: Trivy secret gate
+        # A different question from gitleaks in `lint`, not a second
+        # opinion on the same one: that scan reads the git history, this
+        # one reads the filesystem of the image that would be published. A
+        # key written by a build step, or one inherited from a base image,
+        # exists in neither the repository nor its history.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: samba-ad-dc:ci
+          scanners: secret
+          exit-code: '1'
+          format: table
+          version: v0.71.2
+          cache: true
+
+      - name: CVE exception review clock
+        # The other half of §5.4: unfixed CVEs pass the gate above only for
+        # as long as their ledger entry is current. This fails the build
+        # once a review date has passed, which is what keeps
+        # security/cve-exceptions.yaml from decaying into the permanent
+        # suppression list §5.4 forbids.
+        run: python3 scripts/check-cve-exceptions.py
+      # --- end security gates ---
 
       - name: Set up Go
         # The E2E suite is a Go test binary, so this job needs a toolchain
