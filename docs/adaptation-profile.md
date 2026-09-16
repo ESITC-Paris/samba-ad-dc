@@ -1152,3 +1152,33 @@ gates.
   per-CVE ledger of that size is the suppression list §5.4 forbids. The
   review dates are never moved by a sync — renewing one is a human review,
   and `check-cve-exceptions.py` is still the clock.
+- 2026-09-16: Phase 4 — **the operational half of the release cycle is
+  written down.** New `docs/operations.md` is the counterpart to the
+  Release cycle section above: that section says what the automation
+  decides, and the new file says how it is started, configured, watched
+  and driven by hand — the external hourly trigger (fine-grained PAT,
+  `/usr/local/bin/samba-ad-dc-upstream-check`, the cron line) and why
+  there is no `schedule:` trigger to replace it, the repository secrets
+  and variables with what happens when each is absent, the four
+  supervision layers, every manual operation with its exact command
+  (`security_release`, `dry_run`, re-dispatching a release, the staging
+  rehearsal, adding a series, retiring one, re-measuring the capability
+  set), the two §9.6 degraded modes with the disclosure each produces and
+  what recovery from Mode 2 is, and a triage table. The Release cycle
+  section's forward reference to `docs/operations.md` is no longer
+  dangling. The first-publication path gets a procedure rather than a
+  promise: the three catalog branches are all in the `publish` state, so
+  going live is adding the mirror secrets (optional), starting the timer,
+  and watching three releases — plus the one thing no workflow can do,
+  deleting the README's pre-release notice, which is a plain blockquote
+  and therefore a hand edit. SECURITY.md's §5.4 paragraph stops being a
+  path and a date and states the ledger's actual shape: one entry per
+  affected package, synchronised from the published SBOM by the watcher
+  through `scripts/cve-ledger.py sync`, with `check-cve-exceptions.py` as
+  the clock a sync never moves. README gains a short Release automation
+  section pointing at both documents; its full rewrite is Phase 5. The
+  guide also documents `post-push-verify.yml` from the workflow itself
+  rather than from the plan — including the two properties of its
+  `workflow_run` trigger a maintainer has to know before the first
+  release: it fires only for `release.yml` as it exists on the default
+  branch, and only for a Release run that concluded `success`.

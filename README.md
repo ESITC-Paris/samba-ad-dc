@@ -65,6 +65,16 @@ identity, plus SBOM/provenance inspection commands.)*
 | 4.22 | 4.22.11-r1 | `4.22.11`, `4.22` | security fixes only — deprecation pending (4.25 rc published) |
 <!-- matrix:end -->
 
+## Release automation
+
+Publication is automated end to end: an hourly watcher
+(`.github/workflows/upstream-check.yml`) probes upstream releases, the
+pinned base images and the package closure, and dispatches
+`.github/workflows/release.yml` only when the image is certain to differ
+from the last published one. What it decides is documented in
+`docs/adaptation-profile.md` ("Release cycle"); how it is scheduled,
+supervised and driven by hand is in `docs/operations.md`.
+
 ## Security
 
 See `SECURITY.md`. This project conforms to the vendored publishing
