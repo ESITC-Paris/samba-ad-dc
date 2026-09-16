@@ -177,7 +177,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           # The toolchain is chosen by entrypoint/go.mod, so this job and
           # the Dockerfile's gobuild stage cannot drift apart.
@@ -456,7 +456,7 @@ jobs:
         # too — the same pinned action the `unit` job uses, resolved from
         # the e2e module's own go.mod so the two modules can pick their
         # toolchains independently.
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: test/e2e/go.mod
           # The e2e module has no external dependencies (and therefore no
