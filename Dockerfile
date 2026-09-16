@@ -293,15 +293,20 @@ COPY runtime-packages.txt /usr/share/samba-ad-dc/runtime-packages.txt
 # builder: the inputs are pinned (base image digest, PKG_INDEX_HASH) and the
 # resolved package versions are recorded in the published SBOM (SPEC §4.3
 # interpretation in the adaptation profile).
-# `apt-get upgrade` before the install, and in the SAME RUN: a package the
-# base image already carries is never touched by `apt-get install` of the
-# manifest — apt does not upgrade an already-satisfying package — so a
-# Debian security update to a base-inherited package reached this image
-# only when Debian republished debian:trixie-slim. Measured on the
-# 4.24.7 build of 2026-09-16: gzip 1.13-1, perl-base 5.40.1-6 (three
-# CRITICALs), libsqlite3-0 3.46.1-7+deb13u1 and libpcre2-8-0
-# 10.46-1~deb13u1 shipped with 12 fixable HIGH/CRITICAL CVEs whose fixes
-# were already sitting in the archive this very RUN queries. SPEC
+# `apt-get upgrade` before the install, and in the SAME RUN: installing
+# the manifest upgrades a package the base image already carries only
+# where a dependency's version constraint forces it — 5 packages today
+# (libc6, libc-bin, libcap2, libssl3t64, openssl-provider-legacy) — and
+# leaves every other one alone, because apt does not upgrade a package
+# that already satisfies the request. So 9 of the 14 upgrades available
+# against today's index were invisible to this stage, and a Debian
+# security update to one of those reached the image only when Debian
+# republished debian:trixie-slim — and all four packages that carried the
+# fixable CVEs were in that invisible set. Measured on the 4.24.7 build of
+# 2026-09-16: gzip 1.13-1, perl-base 5.40.1-6 (three CRITICALs),
+# libsqlite3-0 3.46.1-7+deb13u1 and libpcre2-8-0 10.46-1~deb13u1 shipped
+# with 12 fixable HIGH/CRITICAL CVEs whose fixes were already sitting in
+# the archive this very RUN queries. SPEC
 # §9bis.1.c makes a package-index change a build input, and that is what
 # this line honours: the upgrade set is the FIRST of the two dry-runs
 # scripts/pkg-closure-hash.sh folds into PKG_INDEX_HASH, so a security

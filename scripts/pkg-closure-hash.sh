@@ -22,12 +22,19 @@
 #   2. `apt-get -y --no-install-recommends --dry-run install <manifest>`
 #      The closure the manifest pulls in on top of the base.
 #
-# Both are needed, and neither subsumes the other. `install` alone never
-# mentions an already-installed base package — apt does not upgrade a
-# package that already satisfies the request — so a CVE fix to gzip or
-# perl-base would leave the hash untouched while changing what ships,
-# which is precisely the blind spot §9bis.1.c forbids. `upgrade` alone
-# says nothing about packages not installed yet, i.e. the whole manifest.
+# Both are needed, and neither subsumes the other. `install` upgrades an
+# already-installed base package only when a manifest dependency's version
+# constraint forces it — measured against today's index, 5 of them do
+# (libc6, libc-bin, libcap2, libssl3t64, openssl-provider-legacy). Every
+# other base package it leaves alone, because apt does not upgrade one
+# that already satisfies the request: 9 of the 14 upgrades available today
+# are invisible to the `install` half, and they include all four that
+# carried the fixable CVEs (gzip, perl-base, libsqlite3-0, libpcre2-8-0)
+# plus base-files, bash, libaudit1, libaudit-common and tzdata. An
+# `install`-only hash would therefore sit still while a CVE fix to gzip
+# changed what ships — precisely the blind spot §9bis.1.c forbids.
+# `upgrade` alone says nothing about packages not installed yet, i.e.
+# about the whole manifest.
 #
 # Rendering: each `Inst <name> [<old>] (<new> ...)` line becomes
 # `<name> <version>`, where <version> is the version apt would END UP
@@ -45,6 +52,20 @@
 # the index, the digest tracks the base. Neither replaces the other, and
 # a build records both.
 set -eu
+
+# The hash is taken over a SORTED list, so the collating order is part of
+# the definition; pinning it to C is the only way the same closure hashes
+# the same on a developer's box and on the runner. glibc's locales compare
+# with punctuation weakened, so `libaudit-common` and `libc-bin` land on
+# different sides of `libc6` under en_US.UTF-8 or fr_FR.UTF-8 than under
+# C — measured on today's 75-line closure: six lines move (libaudit-common,
+# libc-bin, libpython3-stdlib, libtirpc-common, python3.13,
+# python3.13-minimal) and the hash changes with them. Unpinned, the watcher
+# would read that as "the package closure changed" and rebuild, every time
+# it ran on a host whose locale differed from the one that seeded the
+# value — a phantom trigger that no package update caused.
+LC_ALL=C
+export LC_ALL
 
 BASE=${1:-}
 if [ -z "$BASE" ]; then
