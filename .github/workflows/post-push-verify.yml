@@ -356,6 +356,22 @@ jobs:
           docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}" \
             --format '{{json .Provenance}}' > provenance.json
 
+          # ... but only when the index holds more than one platform. With a
+          # single one buildx prints the attestation itself, so the top-level
+          # keys are SPDX and SLSA instead of a platform name. That is
+          # exactly the shape of a SPEC §9.6 Mode 2 release, so it is
+          # normalised here rather than read as "no SBOM". Guarded on the
+          # count, because rewrapping unconditionally would hide a
+          # one-platform answer where two were promised - which the manifest
+          # step has already refused by now, and must keep refusing here.
+          if [ "$(wc -l < expected.txt)" -eq 1 ]; then
+            ONLY="$(cat expected.txt)"
+            jq --arg p "${ONLY}" 'if has("SPDX") then {($p): .} else . end' sbom.json > sbom.norm
+            jq --arg p "${ONLY}" 'if has("SLSA") then {($p): .} else . end' provenance.json > provenance.norm
+            mv sbom.norm sbom.json
+            mv provenance.norm provenance.json
+          fi
+
           while read -r plat; do
             for kind in sbom provenance; do
               if ! jq -e --arg p "${plat}" 'has($p) and ((.[$p] | length) > 0)' "${kind}.json" > /dev/null; then
@@ -424,6 +440,20 @@ jobs:
             --format '{{json .SBOM}}' > hub-sbom.json
           docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:${IMAGE_TAG}" \
             --format '{{json .Provenance}}' > hub-provenance.json
+
+          # The single-platform shape again - same reason, same guard. The
+          # two blocks are kept separate rather than extracted into a script
+          # because this job deliberately checks out nothing: it must be
+          # able to verify a published image with no working tree at all.
+          if [ "$(wc -l < expected.txt)" -eq 1 ]; then
+            ONLY="$(cat expected.txt)"
+            jq --arg p "${ONLY}" 'if has("SPDX") then {($p): .} else . end' hub-sbom.json > hub-sbom.norm
+            jq --arg p "${ONLY}" 'if has("SLSA") then {($p): .} else . end' \
+              hub-provenance.json > hub-provenance.norm
+            mv hub-sbom.norm hub-sbom.json
+            mv hub-provenance.norm hub-provenance.json
+          fi
+
           while read -r plat; do
             for kind in hub-sbom hub-provenance; do
               if ! jq -e --arg p "${plat}" 'has($p) and ((.[$p] | length) > 0)' "${kind}.json" > /dev/null; then
