@@ -71,13 +71,20 @@ themselves.** The project's commitment is publishing quickly; with a
 digest pin, applying is entirely yours, so pair it with the notification
 setup in §2 and a scheduled review.
 
-**Discouraged — `X`, `latest`, `edge`.** `latest` is documented as not
-production-usable (§3.3); `edge`, if it exists, is built from `main` and
-is marked non-production. `X` is not marked unusable but carries the same
-branch-following behaviour as `latest`, and for a stateful DC a branch
-that arrives by surprise is worse than one that arrives late — see §7:
-what an image update writes to the volume cannot be undone by pulling the
-old tag back.
+**Discouraged — `X` and `latest`.** `latest` is documented as not
+production-usable (§3.3). `X` is not marked unusable but carries the same
+branch-following behaviour, and for a stateful DC a branch that arrives by
+surprise is worse than one that arrives late — see §7: what an image
+update writes to the volume cannot be undone by pulling the old tag back.
+(`edge` is permitted by §3.3 but is **not published by this repository**;
+every published tag comes from a released upstream tarball.)
+
+The README's tag table is the one-screen version of this section, and it
+names the digest as the production pin. The two agree: a branch pin is a
+deliberate trade — you accept that a rebuild arrives on its own, in
+exchange for CVE fixes that do not wait for a change window. Where an
+image entering the estate must be an auditable event, that trade is not
+available and the pin is a digest.
 
 *Covered by:* no E2E test — tag mutability is a registry property, not a
 container behaviour. It is enforced at publication: `release.yml` refuses
@@ -144,7 +151,7 @@ changed and why. A `samba-release` cause is an upstream version change; a
 routine. The procedure — `samba-tool domain backup offline` from a
 stopped DC, and the restore that goes with it — is the backup/restore
 runbook in the deployment guide:
-[`docs/deployment-guide.md#backup-and-restore`](deployment-guide.md#backup-and-restore).
+[`docs/deployment-guide.md#backup-and-restore-runbook`](deployment-guide.md#backup-and-restore-runbook).
 This backup is what §7 restores from; without it there is no rollback.
 
 *Covered by:* `TestOfflineBackupRestore`.
@@ -417,7 +424,7 @@ happened on the volume. The image is not the state.
 1. **Stop the DC.** Leave the volumes alone.
 2. **Restore the backup you took before the update** (§3, step 2), into
    **fresh** volumes, following the restore half of the runbook:
-   [`docs/deployment-guide.md#backup-and-restore`](deployment-guide.md#backup-and-restore).
+   [`docs/deployment-guide.md#backup-and-restore-runbook`](deployment-guide.md#backup-and-restore-runbook).
    A restore is not a copy of the old volume over the new one; it
    relocates state, re-registers the realm's records, and cannot reuse the
    backed-up DC's own name.
