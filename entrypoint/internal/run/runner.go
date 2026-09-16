@@ -18,6 +18,20 @@ type Runner interface {
 	Run(ctx context.Context, name string, args ...string) error
 	// Start executes name as a daemon and returns before it finishes.
 	Start(ctx context.Context, name string, args ...string) (Proc, error)
+	// Output executes name, waits for it, and returns what it wrote to
+	// standard output.
+	//
+	// It exists for the one thing Run cannot do: read a value back out of
+	// samba's own CLI. The entrypoint has to ASK samba where it keeps the
+	// MS-SNTP signing socket rather than assume the path a provision
+	// happens to use (see Executor.ntpSigndDir), and `testparm` is the
+	// only interface that answers with samba's own parser.
+	//
+	// Standard error is left on the container's stderr: a tool that
+	// explains itself there — testparm prints its "Loaded services file
+	// OK" banner to stderr — must not be silenced just because the
+	// entrypoint is after its stdout.
+	Output(ctx context.Context, name string, args ...string) (string, error)
 }
 
 // Proc is a started daemon: it can be signaled and it must be reaped.
@@ -94,6 +108,22 @@ func (r *execRunner) Run(ctx context.Context, name string, args ...string) error
 		return fmt.Errorf("%s: %w", line, err)
 	}
 	return nil
+}
+
+// Output executes name and returns its standard output. The command is
+// logged like any other (redacted), because a value read out of an external
+// program is as much a shell-out as one that only has side effects.
+func (r *execRunner) Output(ctx context.Context, name string, args ...string) (string, error) {
+	line := commandLine(name, args)
+	r.log(line)
+	var out strings.Builder
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout = &out
+	cmd.Stderr = r.stderr
+	if err := cmd.Run(); err != nil {
+		return out.String(), fmt.Errorf("%s: %w", line, err)
+	}
+	return out.String(), nil
 }
 
 // Start executes name as a daemon.

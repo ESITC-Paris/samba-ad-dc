@@ -32,6 +32,11 @@ func (f *fakeRunner) Start(ctx context.Context, name string, args ...string) (ru
 	return nil, errors.New("the health check never starts daemons")
 }
 
+func (f *fakeRunner) Output(ctx context.Context, name string, args ...string) (string, error) {
+	f.calls = append(f.calls, append([]string{"output:" + name}, args...))
+	return "", errors.New("the health check reads no command output")
+}
+
 // smbConf writes a smb.conf holding body and returns its path.
 func smbConf(t *testing.T, body string) string {
 	t.Helper()
@@ -417,4 +422,8 @@ func (d *deadlineRunner) Run(ctx context.Context, name string, args ...string) e
 
 func (d *deadlineRunner) Start(ctx context.Context, name string, args ...string) (run.Proc, error) {
 	return nil, errors.New("the health check never starts daemons")
+}
+
+func (d *deadlineRunner) Output(ctx context.Context, name string, args ...string) (string, error) {
+	return "", errors.New("the health check reads no command output")
 }

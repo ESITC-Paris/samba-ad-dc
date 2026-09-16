@@ -256,10 +256,12 @@ const restoreHealthTimeout = 6 * time.Minute
 // backupWorstCase is what this test can consume if every budget is spent:
 // the source DC's provision, THREE one-off containers each bounded by
 // harness.ExitTimeout (the backup, the listing that proves its tarball
-// exists, and the restore), and the restored DC's health transition. It is
-// well past `go test`'s 10-minute default, which is why the test refuses to
-// start under one — see requireDeadline in replication_test.go.
-const backupWorstCase = harness.HealthTimeout + 3*harness.ExitTimeout + restoreHealthTimeout
+// exists, and the restore), the restored DC's health transition, and the
+// one test-client run that measures time against it. It is well past `go
+// test`'s 10-minute default, which is why the test refuses to start under
+// one — see requireDeadline in replication_test.go.
+const backupWorstCase = harness.HealthTimeout + 3*harness.ExitTimeout + restoreHealthTimeout +
+	harness.ClientTimeout
 
 // TestOfflineBackupRestore asserts the disaster-recovery procedure end to
 // end: an offline backup taken from the stopped volumes of one DC is
@@ -270,11 +272,14 @@ const backupWorstCase = harness.HealthTimeout + 3*harness.ExitTimeout + restoreH
 // one-off containers of the image under test running `samba-tool` directly,
 // never a shell inside a live DC.
 //
-// Three findings from getting this to work are recorded in the body rather
+// Four findings from getting this to work are recorded in the body rather
 // than in a report, because they are the difference between a procedure that
 // works and one that looks like it should:
 //   - the restore cannot reuse the backed-up DC's own name;
 //   - the restore leaves the realm's SRV records unregistered;
+//   - the restored tree relocates state, cache and sysvol under
+//     /var/lib/samba/state — but not the MS-SNTP signing socket, which the
+//     restore leaves at samba's default;
 //   - the restored volume carries no marker at the path the entrypoint
 //     reads, so the container adopts it — which is the documented behaviour
 //     for a foreign volume, and is asserted here rather than worked around.
@@ -413,6 +418,30 @@ func TestOfflineBackupRestore(t *testing.T) {
 	// Object-level verification (B.5): the domain that came back is the one
 	// that was backed up, not an empty one wearing its name.
 	harness.Exec(t, restored.Name, "samba-tool", "user", "show", "dave")
+
+	// FINDING 4 — the restored tree is not laid out like a provisioned one,
+	// but the relocation stops short of the MS-SNTP signing socket. The
+	// restored smb.conf points `state directory`, `cache directory` and the
+	// sysvol share into /var/lib/samba/state (and leaves `lock directory` at
+	// /var/lib/samba), which is why operator documentation must derive those
+	// paths rather than hardcode them (B.6). It does NOT set `ntp signd
+	// socket directory`, and samba's compile-time default for that parameter
+	// does not track `state directory` — so a restored DC keeps the signing
+	// socket exactly where a provisioned one does. This was measured, after
+	// the opposite was suspected; it is recorded here because "the restore
+	// moves everything under state/" is the plausible wrong conclusion, and
+	// the next reader will draw it from the sysvol path two lines up.
+	//
+	// The wiring is still asserted on this DC rather than taken on faith:
+	// the restore is the one path that rewrites smb.conf wholesale, so it is
+	// the one most likely to move this parameter in a future samba release —
+	// and this assertion reads the DC's own value, so it will keep holding
+	// if that happens.
+	assertSignedNTPWiring(t, restored.Name)
+
+	// ...and the time service really answers on the restored DC, not merely
+	// that its configuration looks right.
+	assertServesTime(t, net, restored.IP)
 
 	// The adoption path, asserted rather than tolerated. `domain backup
 	// offline` archives the marker as part of the state directory, so the

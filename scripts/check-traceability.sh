@@ -13,12 +13,17 @@
 #       pointing at a deleted or renamed test is a matrix hole that reads
 #       as coverage.
 #
-# Plus the two ways that pair can rot quietly:
+# Plus the three ways that pair can rot quietly:
 #
 #   (c) no ID appears in the map twice (two rows sharing a test means one
 #       of them is uncovered);
 #   (d) the infrastructure exemptions below still name real functions,
-#       and none of them is listed as a B.5 row.
+#       and none of them is listed as a B.5 row;
+#   (e) there are exactly as many table ROWS as there are distinct test
+#       IDs. (a) and (b) compare two SETS of names and are blind to a row
+#       that names no test at all, or to two rows merged into one naming
+#       two — both of which keep the name sets identical while breaking
+#       the "one row <-> one test" mapping §8.2 requires.
 #
 # The check is STRUCTURAL. It cannot tell whether a test exercises what
 # its row claims; that is the reviewer's job. What it does guarantee is
@@ -94,6 +99,23 @@ grep '^[[:space:]]*|' "$MAP" |
 	sort >"$tmp/ids.all" || true
 sort -u "$tmp/ids.all" >"$tmp/ids"
 
+# --- side 2b: how many ROWS the map has ------------------------------
+#
+# Counted from the table itself rather than from the IDs found in it, so
+# that the two numbers come from independent sources and check (e) below
+# can compare them. A separator line (|---|---|) is what marks the line
+# before it as a header, so every separator cancels the header it
+# follows: what is left is data rows, for any number of tables. The map
+# is expected to hold exactly ONE table — the same assumption the ID
+# extraction above already makes.
+rows=$(awk '
+	/^[[:space:]]*\|/ {
+		if ($0 ~ /^[[:space:]]*\|[-:|[:space:]]*$/) { n--; next }
+		n++
+	}
+	END { print n + 0 }
+' "$MAP")
+
 for name in $EXEMPT; do
 	echo "$name"
 done | sort -u >"$tmp/exempt"
@@ -133,12 +155,20 @@ comm -12 "$tmp/exempt" "$tmp/ids" >"$tmp/infra_rows"
 report "infrastructure test(s) listed as a B.5 row in $MAP (they cover the suite, not the image)" \
 	"$tmp/infra_rows"
 
+# (e) one row, one test — counted, not inferred from the name sets
+ids=$(wc -l <"$tmp/ids" | tr -d ' ')
+if [ "$rows" -ne "$ids" ]; then
+	echo "error: $MAP has $rows matrix table row(s) but names $ids distinct test ID(s);" >&2
+	echo "  §8.2 requires one row per test and one test per row. A row naming no test," >&2
+	echo "  or one row naming two, is the usual cause." >&2
+	failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
 	echo "traceability: $failures problem(s); see above" >&2
 	exit 1
 fi
 
-rows=$(wc -l <"$tmp/ids" | tr -d ' ')
 if [ "$rows" -eq 0 ]; then
 	# Reachable only if every test is exempt: the map lists nothing and
 	# agrees with a suite that documents nothing.
@@ -146,5 +176,8 @@ if [ "$rows" -eq 0 ]; then
 	exit 1
 fi
 
-printf 'traceability ok: %s row(s) <-> %s test(s), %s infrastructure test(s) exempt\n' \
+# The two counts come from different places on purpose — table rows on one
+# side, test functions found in the tree on the other — so printing both is
+# printing the agreement, not the same number twice.
+printf 'traceability ok: %s matrix row(s) <-> %s test function(s), %s infrastructure test(s) exempt\n' \
 	"$rows" "$(wc -l <"$tmp/mapped" | tr -d ' ')" "$(wc -l <"$tmp/exempt" | tr -d ' ')"

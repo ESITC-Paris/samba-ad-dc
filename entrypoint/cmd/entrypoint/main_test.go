@@ -29,6 +29,11 @@ func (f fakeRunner) Start(_ context.Context, name string, args ...string) (run.P
 	return nil, nil
 }
 
+func (f fakeRunner) Output(_ context.Context, name string, args ...string) (string, error) {
+	f.t.Fatalf("unexpected Output(%q, %v)", name, args)
+	return "", nil
+}
+
 // testApp wires an app against a temporary state directory and an
 // environment the test controls entirely.
 func testApp(t *testing.T, env map[string]string) (*app, *bytes.Buffer, *bytes.Buffer) {

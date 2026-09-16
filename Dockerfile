@@ -297,9 +297,14 @@ RUN samba --version \
 
 COPY --from=gobuild /out/entrypoint /usr/local/bin/entrypoint
 
-# The chrony configuration is static and read-only-friendly, so it is baked
-# in. /etc/chrony is NOT a volume (only /etc/samba and /var/lib/samba are),
-# which is exactly why this file can live here and survive.
+# The chrony configuration TEMPLATE. /etc/chrony is NOT a volume (only
+# /etc/samba and /var/lib/samba are) and the rootfs is read-only, which is
+# exactly why this file can live here and survive — and why it is a template
+# rather than the file the daemon reads: one line of it, the MS-SNTP signing
+# socket directory, is an smb.conf parameter the operator may set on the
+# /etc/samba volume, so the entrypoint generates the effective configuration
+# at /run/chrony/chrony.conf from this file plus what the DC's own smb.conf
+# declares, and points chronyd there.
 # Nothing is created under /var/lib/samba at build time: it is a volume, and
 # anything baked there is masked the moment one is mounted. The entrypoint
 # creates the runtime directories (/run/samba, /run/lock/samba, /run/chrony)

@@ -23,7 +23,7 @@ import (
 
 // call is one shell-out recorded by the fake runner.
 type call struct {
-	kind string // "run" (waited) or "start" (daemon)
+	kind string // "run" (waited), "start" (daemon) or "output" (read back)
 	name string
 	args []string
 	ctx  context.Context
@@ -103,12 +103,14 @@ func (p *fakeProc) signals() []os.Signal {
 
 // fakeRunner records every shell-out and returns scripted results.
 type fakeRunner struct {
-	mu       sync.Mutex
-	calls    []call
-	runErr   map[string]error // keyed by key()
-	startErr map[string]error // keyed by binary name
-	procs    map[string]Proc  // keyed by binary name
-	hook     func(c call)     // observation point, runs before the result
+	mu        sync.Mutex
+	calls     []call
+	runErr    map[string]error  // keyed by key()
+	startErr  map[string]error  // keyed by binary name
+	procs     map[string]Proc   // keyed by binary name
+	output    map[string]string // stdout, keyed by binary name
+	outputErr map[string]error  // keyed by binary name
+	hook      func(c call)      // observation point, runs before the result
 }
 
 func newFakeRunner() *fakeRunner {
@@ -116,6 +118,11 @@ func newFakeRunner() *fakeRunner {
 		runErr:   map[string]error{},
 		startErr: map[string]error{},
 		procs:    map[string]Proc{},
+		// What testparm answers on a provisioned DC. Scripted by default
+		// so that every supervision test runs the ordinary path; the
+		// chrony-configuration tests override it.
+		output:    map[string]string{"testparm": provisionedSigndDir + "\n"},
+		outputErr: map[string]error{},
 	}
 }
 
@@ -131,6 +138,11 @@ func (f *fakeRunner) record(c call) {
 func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) error {
 	f.record(call{kind: "run", name: name, args: args, ctx: ctx})
 	return f.runErr[key(name, args)]
+}
+
+func (f *fakeRunner) Output(ctx context.Context, name string, args ...string) (string, error) {
+	f.record(call{kind: "output", name: name, args: args, ctx: ctx})
+	return f.output[name], f.outputErr[name]
 }
 
 func (f *fakeRunner) Start(ctx context.Context, name string, args ...string) (Proc, error) {
@@ -190,6 +202,27 @@ func (f *fakeRunner) argsOf(t *testing.T, kind, name string) []string {
 
 const testImageVersion = "4.24.6"
 
+// provisionedSigndDir is samba's compile-time default for the MS-SNTP
+// signing socket — the value the baked-in template carries — and
+// customSigndDir stands for an smb.conf that sets `ntp signd socket
+// directory` to something else. The gap between the two is the whole reason
+// chrony.conf is generated rather than baked.
+const (
+	provisionedSigndDir = "/var/lib/samba/ntp_signd"
+	customSigndDir      = "/srv/samba/ntp_signd"
+)
+
+// chronyTemplateContent is a stand-in for the file the image bakes at
+// /etc/chrony/chrony.conf: the directive that gets rewritten, plus the
+// absolute drift and pid paths that must survive the rewrite untouched.
+const chronyTemplateContent = `# baked template
+ntpsigndsocket ` + provisionedSigndDir + `
+user root
+driftfile /var/lib/samba/chrony/drift
+pidfile /run/chrony/chronyd.pid
+local stratum 10
+`
+
 // testSecret is the sentinel that must never reach a log or an error.
 const testSecret = "hunter2"
 
@@ -203,6 +236,16 @@ func newTestExecutor(t *testing.T, r Runner) (*Executor, *syncBuffer) {
 	e.Log = logBuf
 	e.Now = func() time.Time { return time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC) }
 	e.SMBConfPath = filepath.Join(t.TempDir(), "smb.conf")
+	// The chrony template is read and the effective configuration is
+	// written, so both are rooted in the test's own filesystem: a unit test
+	// must neither depend on the image's /etc nor write to the developer's
+	// /run. The generated path sits under Root/run/chrony, the directory
+	// makeRuntimeDirs creates.
+	e.ChronyTemplate = filepath.Join(t.TempDir(), "chrony.conf")
+	if err := os.WriteFile(e.ChronyTemplate, []byte(chronyTemplateContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.ChronyConf = filepath.Join(e.Root, "run", "chrony", "chrony.conf")
 	// Never touch the real signal machinery from a unit test.
 	e.Notify = func(c chan<- os.Signal, _ ...os.Signal) {}
 	e.Stop = func(c chan<- os.Signal) {}
@@ -335,7 +378,7 @@ func TestExecuteProvisionInitializesThenStartsDaemons(t *testing.T) {
 		t.Fatalf("Execute: unexpected refusal %d: %s", ref.Code, ref.Msg)
 	}
 
-	want := []string{"run:samba-tool", "start:chronyd", "start:samba"}
+	want := []string{"run:samba-tool", "output:testparm", "start:chronyd", "start:samba"}
 	if got := r.names(); !equalStrings(got, want) {
 		t.Fatalf("call order = %v, want %v", got, want)
 	}
@@ -492,7 +535,7 @@ func TestExecuteJoinInitializesThenStartsDaemons(t *testing.T) {
 		t.Fatalf("Execute: unexpected refusal %d: %s", ref.Code, ref.Msg)
 	}
 
-	want := []string{"run:samba-tool", "start:chronyd", "start:samba"}
+	want := []string{"run:samba-tool", "output:testparm", "start:chronyd", "start:samba"}
 	if got := r.names(); !equalStrings(got, want) {
 		t.Fatalf("call order = %v, want %v", got, want)
 	}
@@ -574,7 +617,7 @@ func TestExecuteStartRunsNoSambaTool(t *testing.T) {
 	if ref := e.Execute(context.Background(), runConfig(config.ModeRun), modes.Plan{Kind: modes.ActStart}, dir, testImageVersion); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
-	want := []string{"start:chronyd", "start:samba"}
+	want := []string{"output:testparm", "start:chronyd", "start:samba"}
 	if got := r.names(); !equalStrings(got, want) {
 		t.Fatalf("call order = %v, want %v (a restart must not touch state)", got, want)
 	}
@@ -593,7 +636,7 @@ func TestExecuteDBCheckThenStartUpgradesMarker(t *testing.T) {
 	if ref := e.Execute(context.Background(), runConfig(config.ModeRun), modes.Plan{Kind: modes.ActDBCheckThenStart}, dir, testImageVersion); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
-	want := []string{"run:samba-tool", "start:chronyd", "start:samba"}
+	want := []string{"run:samba-tool", "output:testparm", "start:chronyd", "start:samba"}
 	if got := r.names(); !equalStrings(got, want) {
 		t.Fatalf("call order = %v, want %v", got, want)
 	}
@@ -767,8 +810,14 @@ func TestSuperviseStartsDaemonsWithTheContractCommands(t *testing.T) {
 	if ref := e.Supervise(context.Background(), cfg); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
-	if got := r.argsOf(t, "start", "chronyd"); !equalStrings(got, []string{"-d", "-x", "-f", "/etc/chrony/chrony.conf"}) {
-		t.Errorf("chronyd args = %v", got)
+	// -f names the GENERATED configuration, never the baked-in template:
+	// the template's signing-socket directory is only a default, and a
+	// chronyd pointed at the template would ignore the rewrite entirely.
+	if got := r.argsOf(t, "start", "chronyd"); !equalStrings(got, []string{"-d", "-x", "-f", e.ChronyConf}) {
+		t.Errorf("chronyd args = %v, want -f %s (the generated configuration)", got, e.ChronyConf)
+	}
+	if e.ChronyConf == e.ChronyTemplate {
+		t.Fatal("the test executor points the generated configuration at the template")
 	}
 	if got := r.argsOf(t, "start", "samba"); !equalStrings(got, []string{"--foreground", "--no-process-group", "--debug-stdout", "-d", "3"}) {
 		t.Errorf("samba args = %v", got)
@@ -866,7 +915,7 @@ func TestSuperviseSignalStopsSambaBeforeChrony(t *testing.T) {
 
 	<-ready
 	// Wait until both daemons are up before asking for a shutdown.
-	waitFor(t, func() bool { return len(r.names()) == 2 })
+	waitFor(t, func() bool { return len(r.names()) == 3 })
 	sigCh <- syscall.SIGTERM
 
 	select {
@@ -900,7 +949,7 @@ func supervising(t *testing.T, ctx context.Context, e *Executor, r *fakeRunner, 
 	done := make(chan *config.Refusal, 1)
 	go func() { done <- e.Supervise(ctx, cfg) }()
 	<-ready
-	waitFor(t, func() bool { return len(r.names()) == 2 })
+	waitFor(t, func() bool { return len(r.names()) == 3 })
 	return sigCh, done
 }
 
@@ -1132,6 +1181,15 @@ func TestSuperviseSignalWithRealProcesses(t *testing.T) {
 	}
 	defer out.Close()
 
+	// A real stand-in for testparm as well: this is the only test that
+	// forks real processes, so it is also the one place where the chrony
+	// configuration is generated from a value that came back over a real
+	// pipe rather than out of a scripted fake.
+	testparm := filepath.Join(dir, "testparm.sh")
+	if err := os.WriteFile(testparm, []byte("#!/bin/sh\necho "+customSigndDir+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	started := make(chan struct{}, 4)
 	base := NewExecRunner(out, out)
 	r := &countingRunner{Runner: base, started: started}
@@ -1139,7 +1197,15 @@ func TestSuperviseSignalWithRealProcesses(t *testing.T) {
 	e := New(r)
 	e.Root = t.TempDir()
 	e.Log = out
-	e.Bin = Binaries{SambaTool: "/bin/true", Samba: sleeper("samba"), Chronyd: sleeper("chronyd"), Smbclient: "/bin/true"}
+	e.Bin = Binaries{
+		SambaTool: "/bin/true", Samba: sleeper("samba"), Chronyd: sleeper("chronyd"),
+		Smbclient: "/bin/true", Testparm: testparm,
+	}
+	e.ChronyTemplate = filepath.Join(dir, "chrony.conf")
+	if err := os.WriteFile(e.ChronyTemplate, []byte(chronyTemplateContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.ChronyConf = filepath.Join(e.Root, "run", "chrony", "chrony.conf")
 	var sigCh chan<- os.Signal
 	ready := make(chan struct{})
 	e.Notify = func(c chan<- os.Signal, _ ...os.Signal) { sigCh = c; close(ready) }
@@ -1178,6 +1244,16 @@ func TestSuperviseSignalWithRealProcesses(t *testing.T) {
 	if !equalStrings(got, []string{"samba", "chronyd"}) {
 		t.Errorf("shutdown order = %v, want [samba chronyd]", got)
 	}
+
+	// The configuration the real chronyd was handed: generated, and
+	// carrying the directory the real testparm stand-in reported.
+	generated, err := os.ReadFile(e.ChronyConf)
+	if err != nil {
+		t.Fatalf("the generated chrony configuration is missing: %v", err)
+	}
+	if want := ntpSigndDirective + " " + customSigndDir; !strings.Contains(string(generated), want) {
+		t.Errorf("generated chrony configuration does not carry %q:\n%s", want, generated)
+	}
 }
 
 // countingRunner announces each Start on a channel.
@@ -1190,6 +1266,178 @@ func (c *countingRunner) Start(ctx context.Context, name string, args ...string)
 	p, err := c.Runner.Start(ctx, name, args...)
 	c.started <- struct{}{}
 	return p, err
+}
+
+// ---------------------------------------------------------------------------
+// chrony configuration generation
+// ---------------------------------------------------------------------------
+
+// What this covers: an smb.conf that sets `ntp signd socket directory` to
+// anything but samba's default. /etc/samba is the operator's volume, and a
+// baked chrony.conf would keep naming the default — a socket samba never
+// creates on that DC — leaving signed NTP dead and silent, because chrony
+// opens the socket lazily, only when an authenticated request arrives.
+// Asking samba's own parser is what makes the two files agree.
+func TestChronyConfigFollowsTheDCsSigndSocketDirectory(t *testing.T) {
+	r := newFakeRunner()
+	r.output["testparm"] = customSigndDir + "\n"
+	e, logBuf := newTestExecutor(t, r)
+	if ref := e.makeRuntimeDirs(); ref != nil {
+		t.Fatalf("makeRuntimeDirs: %s", ref.Msg)
+	}
+
+	path, ref := e.chronyConfig(context.Background())
+	if ref != nil {
+		t.Fatalf("chronyConfig: %s", ref.Msg)
+	}
+	if path != e.ChronyConf {
+		t.Errorf("generated path = %q, want %q", path, e.ChronyConf)
+	}
+
+	// The value came from samba's own parser, over the documented flags.
+	// `-l` is pinned here because dropping it costs a restored DC its
+	// answer: the global logic checks fail on directories samba has not
+	// populated yet and testparm then exits non-zero (see testparmArgs).
+	if got := r.argsOf(t, "output", "testparm"); !equalStrings(got,
+		[]string{"-s", "-l", "--parameter-name=ntp signd socket directory", e.SMBConfPath}) {
+		t.Errorf("testparm args = %v", got)
+	}
+
+	got := readFile(t, path)
+	if want := ntpSigndDirective + " " + customSigndDir; !strings.Contains(got, want) {
+		t.Errorf("generated configuration does not carry %q:\n%s", want, got)
+	}
+	if strings.Contains(got, provisionedSigndDir) {
+		t.Errorf("the template's default directory survived the rewrite:\n%s", got)
+	}
+	// Everything else is copied verbatim — the absolute drift and pid
+	// paths in particular, which the generated file's new location must
+	// not disturb.
+	for _, line := range []string{
+		"user root",
+		"driftfile /var/lib/samba/chrony/drift",
+		"pidfile /run/chrony/chronyd.pid",
+		"local stratum 10",
+	} {
+		if !strings.Contains(got, line) {
+			t.Errorf("generated configuration lost %q:\n%s", line, got)
+		}
+	}
+	// The template itself is never written to: /etc is read-only (B.2).
+	if tmpl := readFile(t, e.ChronyTemplate); tmpl != chronyTemplateContent {
+		t.Errorf("the baked template was modified:\n%s", tmpl)
+	}
+	if !strings.Contains(logBuf.String(), customSigndDir) {
+		t.Errorf("the rewrite was not announced to the operator:\n%s", logBuf.String())
+	}
+}
+
+// The fallback. testparm is the only source for this value, so what
+// happens when it does not answer decides whether an unreadable
+// configuration costs the DC its time service or merely its certainty.
+func TestChronyConfigFallsBackToTheTemplateValue(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+		err    error
+	}{
+		{name: "testparm fails", err: errors.New("exit status 1")},
+		{name: "empty answer", output: "\n"},
+		{name: "not a path", output: "Loaded services file OK.\n"},
+		{name: "several lines", output: "/var/lib/samba/ntp_signd\nWARNING\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newFakeRunner()
+			r.output["testparm"] = tc.output
+			r.outputErr["testparm"] = tc.err
+			e, logBuf := newTestExecutor(t, r)
+			if ref := e.makeRuntimeDirs(); ref != nil {
+				t.Fatalf("makeRuntimeDirs: %s", ref.Msg)
+			}
+
+			path, ref := e.chronyConfig(context.Background())
+			if ref != nil {
+				t.Fatalf("a testparm that does not answer must not stop the time service, got refusal %d: %s", ref.Code, ref.Msg)
+			}
+			if got := readFile(t, path); got != chronyTemplateContent {
+				t.Errorf("the template was not copied verbatim:\n%s", got)
+			}
+			if !strings.Contains(logBuf.String(), "baked into the image") {
+				t.Errorf("the fallback was not announced to the operator:\n%s", logBuf.String())
+			}
+		})
+	}
+}
+
+func TestChronyConfigRefusesWhenTheTemplateIsMissing(t *testing.T) {
+	r := newFakeRunner()
+	e, _ := newTestExecutor(t, r)
+	e.ChronyTemplate = filepath.Join(t.TempDir(), "absent.conf")
+
+	_, ref := e.chronyConfig(context.Background())
+	if ref == nil || ref.Code != config.CodeRuntimeFailure {
+		t.Fatalf("refusal = %v, want code %d", ref, config.CodeRuntimeFailure)
+	}
+	if !strings.Contains(ref.Msg, "SAMBA_CHRONY=off") {
+		t.Errorf("the refusal names no way forward: %s", ref.Msg)
+	}
+}
+
+// withNTPSigndSocket is the pure half: it must rewrite the directive and
+// nothing else, and generating the same file twice must produce the same
+// bytes.
+func TestWithNTPSigndSocket(t *testing.T) {
+	tests := []struct {
+		name        string
+		conf        string
+		dir         string
+		want        string
+		wantChanged bool
+	}{
+		{
+			name:        "rewrites the directive in place",
+			conf:        "# c\nntpsigndsocket /var/lib/samba/ntp_signd\nuser root\n",
+			dir:         customSigndDir,
+			want:        "# c\nntpsigndsocket " + customSigndDir + "\nuser root\n",
+			wantChanged: true,
+		},
+		{
+			name:        "idempotent when it already agrees",
+			conf:        "ntpsigndsocket " + customSigndDir + "\nuser root\n",
+			dir:         customSigndDir,
+			want:        "ntpsigndsocket " + customSigndDir + "\nuser root\n",
+			wantChanged: false,
+		},
+		{
+			name:        "appends when the directive is absent",
+			conf:        "user root\n",
+			dir:         customSigndDir,
+			want:        "user root\nntpsigndsocket " + customSigndDir + "\n",
+			wantChanged: true,
+		},
+		{
+			name:        "a commented directive is not the directive",
+			conf:        "# ntpsigndsocket /nowhere\n",
+			dir:         customSigndDir,
+			want:        "# ntpsigndsocket /nowhere\nntpsigndsocket " + customSigndDir + "\n",
+			wantChanged: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := withNTPSigndSocket(tc.conf, tc.dir)
+			if got != tc.want {
+				t.Errorf("result =\n%q\nwant\n%q", got, tc.want)
+			}
+			if changed != tc.wantChanged {
+				t.Errorf("changed = %v, want %v", changed, tc.wantChanged)
+			}
+			// Idempotence: a second pass over the result changes nothing.
+			if again, changed := withNTPSigndSocket(got, tc.dir); changed || again != got {
+				t.Errorf("second pass changed the file (changed=%v):\n%q", changed, again)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,6 +1920,16 @@ func TestExecRunnerStartMissingBinary(t *testing.T) {
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
+
+// readFile returns the contents of path, failing the test if it cannot.
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(data)
+}
 
 // equalStrings compares two string slices element by element.
 func equalStrings(a, b []string) bool {

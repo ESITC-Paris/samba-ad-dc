@@ -48,10 +48,29 @@ const dcFunctionalLevelKey = "ad dc functional level"
 // break Kerberos.
 const dnsForwarderKey = "dns forwarder"
 
+// ntpSigndDirKey is the smb.conf parameter naming the directory samba
+// creates the MS-SNTP signing socket in, and ntpSigndDirective is the
+// chrony.conf directive that has to name the SAME directory or the signing
+// hand-off silently does nothing. Nothing in samba or in chrony reconciles
+// the two: see chronyConfig for who does.
+const (
+	ntpSigndDirKey    = "ntp signd socket directory"
+	ntpSigndDirective = "ntpsigndsocket"
+)
+
 // Default paths and programs.
 const (
-	defaultSMBConf    = "/etc/samba/smb.conf"
-	defaultChronyConf = "/etc/chrony/chrony.conf"
+	defaultSMBConf = "/etc/samba/smb.conf"
+	// defaultChronyTemplate is the chrony configuration baked into the
+	// image. It is a TEMPLATE, not the file chronyd reads: everything in
+	// it is final except the ntpsigndsocket directive, which is rewritten
+	// per boot from the DC's own smb.conf.
+	defaultChronyTemplate = "/etc/chrony/chrony.conf"
+	// defaultChronyConf is the effective configuration, generated from
+	// that template before chronyd starts. It lives under /run because the
+	// root filesystem is read-only (B.2) and /run is the tmpfs the
+	// entrypoint already creates.
+	defaultChronyConf = "/run/chrony/chrony.conf"
 	defaultRoot       = "/"
 	// defaultShutdownGrace is the TOTAL an orderly stop may take: samba and
 	// chrony together, SIGTERM phase and SIGKILL escalation included (§6.3:
@@ -79,6 +98,7 @@ type Binaries struct {
 	Samba     string
 	Chronyd   string
 	Smbclient string
+	Testparm  string
 }
 
 // DefaultBinaries resolves the programs through PATH, as the image installs
@@ -89,6 +109,7 @@ func DefaultBinaries() Binaries {
 		Samba:     "samba",
 		Chronyd:   "chronyd",
 		Smbclient: "smbclient",
+		Testparm:  "testparm",
 	}
 }
 
@@ -97,33 +118,35 @@ func DefaultBinaries() Binaries {
 // the filesystem root, the clock and the signal plumbing. Production uses the
 // defaults from New; tests replace the parts they need to observe.
 type Executor struct {
-	Runner        Runner
-	Bin           Binaries
-	Root          string // filesystem root under which runtime dirs are made
-	SMBConfPath   string
-	ChronyConf    string
-	Now           func() time.Time
-	Log           io.Writer
-	Notify        func(c chan<- os.Signal, sig ...os.Signal)
-	Stop          func(c chan<- os.Signal)
-	ShutdownGrace time.Duration
-	KillGrace     time.Duration
+	Runner         Runner
+	Bin            Binaries
+	Root           string // filesystem root under which runtime dirs are made
+	SMBConfPath    string
+	ChronyTemplate string // baked-in template, read
+	ChronyConf     string // generated effective config, written, and what chronyd reads
+	Now            func() time.Time
+	Log            io.Writer
+	Notify         func(c chan<- os.Signal, sig ...os.Signal)
+	Stop           func(c chan<- os.Signal)
+	ShutdownGrace  time.Duration
+	KillGrace      time.Duration
 }
 
 // New returns an Executor wired for the container.
 func New(r Runner) *Executor {
 	return &Executor{
-		Runner:        r,
-		Bin:           DefaultBinaries(),
-		Root:          defaultRoot,
-		SMBConfPath:   defaultSMBConf,
-		ChronyConf:    defaultChronyConf,
-		Now:           time.Now,
-		Log:           os.Stdout,
-		Notify:        signal.Notify,
-		Stop:          signal.Stop,
-		ShutdownGrace: defaultShutdownGrace,
-		KillGrace:     defaultKillGrace,
+		Runner:         r,
+		Bin:            DefaultBinaries(),
+		Root:           defaultRoot,
+		SMBConfPath:    defaultSMBConf,
+		ChronyTemplate: defaultChronyTemplate,
+		ChronyConf:     defaultChronyConf,
+		Now:            time.Now,
+		Log:            os.Stdout,
+		Notify:         signal.Notify,
+		Stop:           signal.Stop,
+		ShutdownGrace:  defaultShutdownGrace,
+		KillGrace:      defaultKillGrace,
 	}
 }
 
@@ -424,6 +447,108 @@ func (e *Executor) ensureJoinedConf(cfg *config.Config) *config.Refusal {
 	return nil
 }
 
+// chronyConfig generates the configuration chronyd will actually read and
+// returns its path.
+//
+// The file baked into the image is a template, and this is why. chrony has
+// to be pointed at the directory samba creates the MS-SNTP signing socket
+// in, and that directory is not the image's to decide: `ntp signd socket
+// directory` is an ordinary smb.conf parameter, and /etc/samba is a volume
+// an operator owns. Nothing in samba or in chrony reconciles the two files,
+// so the day someone sets that parameter a chrony.conf carrying the
+// compile-time default names a socket samba never creates — and says
+// nothing about it, because chrony opens that socket lazily, only when a
+// request carrying an authenticator arrives. A time service whose signing
+// fails in silence is the one failure mode this must not have.
+//
+// So the value is not assumed, it is ASKED: `testparm` is samba's own
+// parser reading samba's own configuration, which makes the generated file
+// agree with the running DC by construction rather than by coincidence.
+//
+// To be clear about what this does NOT fix, because the restore path was
+// suspected and measured: `samba-tool domain backup restore` relocates
+// `state directory`, `cache directory`, `lock directory` and sysvol under
+// /var/lib/samba/state, but it leaves this parameter unset, and samba's
+// compile-time default for it does not track `state directory`. A restored
+// DC keeps the signing socket exactly where a provisioned one does.
+//
+// Everything else in the template is copied verbatim, the absolute
+// driftfile and pidfile paths included: they are unaffected by where the
+// generated file sits.
+func (e *Executor) chronyConfig(ctx context.Context) (string, *config.Refusal) {
+	tmplPath, outPath := e.chronyTemplate(), e.chronyConfPath()
+
+	data, err := os.ReadFile(tmplPath)
+	if err != nil {
+		return "", config.Refuse(config.CodeRuntimeFailure,
+			"the chrony configuration template %q cannot be read (%s); it is part of the image, so this is an image or mount fault — set SAMBA_CHRONY=off to run without the MS-SNTP time service",
+			tmplPath, oneLine(err.Error()))
+	}
+
+	conf := string(data)
+	if dir := e.ntpSigndDir(ctx); dir != "" {
+		updated, changed := withNTPSigndSocket(conf, dir)
+		if changed {
+			e.logf("chrony will use the signing socket directory this DC's smb.conf declares: %s %s", ntpSigndDirective, dir)
+		}
+		conf = updated
+	}
+
+	if err := writeFileAtomic(outPath, []byte(conf), 0o644); err != nil {
+		return "", config.Refuse(config.CodeRuntimeFailure,
+			"the chrony configuration %q cannot be written (%s); /run must be writable (mount it as tmpfs when the root filesystem is read-only), or set SAMBA_CHRONY=off",
+			outPath, oneLine(err.Error()))
+	}
+	return outPath, nil
+}
+
+// ntpSigndDir asks samba where it puts the MS-SNTP signing socket, and
+// returns "" when the answer cannot be trusted.
+//
+// "" is not a failure of the boot: it means the generated configuration
+// keeps the template's own value, which is samba's compile-time default and
+// therefore right on every DC that has not been told otherwise — the
+// overwhelming majority, and the best guess available when there is nothing
+// better. Losing the time service over a testparm that did not answer would
+// be a far worse trade than serving unsigned time — and the fallback is
+// logged, so an operator debugging signed NTP is not left guessing which
+// value is in force.
+func (e *Executor) ntpSigndDir(ctx context.Context) string {
+	out, err := e.Runner.Output(ctx, e.Bin.Testparm, testparmArgs(e.SMBConfPath, ntpSigndDirKey)...)
+	if err != nil {
+		e.logf("%q could not be read from %s (%s); chrony keeps the signing socket directory baked into the image",
+			ntpSigndDirKey, e.SMBConfPath, oneLine(err.Error()))
+		return ""
+	}
+	// testparm prints the value on stdout and its banner on stderr, but a
+	// future release printing one extra line must not turn into a chrony
+	// configuration pointing at a banner: only a lone absolute path is
+	// taken, anything else falls back.
+	dir := strings.TrimSpace(out)
+	if dir == "" || strings.ContainsAny(dir, "\n\r") || !strings.HasPrefix(dir, "/") {
+		e.logf("%s reported no usable %q (%q); chrony keeps the signing socket directory baked into the image",
+			e.Bin.Testparm, ntpSigndDirKey, oneLine(dir))
+		return ""
+	}
+	return dir
+}
+
+// chronyTemplate is the baked-in template path, defaulted.
+func (e *Executor) chronyTemplate() string {
+	if e.ChronyTemplate == "" {
+		return defaultChronyTemplate
+	}
+	return e.ChronyTemplate
+}
+
+// chronyConfPath is the generated configuration's path, defaulted.
+func (e *Executor) chronyConfPath() string {
+	if e.ChronyConf == "" {
+		return defaultChronyConf
+	}
+	return e.ChronyConf
+}
+
 // Supervise starts chronyd (when enabled) and then samba in the foreground,
 // and stays until one of them ends or the container is asked to stop. A
 // signal stops samba first and chronyd second: the directory should leave the
@@ -446,7 +571,11 @@ func (e *Executor) Supervise(ctx context.Context, cfg *config.Config) *config.Re
 	var chrony Proc
 	var chronyDone chan error
 	if cfg.Chrony {
-		p, err := e.Runner.Start(daemonCtx, e.Bin.Chronyd, chronyArgs(e.ChronyConf)...)
+		conf, ref := e.chronyConfig(ctx)
+		if ref != nil {
+			return ref
+		}
+		p, err := e.Runner.Start(daemonCtx, e.Bin.Chronyd, chronyArgs(conf)...)
 		if err != nil {
 			return config.Refuse(config.CodeRuntimeFailure,
 				"chronyd could not be started (%s); set SAMBA_CHRONY=off to run without the MS-SNTP time service, or fix the reported cause",
@@ -728,8 +857,64 @@ func sambaArgs(logLevel int) []string {
 // chronyArgs builds the chronyd command line: foreground with logging to
 // stderr (-d) and never stepping the clock (-x), because the container shares
 // the host's clock and must not try to discipline it (B.3).
+//
+// conf is the GENERATED configuration (chronyConfig), never the baked-in
+// template: the template's signing-socket directory is only a default.
 func chronyArgs(conf string) []string {
 	return []string{"-d", "-x", "-f", conf}
+}
+
+// testparmArgs builds the command line that reads one smb.conf parameter
+// back through samba's own parser.
+//
+//   - `-s` suppresses the "Press enter" prompt, which is what makes a bare
+//     testparm hang in a container.
+//   - `-l` skips the GLOBAL LOGIC CHECKS, and it is not optional here.
+//     Those checks verify that the directories smb.conf names already
+//     exist, and this command runs before the daemons do: on a DC restored
+//     from an offline backup, `state directory` and `cache directory` point
+//     into a tree samba has not populated yet, so testparm prints the
+//     requested value on stdout and then exits 1 ("ERROR: cache directory
+//     /var/lib/samba/cache does not exist" — observed). Reading one
+//     parameter is not validating a configuration; the checks are somebody
+//     else's job and their failure must not cost this one its answer.
+//   - the configuration file is named explicitly rather than left to the
+//     compiled-in default, so the entrypoint and samba can never read two
+//     different files.
+func testparmArgs(smbConf, parameter string) []string {
+	return []string{"-s", "-l", "--parameter-name=" + parameter, smbConf}
+}
+
+// withNTPSigndSocket returns conf with the ntpsigndsocket directive naming
+// dir, and says whether that changed anything. It is pure and idempotent:
+// generating the same configuration twice produces the same bytes.
+//
+// Only the directive line is touched. A directive that is missing entirely
+// is appended rather than assumed to be commented out somewhere — a chrony
+// configuration without it cannot sign anything, so adding it is the only
+// answer that leaves signed NTP working.
+func withNTPSigndSocket(conf, dir string) (string, bool) {
+	entry := ntpSigndDirective + " " + dir
+	lines := strings.Split(conf, "\n")
+	for i, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != ntpSigndDirective {
+			continue
+		}
+		if line == entry {
+			return conf, false
+		}
+		out := make([]string, len(lines))
+		copy(out, lines)
+		out[i] = entry
+		return strings.Join(out, "\n"), true
+	}
+
+	out := strings.TrimRight(conf, "\n")
+	if out != "" {
+		out += "\n"
+	}
+	return out + entry + "\n", true
 }
 
 // confEdit says what withGlobalSetting did to a file.

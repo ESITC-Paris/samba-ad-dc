@@ -407,41 +407,95 @@ func TestLDAPSCertificate(t *testing.T) {
 // undisciplined clock, fails here.
 func TestSignedNTPWiring(t *testing.T) {
 	f := provisionedDC(t)
-	const signdDir = "/var/lib/samba/ntp_signd"
+
+	// The two ends agree, and they agree on the directory THIS DC declares
+	// rather than on a constant — see assertSignedNTPWiring.
+	signdDir := assertSignedNTPWiring(t, f.DC.Name)
+	if signdDir != provisionedSigndDir {
+		t.Fatalf("a provisioned DC keeps the signing socket in %q, not %q",
+			provisionedSigndDir, signdDir)
+	}
+
+	// The generated configuration is a copy of the template, so the
+	// template's own value has to stay samba's default: it is what a DC
+	// gets when testparm cannot be read.
+	template := strings.TrimSpace(harness.Exec(t, f.DC.Name, "sh", "-c",
+		"grep '^ntpsigndsocket' "+chronyTemplatePath))
+	if template != "ntpsigndsocket "+provisionedSigndDir {
+		t.Fatalf("the baked template's fallback is %q, want %q",
+			template, "ntpsigndsocket "+provisionedSigndDir)
+	}
+
+	// And the service answers: a one-shot query (never disciplining the
+	// client's clock) that produces a measurement. Unauthenticated, per the
+	// boundary in this test's doc comment.
+	assertServesTime(t, f.Net, f.DC.IP)
+}
+
+// Where the MS-SNTP signing socket lives, and where the two configurations
+// that have to agree about it are. The generated file is what chronyd is
+// started with (`-f`); the template is only its fallback default.
+const (
+	provisionedSigndDir  = "/var/lib/samba/ntp_signd"
+	chronyTemplatePath   = "/etc/chrony/chrony.conf"
+	chronyGeneratedPath  = "/run/chrony/chrony.conf"
+	chronySigndDirective = "ntpsigndsocket"
+)
+
+// assertSignedNTPWiring asserts, on the named DC container, that samba is
+// serving the MS-SNTP signing socket in the directory its own smb.conf
+// declares and that the chrony configuration chronyd was started with names
+// that same directory. It returns the directory.
+//
+// Nothing in samba or in chrony reconciles those two files, which is why
+// asserting they agree is the point — and why the DC's OWN value is read
+// first instead of a constant being checked twice. `ntp signd socket
+// directory` is an smb.conf parameter on a volume the operator owns, so a
+// helper that hardcoded the default would pass on exactly the DCs where
+// nothing can go wrong and say nothing about the ones where it can.
+func assertSignedNTPWiring(t *testing.T, container string) string {
+	t.Helper()
+
+	// samba's effective configuration, read through its own parser — the
+	// same question the entrypoint asks when it generates chrony.conf.
+	signdDir := strings.TrimSpace(harness.Exec(t, container, "sh", "-c",
+		`testparm -s --parameter-name="ntp signd socket directory" 2>/dev/null`))
+	if !strings.HasPrefix(signdDir, "/") {
+		t.Fatalf("`ntp signd socket directory` on %s read back as %q, which is not a path", container, signdDir)
+	}
+
 	// samba names the socket after the service; asserting the exact path
 	// rather than "something socket-shaped is in the directory" is what makes
 	// a failure say which file is missing.
-	const signdSocket = signdDir + "/socket"
-
-	code, out := harness.ExecErr(t, f.DC.Name, "sh", "-c",
+	signdSocket := signdDir + "/socket"
+	code, out := harness.ExecErr(t, container, "sh", "-c",
 		"test -S "+signdSocket+" || { ls -l "+signdDir+"; exit 1; }")
 	if code != 0 {
 		t.Fatalf("%s is not a socket; samba is not serving MS-SNTP signing "+
 			"requests. Contents of %s:\n%s", signdSocket, signdDir, out)
 	}
 
-	// samba's effective configuration, read through its own parser.
-	got := strings.TrimSpace(harness.Exec(t, f.DC.Name, "sh", "-c",
-		`testparm -s --parameter-name="ntp signd socket directory" 2>/dev/null`))
-	if got != signdDir {
-		t.Fatalf("smb.conf `ntp signd socket directory` = %q, want %q", got, signdDir)
-	}
-
 	// ...and chrony's, which must name the same directory or the signing
-	// hand-off silently does nothing.
-	chronyConf := harness.Exec(t, f.DC.Name, "sh", "-c",
-		"grep '^ntpsigndsocket' /etc/chrony/chrony.conf")
-	if strings.TrimSpace(chronyConf) != "ntpsigndsocket "+signdDir {
-		t.Fatalf("chrony.conf ntpsigndsocket = %q, want %q",
-			strings.TrimSpace(chronyConf), signdDir)
+	// hand-off silently does nothing. The GENERATED file is read, because
+	// that is the one chronyd was started with.
+	generated := strings.TrimSpace(harness.Exec(t, container, "sh", "-c",
+		"grep '^"+chronySigndDirective+"' "+chronyGeneratedPath))
+	if want := chronySigndDirective + " " + signdDir; generated != want {
+		t.Fatalf("%s in %s = %q, want %q — chrony would hand signing requests "+
+			"to a socket samba never creates", chronySigndDirective, chronyGeneratedPath, generated, want)
 	}
+	return signdDir
+}
 
-	// And the service answers: a one-shot query (never disciplining the
-	// client's clock) that produces a measurement. Unauthenticated, per the
-	// boundary in this test's doc comment.
-	measured := harness.Client(t, f.Net, clientEnv(f), "sh", "-c",
-		`timeout 60 chronyd -Q -t 30 "server `+f.DC.IP+` iburst"`)
-	mustContain(t, "chronyd -Q against the DC", measured, "System clock wrong by")
+// assertServesTime asserts that a client on the domain network gets a usable
+// measurement out of the DC at ip: a one-shot chronyd that never disciplines
+// the client's clock. Unauthenticated, per the boundary in
+// TestSignedNTPWiring's doc comment.
+func assertServesTime(t *testing.T, net, ip string) {
+	t.Helper()
+	measured := harness.Client(t, net, map[string]string{harness.ClientDNSEnv: ip}, "sh", "-c",
+		`timeout 60 chronyd -Q -t 30 "server `+ip+` iburst"`)
+	mustContain(t, "chronyd -Q against the DC at "+ip, measured, "System clock wrong by")
 }
 
 // ---------------------------------------------------------------------

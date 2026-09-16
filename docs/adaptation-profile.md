@@ -204,6 +204,11 @@ actionable message; provision over existing state refused; run mode
 without state refused. All of the above executed on both architectures
 with the read-only rootfs configuration.
 
+Which test covers which clause is not left to the reader:
+[`docs/traceability.md`](traceability.md) carries the row-by-row mapping
+in both directions (§8.2), and `scripts/check-traceability.sh` fails CI
+when a test or a row exists without its counterpart.
+
 ### B.6 Known limitations (stated per §12.4)
 
 - **§6.7 shell-entrypoint exception: not required** — the entrypoint is Go
@@ -259,6 +264,48 @@ with the read-only rootfs configuration.
   needs a client authenticating as a domain machine account, which the
   protocol test-client is not. A regression in the signing path itself
   would therefore surface as a chrony log error rather than as a red test.
+- **A restored DC does not have a provisioned DC's layout.**
+  `samba-tool domain backup restore --targetdir=/var/lib/samba` writes a
+  self-contained tree and an `smb.conf` whose paths point *into* it, so a
+  restored DC keeps most of its state one level down. Measured on a restored
+  DC that had reached healthy (`TestOfflineBackupRestore`): `state directory
+  = /var/lib/samba/state`, `cache directory = /var/lib/samba/cache`, `lock
+  directory = /var/lib/samba`, sysvol at `/var/lib/samba/state/sysvol` and
+  netlogon under it.
+  - *What does not move:* the MS-SNTP signing socket. The restored `smb.conf`
+    does not set `ntp signd socket directory` at all, and samba's
+    compile-time default for it does not track `state directory`, so it stays
+    `/var/lib/samba/ntp_signd` — where a provisioned DC keeps it. This is
+    recorded explicitly because the opposite was assumed during Phase 3 and
+    is the natural conclusion to draw from the sysvol path; the measurement
+    says otherwise. Signed NTP on a restored DC is asserted end to end by
+    `TestOfflineBackupRestore` all the same.
+  - *The caveat that remains:* paths a human or a script learned from a
+    provisioned DC. samba itself is self-consistent — every path is read from
+    `smb.conf`, which the restore rewrote — so nothing inside the container
+    breaks. Operator documentation (Phase 5) must therefore derive locations
+    from `smb.conf` rather than hardcode them: sysvol via
+    `testparm -s --parameter-name="path" --section-name=sysvol` rather than
+    `/var/lib/samba/sysvol`, and likewise for the state and cache
+    directories. Any backup or GPO procedure that names a path must say
+    which of the two layouts it assumes.
+
+- **The rpc worker processes log a `reopen_one_log ... Read-only file
+  system` complaint per boot**, attempting to open their own files under
+  `/var/log/samba` (measured on a provision boot: 16 such failures —
+  `samba-dcerpcd`, `rpcd_classic`, `rpcd_winreg`, `rpcd_lsad`,
+  `rpcd_epmapper`, `rpcd_spoolss`, `rpcd_fsrvp`, `rpcd_mdssvc` — printed
+  as 32 lines, each being a debug header plus its message). Accepted as
+  cosmetic for v1: every real log line goes to stdout as §6.4 requires
+  (samba runs `--debug-stdout`), the directory is deliberately absent from
+  the writable set (B.2), and nothing is lost — the noise is the workers
+  *reporting* that they will keep logging to stdout. Silencing it is
+  deferred rather than attempted: the levers
+  (`logging = `, a tmpfs at `/var/log/samba`, per-process log files) all
+  redirect where diagnostics go, and the risk of quietly losing a class of
+  log lines outweighs the cosmetic gain. Revisit if upstream separates the
+  worker log-reopen path from the configured logging backend.
+
 - **No `nsupdate` in the image** (`bind9-dnsutils` is not installed).
   Dynamic DNS updates therefore run through
   `samba_dnsupdate --use-samba-tool`, which the entrypoint pins (Phase 2);
@@ -468,11 +515,36 @@ restarted into a half-initialized state.
 
 ### Time service
 
-`chronyd` is started with `-d -x -f /etc/chrony/chrony.conf`: `-x` so it
+`chronyd` is started with `-d -x -f /run/chrony/chrony.conf`: `-x` so it
 never disciplines the host's clock (B.3), `-d` so it logs to the
-container's stderr. The configuration is baked into the image (read-only
-rootfs) and wires `ntpsigndsocket /var/lib/samba/ntp_signd` for MS-SNTP
-signing; 123/udp is exposed. `SAMBA_CHRONY=off` runs the DC without it.
+container's stderr. 123/udp is exposed. `SAMBA_CHRONY=off` runs the DC
+without it.
+
+That configuration is **generated at daemon-start time**, not baked. The
+image bakes a *template* at `/etc/chrony/chrony.conf` (read-only rootfs);
+before starting the daemon the entrypoint copies it to
+`/run/chrony/chrony.conf` and rewrites the single line that cannot be a
+constant — `ntpsigndsocket` — to whatever this DC's own `smb.conf`
+declares as `ntp signd socket directory`, read back through `testparm`.
+The template's value (`/var/lib/samba/ntp_signd`, samba's compile-time
+default) is the fallback when `testparm` gives no usable answer, and the
+fallback is logged. Everything else in the template is copied verbatim,
+drift and pid paths included.
+
+The reason is that the directory is **not** the image's to decide: `ntp
+signd socket directory` is an ordinary `smb.conf` parameter and `/etc/samba`
+is a volume the operator owns. Nothing in samba or in chrony reconciles the
+two files, so a baked `chrony.conf` would keep naming samba's default on a
+DC whose `smb.conf` says otherwise — and say nothing about it, because
+chrony opens the signing socket lazily, only when a request carrying an
+authenticator arrives. Silent failure is the one failure mode a time service
+must not have, so the entrypoint asks rather than assumes.
+
+Note what this does *not* address, since the restore path was suspected and
+then measured: a DC restored with `samba-tool domain backup restore` keeps
+this socket exactly where a provisioned one does (B.6). The restore
+relocates state, cache, lock and sysvol, but leaves this parameter unset,
+and samba's default for it does not track `state directory`.
 
 ### In-container Kerberos
 
@@ -569,3 +641,31 @@ it is harmless: Kerberos falls back to its built-in defaults.
   not merely "did the bisection finish". CI confirmation on both
   architectures awaits the first `workflow_dispatch` run of
   `.github/workflows/capbisect.yml`.
+- 2026-09-16: Phase 3 final wave. **The chrony configuration becomes a
+  template, and a Phase 3 hypothesis is withdrawn.** The suspicion that
+  drove this change — that `samba-tool domain backup restore` moves the
+  MS-SNTP signing socket to `/var/lib/samba/state/ntp_signd`, leaving
+  signed NTP silently dead on every restored DC — was **falsified** by the
+  restore test itself: the restored `smb.conf` does not set `ntp signd
+  socket directory`, samba's compile-time default for it does not track
+  `state directory`, and the live socket sits at `/var/lib/samba/ntp_signd`
+  like a provisioned DC's. There was no restore bug. The change is retained
+  on a different and verifiable argument: that parameter is the operator's
+  to set on the `/etc/samba` volume, nothing reconciles `smb.conf` with
+  `chrony.conf`, and chrony opens the socket lazily — so a baked path fails
+  silently rather than loudly. The entrypoint therefore generates
+  `/run/chrony/chrony.conf` from the baked template before starting
+  chronyd, rewriting `ntpsigndsocket` to what this DC's own configuration
+  declares (read back with `testparm -s -l`, falling back to the template's
+  value and logging when it cannot be read), and starts chronyd with `-f`
+  on the generated file — see **Time service**. `TestSignedNTPWiring` and
+  `TestOfflineBackupRestore` both assert the two files agree on the DC's
+  own value and that the service answers. B.6 gains the restored-layout
+  entry, restated around what was measured: state, cache, lock and sysvol
+  relocate under `/var/lib/samba/state`, the signing socket does not, and
+  what needs the caveat is operator documentation, which must derive those
+  paths from `smb.conf` rather than hardcode them. B.6 also records the
+  accepted `reopen_one_log ... Read-only file system` noise from the
+  smbd/rpcd workers (cosmetic; all real logs go to stdout per §6.4;
+  silencing deferred because every lever risks losing diagnostics). B.5
+  gains a back-link to `docs/traceability.md`.
