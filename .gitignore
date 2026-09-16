@@ -7,6 +7,9 @@
 # override the modules' own go.sum files — the image build resolves
 # entrypoint/ alone and would never see it.
 go.work.sum
+# Python bytecode cache: `python3 -m unittest scripts/catalog_test.py`
+# imports the scripts as modules and CPython writes it next to them.
+__pycache__/
 # Local scratch
 *.log
 .DS_Store

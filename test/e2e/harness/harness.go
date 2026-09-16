@@ -166,6 +166,44 @@ func Caps() []string {
 	if !ok {
 		return append([]string(nil), DefaultCaps...)
 	}
+	return parseCaps(v)
+}
+
+// RestoreCaps returns the capability set for the ONE-OFF container that
+// runs `samba-tool domain backup restore`, and whether E2E_RESTORE_CAPS
+// named one at all. Unset (ok == false) means "no override": the restore
+// container gets exactly what everything else gets.
+//
+// It exists because of a measured, branch-specific fact and covers
+// nothing else. On Samba 4.22.11 the restore's sysvol NT-ACL step fails
+// under the B.2 capability set with
+//
+//	py_smbd_mkdir: mkdirat error=13 (Permission denied)
+//
+// and `samba-tool domain backup restore` exits 255; the same restore
+// succeeds with DAC_OVERRIDE added, and needs no such thing on 4.23.12 or
+// 4.24.7 (measured locally, arm64, 2026-09-16). The ruling that follows
+// from that is deliberately narrow: the capability set a running DC is
+// tested under does NOT change on any branch, because nothing showed that
+// it must — what changes is the one short-lived container that performs a
+// restore, on the one branch that needs it. So this knob reaches the
+// restore one-off and nothing else: the backup one-off, the listing
+// one-off and every DC (including the restored one) keep Caps().
+//
+// Same parsing as E2E_CAPS, and the same meaning for a set-but-empty
+// value: no capabilities at all beyond the dropped-all baseline.
+func RestoreCaps() ([]string, bool) {
+	v, ok := os.LookupEnv("E2E_RESTORE_CAPS")
+	if !ok {
+		return nil, false
+	}
+	return parseCaps(v), true
+}
+
+// parseCaps turns a comma-separated capability list into the normalized
+// form docker is given. Empty entries are dropped, so a trailing comma or
+// a stray space cannot turn into a `--cap-add ` with nothing after it.
+func parseCaps(v string) []string {
 	var caps []string
 	for _, c := range strings.Split(v, ",") {
 		if c = strings.ToUpper(strings.TrimSpace(c)); c != "" {

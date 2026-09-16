@@ -381,10 +381,31 @@ func TestOfflineBackupRestore(t *testing.T) {
 		"cp /var/lib/samba/etc/smb.conf /etc/samba/smb.conf",
 	}, "\n")
 
-	code, logs = harness.RunDCExpectExit(t, net, restoreRunner, "", nil,
+	//
+	// FINDING 4 — on branch 4.22 this one container needs a capability the
+	// running DC does not. Samba 4.22.11's restore reaches the sysvol
+	// NT-ACL step through smbd and fails there with `py_smbd_mkdir:
+	// mkdirat error=13 (Permission denied)`, exiting 255, under the very
+	// capability set every other container in this suite runs green with;
+	// adding DAC_OVERRIDE makes it pass, and 4.23.12 and 4.24.7 need
+	// nothing added at all (measured locally, arm64, 2026-09-16). The
+	// capability set a *running DC* is tested under is therefore left
+	// alone on every branch — nothing showed it has to change — and the
+	// widening is scoped to this short-lived restore container, through
+	// E2E_RESTORE_CAPS, by the caller that knows which branch is under
+	// test (release.yml sets it for 4.22). Unset, which is the default and
+	// what 4.23/4.24 run with, changes nothing here.
+	restoreOpts := []harness.Opt{
 		harness.WithVolumes(stateVol, confVol),
 		harness.WithRunArgs("-v", backupVol+":"+backupDir+":ro"),
-		harness.WithEntrypoint("sh", "-c", restore))
+		harness.WithEntrypoint("sh", "-c", restore),
+	}
+	if caps, ok := harness.RestoreCaps(); ok {
+		t.Logf("restore container capability override in effect (E2E_RESTORE_CAPS): %v", caps)
+		restoreOpts = append(restoreOpts, harness.WithCaps(caps...))
+	}
+
+	code, logs = harness.RunDCExpectExit(t, net, restoreRunner, "", nil, restoreOpts...)
 	if code != 0 {
 		t.Fatalf("samba-tool domain backup restore: exit code = %d, want 0\n%s", code, logs)
 	}
