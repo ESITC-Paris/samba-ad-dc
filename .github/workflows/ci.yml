@@ -51,6 +51,15 @@ jobs:
           # would make that scan pass by construction.
           fetch-depth: 0
 
+      - name: Ensure PyYAML
+        # catalog.py hard-requires PyYAML (watch.py and cve-ledger.py reach
+        # it through catalog.py), and the hosted runner images do not
+        # guarantee it. Without this the first failure would be an
+        # ImportError from a step whose job is something else entirely.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || sudo apt-get install -y --no-install-recommends python3-yaml
+
       - name: gitleaks
         # SPEC §5.3: a credential that ever reached a commit is disclosed,
         # whether or not it survives to HEAD, so this is blocking (gitleaks
@@ -123,6 +132,13 @@ jobs:
         # neither Go nor docker — a mismatch is reported in seconds,
         # before an hour of image builds.
         run: sh scripts/check-traceability.sh
+
+      - name: Security-gate block identity
+        # The §5.3/§5.4 gates are one block of steps copied verbatim into
+        # release.yml, so a tag is gated by exactly what a pull request was
+        # gated by. That duplication only holds while something checks it:
+        # this compares the two copies byte for byte and prints the diff.
+        run: sh scripts/check-gate-block.sh
 
       - name: Python unit tests
         # scripts/catalog.py is what the release watcher edits versions.yaml
@@ -211,6 +227,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+
+      - name: Ensure PyYAML
+        # catalog.py hard-requires PyYAML (watch.py and cve-ledger.py reach
+        # it through catalog.py), and the hosted runner images do not
+        # guarantee it. Without this the first failure would be an
+        # ImportError from a step whose job is something else entirely.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || sudo apt-get install -y --no-install-recommends python3-yaml
 
       - name: Pin consistency
         run: sh scripts/check-pins-consistency.sh
@@ -337,6 +362,14 @@ jobs:
         # §5.4 exception ledger is written from. JSON because this artifact
         # is read by tools; the human-readable table is the gate's own
         # output.
+        env:
+          # The vulnerability database is pulled from ghcr.io, whose
+          # anonymous quota is per IP and therefore shared with every other
+          # job on the runner fleet. These make it an authenticated pull
+          # against this repository's own quota, the same way the watcher's
+          # advisory scan does it.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: samba-ad-dc:ci
@@ -367,6 +400,14 @@ jobs:
         # Those are handled by the ledger and its review clock (SPEC §5.4,
         # the last step of this block) and are all present, unfiltered, in
         # the artifact above.
+        env:
+          # The vulnerability database is pulled from ghcr.io, whose
+          # anonymous quota is per IP and therefore shared with every other
+          # job on the runner fleet. These make it an authenticated pull
+          # against this repository's own quota, the same way the watcher's
+          # advisory scan does it.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: samba-ad-dc:ci
@@ -384,6 +425,14 @@ jobs:
         # one reads the filesystem of the image that would be published. A
         # key written by a build step, or one inherited from a base image,
         # exists in neither the repository nor its history.
+        env:
+          # The vulnerability database is pulled from ghcr.io, whose
+          # anonymous quota is per IP and therefore shared with every other
+          # job on the runner fleet. These make it an authenticated pull
+          # against this repository's own quota, the same way the watcher's
+          # advisory scan does it.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: samba-ad-dc:ci

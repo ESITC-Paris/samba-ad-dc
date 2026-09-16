@@ -40,9 +40,10 @@ on:
 #   actions  - the triggering run is read from the event payload, never
 #              from the Actions API, so nothing here needs to read runs.
 permissions:
-  contents: read  # gh release view, for the published release notes
-  packages: read  # pull the published image from GHCR
-  issues: write   # the failure issue below
+  contents: read      # gh release view, for the published release notes
+  packages: read      # pull the published image from GHCR
+  attestations: read  # gh attestation verify reads the repo's attestations
+  issues: write       # the failure issue below
 
 concurrency:
   # Keyed on what is known before the first step runs, which is an

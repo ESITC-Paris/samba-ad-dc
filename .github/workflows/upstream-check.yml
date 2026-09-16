@@ -61,6 +61,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
 
+      - name: Ensure PyYAML
+        # catalog.py hard-requires PyYAML (watch.py and cve-ledger.py reach
+        # it through catalog.py), and the hosted runner images do not
+        # guarantee it. Without this the first failure would be an
+        # ImportError from a step whose job is something else entirely.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || sudo apt-get install -y --no-install-recommends python3-yaml
+
       - name: Set up Buildx
         # `docker buildx imagetools inspect` is how the base-image digests
         # and the published SBOMs are read: a registry query, no pull.

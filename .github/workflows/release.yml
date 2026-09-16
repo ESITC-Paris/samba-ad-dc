@@ -165,6 +165,15 @@ jobs:
           # Set on every checkout in this workflow for that reason.
           persist-credentials: false
 
+      - name: Ensure PyYAML
+        # catalog.py hard-requires PyYAML (watch.py and cve-ledger.py reach
+        # it through catalog.py), and the hosted runner images do not
+        # guarantee it. Without this the first failure would be an
+        # ImportError from a step whose job is something else entirely.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || sudo apt-get install -y --no-install-recommends python3-yaml
+
       - name: Resolve branch and pins from the catalog
         id: catalog
         env:
@@ -531,6 +540,15 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           persist-credentials: false
 
+      - name: Ensure PyYAML
+        # catalog.py hard-requires PyYAML (watch.py and cve-ledger.py reach
+        # it through catalog.py), and the hosted runner images do not
+        # guarantee it. Without this the first failure would be an
+        # ImportError from a step whose job is something else entirely.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || sudo apt-get install -y --no-install-recommends python3-yaml
+
       - name: Build arguments from the catalog
         run: |
           set -eu
@@ -734,6 +752,14 @@ jobs:
         # §5.4 exception ledger is written from. JSON because this artifact
         # is read by tools; the human-readable table is the gate's own
         # output.
+        env:
+          # The vulnerability database is pulled from ghcr.io, whose
+          # anonymous quota is per IP and therefore shared with every other
+          # job on the runner fleet. These make it an authenticated pull
+          # against this repository's own quota, the same way the watcher's
+          # advisory scan does it.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: samba-ad-dc:ci
@@ -764,6 +790,14 @@ jobs:
         # Those are handled by the ledger and its review clock (SPEC §5.4,
         # the last step of this block) and are all present, unfiltered, in
         # the artifact above.
+        env:
+          # The vulnerability database is pulled from ghcr.io, whose
+          # anonymous quota is per IP and therefore shared with every other
+          # job on the runner fleet. These make it an authenticated pull
+          # against this repository's own quota, the same way the watcher's
+          # advisory scan does it.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: samba-ad-dc:ci
@@ -781,6 +815,14 @@ jobs:
         # one reads the filesystem of the image that would be published. A
         # key written by a build step, or one inherited from a base image,
         # exists in neither the repository nor its history.
+        env:
+          # The vulnerability database is pulled from ghcr.io, whose
+          # anonymous quota is per IP and therefore shared with every other
+          # job on the runner fleet. These make it an authenticated pull
+          # against this repository's own quota, the same way the watcher's
+          # advisory scan does it.
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: samba-ad-dc:ci
@@ -972,6 +1014,15 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
           persist-credentials: false
+
+      - name: Ensure PyYAML
+        # catalog.py hard-requires PyYAML (watch.py and cve-ledger.py reach
+        # it through catalog.py), and the hosted runner images do not
+        # guarantee it. Without this the first failure would be an
+        # ImportError from a step whose job is something else entirely.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null \
+            || sudo apt-get install -y --no-install-recommends python3-yaml
 
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
