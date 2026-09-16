@@ -1,0 +1,1234 @@
+name: Release
+
+# The staging marker belongs in the run title: post-push-verify keys on the
+# ` (staging)` suffix to tell a rehearsal apart from a real publication, and
+# a human scanning the Actions list gets the same signal without opening
+# anything.
+run-name: "Release ${{ inputs.tag || github.ref_name }}${{ (inputs.staging && ' (staging)') || '' }}"
+
+on:
+  # A tag pushed by a human is a release. The watcher's tag does NOT arrive
+  # here: a ref created with a workflow's own GITHUB_TOKEN never triggers
+  # another workflow (GitHub's recursion guard), which is exactly why
+  # upstream-check.yml follows its push with an explicit
+  # `gh workflow run release.yml --ref <tag> -f tag=<tag>`. This trigger is
+  # kept for the human path, and the two paths must stay interchangeable:
+  # everything below reads `inputs.tag || github.ref_name`.
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (vX.Y.Z-rN)'
+        required: true
+        type: string
+      trigger_cause:
+        description: 'Why this revision is published (goes into the release notes, §9bis)'
+        type: choice
+        default: manual
+        options: [samba-release, pkg-update, base-digest, manual, first-publication]
+      degraded_mode:
+        description: 'SPEC §9.6 degraded publication mode (security-driven builds only)'
+        type: choice
+        default: none
+        options: [none, emulated, staggered]
+      staggered_arch:
+        description: 'The architecture that IS available (emulated and staggered read it)'
+        type: choice
+        default: amd64
+        options: [amd64, arm64]
+      staging:
+        description: 'Rehearsal: publish to <image>-staging on GHCR only, no Release, no mirror'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write      # creates the GitHub Release
+  packages: write      # pushes to GHCR, and lists its tags for the upgrade test
+  id-token: write      # cosign keyless signing (OIDC)
+  attestations: write  # actions/attest-build-provenance
+  issues: write        # published / failed notifications
+
+# One run per tag, and never cancel one. A cancelled release can leave
+# untagged digests pushed and nothing signed, which is a state a human has
+# to read the logs to understand; queueing behind the previous run costs
+# minutes and leaves no such residue. Keyed on the tag rather than on the
+# workflow so two different branches can be published in parallel.
+concurrency:
+  group: "release-${{ inputs.tag || github.ref_name }}"
+  cancel-in-progress: false
+
+env:
+  # GHCR is the source of truth (SPEC §3.1); Docker Hub is a mirror and is
+  # skipped entirely when its credentials are absent. `vars.IMAGE_NAME` is
+  # the one knob a fork needs to publish under its own name.
+  GHCR_IMAGE: "ghcr.io/esitc-paris/${{ vars.IMAGE_NAME || 'samba-ad-dc' }}"
+  DOCKERHUB_IMAGE: "docker.io/esitcparis/${{ vars.IMAGE_NAME || 'samba-ad-dc' }}"
+
+# Every action is pinned to a full commit SHA; the trailing comment records
+# the tag that SHA was resolved from. The block above is what `merge` needs
+# — contents:write, packages:write, id-token:write — so a mutable tag on a
+# third-party action would be a direct path to a signed, published image.
+# `prepare` and `build` narrow it back down per job; only `merge` runs with
+# the full grant.
+#
+# Shape: `prepare` decides WHAT is published and refuses early; `build`
+# runs the complete §8 gate set natively per architecture and then pushes
+# its platform image BY DIGEST ONLY (untagged, invisible to any `docker
+# pull`); `merge` assembles the manifest lists, which is the first and only
+# moment a user-visible tag exists — and it only runs once every gate has
+# passed on every architecture the degraded mode requires.
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      # Reads: the tree at the tag, and GHCR's tag list (both for the
+      # immutability check and for the upgrade references). It writes
+      # nothing anywhere.
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+      checkout_ref: ${{ steps.tag.outputs.checkout_ref }}
+      staging: ${{ steps.tag.outputs.staging }}
+      branch: ${{ steps.catalog.outputs.branch }}
+      is_default: ${{ steps.catalog.outputs.is_default }}
+      aliases: ${{ steps.catalog.outputs.aliases }}
+      samba_version: ${{ steps.catalog.outputs.samba_version }}
+      tarball_sha256: ${{ steps.catalog.outputs.tarball_sha256 }}
+      builder_base: ${{ steps.catalog.outputs.builder_base }}
+      runtime_base: ${{ steps.catalog.outputs.runtime_base }}
+      gobuild_base: ${{ steps.catalog.outputs.gobuild_base }}
+      base_name: ${{ steps.catalog.outputs.base_name }}
+      base_digest: ${{ steps.catalog.outputs.base_digest }}
+      pkg_index_hash: ${{ steps.catalog.outputs.pkg_index_hash }}
+      vcs_ref: ${{ steps.catalog.outputs.vcs_ref }}
+      created: ${{ steps.catalog.outputs.created }}
+      ghcr_image: ${{ steps.target.outputs.ghcr_image }}
+      build_matrix: ${{ steps.target.outputs.build_matrix }}
+      expected_digests: ${{ steps.target.outputs.expected_digests }}
+      degraded_mode: ${{ steps.target.outputs.degraded_mode }}
+      pending_arch: ${{ steps.target.outputs.pending_arch }}
+      trigger_cause: ${{ steps.target.outputs.trigger_cause }}
+      mirror: ${{ steps.mirror.outputs.mirror }}
+      upgrade_from: ${{ steps.upgrade.outputs.upgrade_from }}
+      upgrade_from_prev: ${{ steps.upgrade.outputs.upgrade_from_prev }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          RAW_TAG: ${{ inputs.tag || github.ref_name }}
+          STAGING: ${{ inputs.staging || false }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_REF: ${{ github.ref_name }}
+        run: |
+          set -eu
+          # Shape first, before anything checks out a ref this run was
+          # handed. catalog.py re-validates the same pattern and also
+          # cross-checks it against versions.yaml, but that needs a working
+          # tree, and fetching one is precisely what this guard runs ahead
+          # of.
+          if ! printf '%s' "${RAW_TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$'; then
+            echo "::error::bad tag format: ${RAW_TAG} (expected vX.Y.Z-rN)"
+            exit 1
+          fi
+
+          # A staging rehearsal is dispatched BEFORE the tag exists — that is
+          # the point of it: it proves the pipeline against the tree main is
+          # about to tag. A real publication builds the tag and nothing else,
+          # so that what was gated and what was signed are the same commit.
+          checkout_ref="${RAW_TAG}"
+          if [ "${STAGING}" = "true" ] && [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            checkout_ref="${DISPATCH_REF}"
+          fi
+          echo "tag=${RAW_TAG} staging=${STAGING} checkout=${checkout_ref}"
+          {
+            echo "tag=${RAW_TAG}"
+            echo "image_tag=${RAW_TAG#v}"
+            echo "checkout_ref=${checkout_ref}"
+            echo "staging=${STAGING}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.checkout_ref }}
+          # No job here pushes with git — the tag already exists and the
+          # Release is created through the API — so leaving a credential in
+          # .git/config would only widen what a compromised step can reach.
+          # Set on every checkout in this workflow for that reason.
+          persist-credentials: false
+
+      - name: Resolve branch and pins from the catalog
+        id: catalog
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          # `branch-of-tag` refuses unless the catalog entry's samba_version
+          # AND revision both agree with the tag, so this single call is the
+          # whole tag↔tree cross-check: a tag pointing at a tree that pins a
+          # different version cannot get past it.
+          branch=$(python3 scripts/catalog.py branch-of-tag "${TAG}")
+
+          # Every pin below comes from `catalog.py get <branch> …` and NOT
+          # from `check-pins-consistency.sh --print`: that script asserts the
+          # Dockerfile's ARG defaults against the DEFAULT branch, and this
+          # workflow publishes any of the catalog's branches.
+          get() { python3 scripts/catalog.py get "${branch}" "$1"; }
+          runtime_base=$(get base.runtime)
+
+          # BASE_NAME and BASE_DIGEST feed the two OCI base-image labels and
+          # are split out of the runtime ref rather than stored a second
+          # time — the same derivation check-pins-consistency.sh makes for
+          # the default branch.
+          default_branch=$(python3 scripts/catalog.py default)
+          is_default=false
+          if [ "${branch}" = "${default_branch}" ]; then
+            is_default=true
+          fi
+
+          # The alias list is catalog.py's decision, including the rule that
+          # `X` and `latest` belong to the default branch alone. Carried as
+          # JSON because a GITHUB_OUTPUT value is a single line.
+          aliases=$(python3 scripts/catalog.py aliases "${branch}" \
+            | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')
+
+          # The commit actually checked out, not github.sha: on a staging
+          # dispatch those differ, and the image's revision label must name
+          # the tree it was built from.
+          vcs_ref=$(git rev-parse HEAD)
+          # One timestamp for the whole run, resolved here so both
+          # architectures label the same instant — two `date` calls on two
+          # runners would not.
+          created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          echo "branch=${branch} (default: ${default_branch}) aliases=${aliases}"
+          {
+            echo "branch=${branch}"
+            echo "is_default=${is_default}"
+            echo "aliases=${aliases}"
+            echo "samba_version=$(get samba_version)"
+            echo "tarball_sha256=$(get tarball_sha256)"
+            echo "builder_base=$(get base.builder)"
+            echo "runtime_base=${runtime_base}"
+            echo "gobuild_base=$(get base.gobuild)"
+            echo "base_name=${runtime_base%@*}"
+            echo "base_digest=${runtime_base#*@}"
+            echo "pkg_index_hash=$(get pkg_index_hash)"
+            echo "vcs_ref=${vcs_ref}"
+            echo "created=${created}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publication target and degraded mode
+        id: target
+        env:
+          STAGING: ${{ steps.tag.outputs.staging }}
+          DEGRADED_MODE: ${{ inputs.degraded_mode || 'none' }}
+          STAGGERED_ARCH: ${{ inputs.staggered_arch || 'amd64' }}
+          TRIGGER_CAUSE: ${{ inputs.trigger_cause || 'manual' }}
+        run: |
+          set -eu
+          image="${GHCR_IMAGE}"
+          if [ "${STAGING}" = "true" ]; then
+            # A rehearsal publishes to a different PACKAGE, not to a
+            # different tag of the real one: nothing it does can collide
+            # with — or be mistaken for — a publication, and the
+            # immutability check below has nothing left to protect.
+            image="${GHCR_IMAGE}-staging"
+          fi
+
+          # The complement of the available architecture: the one Mode 1
+          # builds under emulation and Mode 2 leaves unpublished. It is what
+          # the §9.6 disclosure in the release notes names.
+          pending_arch=arm64
+          if [ "${STAGGERED_ARCH}" = "arm64" ]; then
+            pending_arch=amd64
+          fi
+
+          # The build matrix is computed here rather than declared in the
+          # job, because a job-level `if:` is evaluated once for the whole
+          # matrix and cannot skip a single leg. Emitting the legs means the
+          # skipped architecture never appears as a green "skipped" job that
+          # reads like it ran, and it gives `merge` the exact number of
+          # platform digests to insist on.
+          build_matrix=$(python3 - <<'PY'
+          import json
+          import os
+
+          mode = os.environ["DEGRADED_MODE"]
+          available = os.environ["STAGGERED_ARCH"]
+          native = (("amd64", "ubuntu-24.04"), ("arm64", "ubuntu-24.04-arm"))
+          # The emulated leg runs on a runner of the architecture that IS
+          # available — which is amd64 in the incident this mode was written
+          # for (the arm64 pool queueing), but not by definition: naming the
+          # amd64 runner outright would put an emulated amd64 build on the
+          # very pool that was declared unavailable.
+          host = dict(native)[available]
+
+          legs = []
+          for arch, runner in native:
+              # Mode 2: the unavailable architecture is not built at all.
+              if mode == "staggered" and arch != available:
+                  continue
+              # Mode 1: it is built under QEMU on the surviving pool. Same
+              # steps, same gates — §9.6 waives none of them.
+              emulated = mode == "emulated" and arch != available
+              legs.append({
+                  "arch": arch,
+                  "runner": host if emulated else runner,
+                  "emulated": emulated,
+              })
+          print(json.dumps({"include": legs}, separators=(",", ":")))
+          PY
+          )
+          expected_digests=$(printf '%s' "${build_matrix}" \
+            | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["include"]))')
+
+          echo "target=${image} mode=${DEGRADED_MODE} legs=${expected_digests}"
+          echo "matrix=${build_matrix}"
+          {
+            echo "ghcr_image=${image}"
+            echo "build_matrix=${build_matrix}"
+            echo "expected_digests=${expected_digests}"
+            echo "degraded_mode=${DEGRADED_MODE}"
+            echo "pending_arch=${pending_arch}"
+            echo "trigger_cause=${TRIGGER_CAUSE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Docker Hub mirror availability
+        id: mirror
+        env:
+          # Evaluated as an expression into a plain boolean: the secret's
+          # value never enters a shell, only the answer to "is it set".
+          SECRETS_PRESENT: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+          STAGING: ${{ steps.tag.outputs.staging }}
+        run: |
+          set -eu
+          # One output, one meaning: "the Docker Hub mirror runs". A missing
+          # credential is a warning and not a failure — GHCR is the source
+          # of truth and a release without a mirror is complete.
+          mirror="${SECRETS_PRESENT}"
+          if [ "${SECRETS_PRESENT}" != "true" ]; then
+            echo "::warning::DOCKERHUB_USERNAME and/or DOCKERHUB_TOKEN is unset" \
+              "- the Docker Hub mirror is skipped; GHCR remains the source of truth"
+          fi
+          if [ "${STAGING}" = "true" ]; then
+            mirror=false
+            echo "staging rehearsal: the Docker Hub mirror is skipped unconditionally"
+          fi
+          echo "mirror=${mirror}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag immutability (SPEC §3.2)
+        if: steps.tag.outputs.staging != 'true'
+        env:
+          IMAGE: ${{ steps.target.outputs.ghcr_image }}
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+        run: |
+          set -eu
+          # §3.2: a published X.Y.Z-rN is never amended in place. The gate is
+          # the inspect FAILING — if the tag resolves, this run would
+          # overwrite it. The GHCR login above is what makes that failure
+          # mean "not published": anonymously, a private or not-yet-created
+          # package answers 401 too, which would turn the check into a pass
+          # by construction.
+          if docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}" > /dev/null 2>&1; then
+            echo "::error::${IMAGE}:${IMAGE_TAG} is already published; tags are immutable" \
+              "(SPEC §3.2) - bump the revision instead"
+            exit 1
+          fi
+          echo "${IMAGE}:${IMAGE_TAG} is free"
+
+      - name: Resolve upgrade references
+        id: upgrade
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.catalog.outputs.branch }}
+          # Always the real package, never the staging one: the upgrade test
+          # asks whether a domain created by the last PUBLISHED image
+          # survives this candidate, and a rehearsal has to answer the same
+          # question a publication does.
+          IMAGE: ${{ env.GHCR_IMAGE }}
+          PACKAGE: ${{ vars.IMAGE_NAME || 'samba-ad-dc' }}
+        run: |
+          set -eu
+          # The org path is lowercase and spelled out: GHCR package paths are
+          # case-sensitive, and github.repository_owner carries the
+          # display-cased `ESITC-Paris`.
+          tags=$(gh api "/orgs/esitc-paris/packages/container/${PACKAGE}/versions" \
+            --paginate --jq '.[].metadata.container.tags[]' 2>/dev/null || true)
+          if [ -z "${tags}" ]; then
+            echo "::warning::no published tag found for ${PACKAGE} on GHCR" \
+              "(first publication, or the package listing is not readable) - the upgrade tests will skip"
+          fi
+
+          # The highest X.Y.Z-rN of one branch. Sorted on the two numbers
+          # that vary within a branch (patch, then revision), numerically, so
+          # r10 cannot sort below r2 the way a lexical or locale-dependent
+          # comparison would.
+          highest() {
+            prefix=$(printf '%s' "$1" | sed 's/\./\\./g')
+            printf '%s\n' "${tags}" \
+              | grep -E "^${prefix}\.[0-9]+-r[0-9]+$" \
+              | awk -F'[.-]' '{ printf "%d %d %s\n", $3, substr($4, 2), $0 }' \
+              | sort -k1,1n -k2,2n \
+              | tail -1 \
+              | awk '{ print $3 }'
+          }
+
+          upgrade_from=""
+          newest=$(highest "${BRANCH}")
+          if [ -n "${newest}" ]; then
+            upgrade_from="${IMAGE}:${newest}"
+          fi
+
+          # The catalog lists branches ascending, so the line before this one
+          # is the previous series. Empty when this is the oldest branch.
+          previous=$(python3 scripts/catalog.py branches \
+            | awk -v want="${BRANCH}" '$0 == want { print seen; exit } { seen = $0 }')
+          upgrade_from_prev=""
+          if [ -n "${previous}" ]; then
+            newest_prev=$(highest "${previous}")
+            if [ -n "${newest_prev}" ]; then
+              upgrade_from_prev="${IMAGE}:${newest_prev}"
+            fi
+          fi
+
+          echo "upgrade_from=${upgrade_from}"
+          echo "upgrade_from_prev=${upgrade_from_prev} (previous series: ${previous:-none})"
+          {
+            echo "upgrade_from=${upgrade_from}"
+            echo "upgrade_from_prev=${upgrade_from_prev}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }}${{ matrix.emulated && ' (emulated)' || '' }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    # The Samba build from source plus the full E2E suite, which provisions
+    # domains, joins a second DC and waits for replication to converge. CI's
+    # budget is 120 minutes on the same work; 150 here because a release run
+    # additionally pulls published images for two upgrade tests, and because
+    # the emulated leg (§9.6 Mode 1) runs all of it under QEMU.
+    timeout-minutes: 150
+    strategy:
+      # A release that fails on one architecture publishes nothing either
+      # way, so cancelling the other leg buys nothing and costs the answer
+      # to the only question a maintainer will have: is the other
+      # architecture affected too.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.build_matrix) }}
+    env:
+      SAMBA_VERSION: ${{ needs.prepare.outputs.samba_version }}
+      SAMBA_TARBALL_SHA256: ${{ needs.prepare.outputs.tarball_sha256 }}
+      BUILDER_BASE: ${{ needs.prepare.outputs.builder_base }}
+      RUNTIME_BASE: ${{ needs.prepare.outputs.runtime_base }}
+      GOBUILD_BASE: ${{ needs.prepare.outputs.gobuild_base }}
+      BASE_NAME: ${{ needs.prepare.outputs.base_name }}
+      BASE_DIGEST: ${{ needs.prepare.outputs.base_digest }}
+      PKG_INDEX_HASH: ${{ needs.prepare.outputs.pkg_index_hash }}
+      VCS_REF: ${{ needs.prepare.outputs.vcs_ref }}
+      CREATED: ${{ needs.prepare.outputs.created }}
+      # A no-op on a native leg and load-bearing on the emulated one (§9.6
+      # Mode 1): without it, every plain `docker pull` / `docker run` /
+      # `docker build` on that leg resolves the RUNNER's architecture, not
+      # the one under test. That would have the package-closure check
+      # compare an arm64 image against an amd64 base, and the upgrade tests
+      # start an amd64 published image on volumes an arm64 candidate then
+      # adopts - a cross-architecture upgrade nobody asked for. The buildx
+      # invocations below pass --platform explicitly and are unaffected.
+      DOCKER_DEFAULT_PLATFORM: linux/${{ matrix.arch }}
+    permissions:
+      # This job does not create a Release, does not sign and does not open
+      # issues; it pushes untagged digests and reads published ones. The
+      # workflow-level grant is what `merge` needs, and nothing forces the
+      # longest-running, most dependency-exposed job to hold it too.
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Build arguments from the catalog
+        run: |
+          set -eu
+          # Pin sanity, then one file both builds below read. An empty pin
+          # would not fail a build: it would silently fall back to the
+          # Dockerfile's ARG default, which is the DEFAULT branch's value —
+          # i.e. it would publish 4.24 content under a 4.22 tag. Absence is
+          # the failure mode worth guarding here.
+          #
+          # The file exists so that the image the gates run against and the
+          # image pushed by digest cannot differ by an argument; that
+          # identity is the whole content of the B.8 claim made at the push
+          # step.
+          : > "${RUNNER_TEMP}/build-args"
+          missing=0
+          for name in SAMBA_VERSION SAMBA_TARBALL_SHA256 BUILDER_BASE RUNTIME_BASE GOBUILD_BASE \
+                      BASE_NAME BASE_DIGEST PKG_INDEX_HASH VCS_REF CREATED; do
+            value=${!name:-}
+            if [ -z "${value}" ]; then
+              echo "::error::build argument ${name} is empty"
+              missing=$((missing + 1))
+            else
+              printf 'ok  %-22s = %s\n' "${name}" "${value}"
+              printf '%s=%s\n' "${name}" "${value}" >> "${RUNNER_TEMP}/build-args"
+            fi
+          done
+          [ "${missing}" -eq 0 ] || exit 1
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          # The toolchain is chosen by entrypoint/go.mod, so this step and
+          # the Dockerfile's gobuild stage cannot drift apart.
+          go-version-file: entrypoint/go.mod
+          cache-dependency-path: entrypoint/go.sum
+
+      - name: gofmt, vet and unit tests
+        working-directory: entrypoint
+        run: |
+          set -eu
+          # CI runs these in a job of its own; a release run has no such job
+          # to depend on, and a tag must not be gated by less than a pull
+          # request was. The same three gates the gobuild stage runs inside
+          # the image (SPEC §6.7), where a failure is buried in a 90-minute
+          # build instead of reported in seconds.
+          unformatted=$(gofmt -l .)
+          if [ -n "${unformatted}" ]; then
+            echo "::error::gofmt would rewrite: ${unformatted}"
+            exit 1
+          fi
+          go vet ./...
+          # -race here and not in the image build: the supervision and
+          # shutdown tests run real goroutines against real signals, and the
+          # runner has the cgo toolchain the detector needs.
+          go test -race ./...
+
+      - name: Set up QEMU
+        # §9.6 Mode 1 only, and only for the architecture that lost its
+        # native pool. Emulation changes where the build runs, not what runs:
+        # the steps below are the same steps, on the same public hosted
+        # infrastructure, with no gate waived — which is the condition §9.6
+        # attaches to Mode 1.
+        if: matrix.emulated
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+
+      - name: Set up Buildx
+        # The container driver is what makes `--sbom` and `--provenance`
+        # available at push time, and it keeps one builder — one cache — for
+        # both builds in this job.
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Build image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          # --platform is explicit even on a native runner: on the emulated
+          # leg it is what selects QEMU, and stating it on every leg means
+          # the two legs run the same command.
+          build_args=()
+          while IFS= read -r arg; do
+            build_args+=(--build-arg "${arg}")
+          done < "${RUNNER_TEMP}/build-args"
+          docker buildx build \
+            --platform "linux/${ARCH}" \
+            "${build_args[@]}" \
+            --load \
+            -t samba-ad-dc:ci .
+
+      - name: Smoke
+        run: |
+          # --entrypoint is required from Phase 2 on: the image's ENTRYPOINT
+          # is the Go state machine, which (correctly) refuses arguments it
+          # does not understand instead of running them.
+          expected="${SAMBA_VERSION}"
+          actual=$(docker run --rm --entrypoint samba samba-ad-dc:ci --version)
+          echo "${actual} (the catalog pins ${expected})"
+          case "${actual}" in
+            *"${expected}"*) ;;
+            *)
+              echo "::error::samba reports '${actual}', the catalog pins ${expected}"
+              exit 1
+              ;;
+          esac
+          docker run --rm --entrypoint samba-tool samba-ad-dc:ci --help > /dev/null
+
+          # The entrypoint's own report of the Samba version comes from the
+          # -ldflags injection in the gobuild stage; the version guard on the
+          # state volume is only as trustworthy as this value.
+          reported=$(docker run --rm samba-ad-dc:ci --version)
+          echo "${reported}"
+          case "${reported}" in
+            *"${expected}"*) ;;
+            *)
+              echo "::error::entrypoint reports '${reported}', the catalog pins ${expected}"
+              exit 1
+              ;;
+          esac
+
+          # An unconfigured container must refuse with the documented
+          # configuration exit code, not start something.
+          code=0
+          docker run --rm -e SAMBA_MODE=run samba-ad-dc:ci || code=$?
+          echo "run mode without a state volume exited ${code}"
+          if [ "${code}" -ne 21 ]; then
+            echo "::error::run mode without state exited ${code}, expected 21"
+            exit 1
+          fi
+
+      - name: Label assertion
+        run: |
+          # The OCI labels are the image's only self-description once it is
+          # pulled from a registry; a build-arg that silently stayed empty
+          # would ship a label with an empty value, which reads as "present"
+          # to anything that only checks for the key. Both are checked.
+          labels=$(docker inspect --format '{{json .Config.Labels}}' samba-ad-dc:ci)
+          echo "${labels}"
+          required=(
+            org.opencontainers.image.source
+            org.opencontainers.image.version
+            org.opencontainers.image.revision
+            org.opencontainers.image.licenses
+            org.opencontainers.image.description
+            org.opencontainers.image.created
+            org.opencontainers.image.base.name
+            org.opencontainers.image.base.digest
+            org.esitc-paris.spec-version
+          )
+          missing=0
+          for key in "${required[@]}"; do
+            value=$(printf '%s' "${labels}" | python3 -c \
+              'import json,sys; print((json.load(sys.stdin) or {}).get(sys.argv[1], ""))' "${key}")
+            if [ -z "${value}" ]; then
+              echo "::error::image label ${key} is missing or empty"
+              missing=$((missing + 1))
+            else
+              printf 'ok  %-45s = %s\n' "${key}" "${value}"
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::${missing} required OCI label(s) missing or empty"
+            exit 1
+          fi
+          printf 'all %d required labels present\n' "${#required[@]}"
+
+      - name: Package closure check
+        # The runtime base is passed explicitly, unlike in CI: the script's
+        # default reads `ARG RUNTIME_BASE` out of the Dockerfile, which is
+        # the DEFAULT branch's pin, and a 4.22 release must be checked
+        # against 4.22's base.
+        run: sh scripts/check-image-packages.sh samba-ad-dc:ci "${RUNTIME_BASE}"
+
+      # --- security gates (SPEC §5.3, §5.4) ---
+      # One contiguous block, copied verbatim into release.yml: a tag must
+      # be gated by exactly the checks a pull request was gated by, and the
+      # cheapest way to guarantee that is for both files to run the same
+      # steps in the same order. They sit inside the build matrix rather
+      # than in a job of their own because the package set apt resolves is
+      # per-architecture, and so is the vulnerability set it carries - an
+      # amd64-only scan would state nothing about the arm64 image that is
+      # published under the same tag.
+      #
+      # Copy contract for release.yml: these steps assume a single-arch
+      # image already loaded in the local docker daemon under the tag
+      # `samba-ad-dc:ci`, and a `matrix.arch` value that makes the report
+      # file and the artifact name unique per leg. A copy that keeps the
+      # steps but drops either one produces colliding artifacts or scans
+      # the wrong image.
+      #
+      # All three trivy invocations go through the pinned action instead of
+      # a hand-installed binary, for one reason: it caches the
+      # vulnerability database (`cache: true`), and a cold DB download per
+      # scan per architecture is the slow part of this block. `version`
+      # pins the trivy release these gates were proven against locally, so
+      # an upstream trivy release changes this gate's verdict only when
+      # someone bumps it deliberately.
+      - name: Trivy report (full, unfiltered)
+        # Everything trivy can see, kept as evidence and filtered by
+        # nothing: the gate below is deliberately narrow, and the unfixed
+        # and lower-severity findings it lets through are exactly what the
+        # §5.4 exception ledger is written from. JSON because this artifact
+        # is read by tools; the human-readable table is the gate's own
+        # output.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: samba-ad-dc:ci
+          format: json
+          output: trivy-full-${{ matrix.arch }}.json
+          version: v0.71.2
+          cache: true
+
+      - name: Upload trivy report
+        # `always()`: the report is most useful precisely when a gate below
+        # fails, and an upload that only ran on success would withhold it
+        # exactly then. 90 days so an image published today can still be
+        # compared against the scan that gated it a quarter from now.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: trivy-full-${{ matrix.arch }}
+          path: trivy-full-${{ matrix.arch }}.json
+          retention-days: 90
+          # A missing report means the scan above never produced one; that
+          # is a broken gate, not a warning.
+          if-no-files-found: error
+
+      - name: Trivy vulnerability gate (fixable HIGH/CRITICAL)
+        # Blocking (SPEC §5.3). --ignore-unfixed is not leniency: a CVE
+        # with no fixed package cannot be resolved by rebuilding, so
+        # failing on it would only teach people to route around the gate.
+        # Those are handled by the ledger and its review clock (SPEC §5.4,
+        # the last step of this block) and are all present, unfiltered, in
+        # the artifact above.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: samba-ad-dc:ci
+          scanners: vuln
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
+          version: v0.71.2
+          cache: true
+
+      - name: Trivy secret gate
+        # A different question from gitleaks in `lint`, not a second
+        # opinion on the same one: that scan reads the git history, this
+        # one reads the filesystem of the image that would be published. A
+        # key written by a build step, or one inherited from a base image,
+        # exists in neither the repository nor its history.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: samba-ad-dc:ci
+          scanners: secret
+          exit-code: '1'
+          format: table
+          version: v0.71.2
+          cache: true
+
+      - name: CVE exception review clock
+        # The other half of §5.4: unfixed CVEs pass the gate above only for
+        # as long as their ledger entry is current. This fails the build
+        # once a review date has passed, which is what keeps
+        # security/cve-exceptions.yaml from decaying into the permanent
+        # suppression list §5.4 forbids.
+        run: python3 scripts/check-cve-exceptions.py
+      # --- end security gates ---
+
+      - name: Set up Go
+        # The E2E suite is a Go test binary, so this job needs a toolchain
+        # too — the same pinned action, resolved from the e2e module's own
+        # go.mod so the two modules can pick their toolchains independently.
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version-file: test/e2e/go.mod
+          # The e2e module has no external dependencies (and therefore no
+          # go.sum): there is nothing to cache, and pointing the cache at a
+          # file that does not exist fails the step.
+          cache: false
+
+      - name: Login to GHCR
+        # Here and not just before the push, because the two upgrade tests
+        # below PULL published images from GHCR (harness.EnsureImage), and an
+        # anonymous pull of a package that is private - or of a fork's
+        # package - fails. What keeps this pipeline from publishing early is
+        # not the absence of a credential: it is that the only step which
+        # pushes comes after every gate, and that `merge` - the only job that
+        # creates a user-visible tag - needs every build leg to have
+        # succeeded.
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build test-client image
+        # The protocol client (kinit, smbclient, ldapsearch, dig, ntpdate)
+        # that drives the DC over the network. Built as a step of its own so
+        # a client-image failure is reported as one, and so it is not built
+        # inside the suite's own timeout.
+        run: docker build -t samba-ad-dc-e2e-client:ci test/client
+
+      - name: E2E suite
+        working-directory: test/e2e
+        env:
+          # The suite must never build or pull its own subject — it tests the
+          # image this job just built, by name.
+          E2E_IMAGE: samba-ad-dc:ci
+          E2E_CLIENT_IMAGE: samba-ad-dc-e2e-client:ci
+          # An image reference the harness pulls (harness.EnsureImage), or
+          # empty on a branch that has never been published — in which case
+          # TestUpgradeFromLastPublished skips loudly naming the variable,
+          # which is §8.3's first-release behaviour.
+          E2E_UPGRADE_FROM: ${{ needs.prepare.outputs.upgrade_from }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: |
+          set -eu
+          # E2E_RESTORE_CAPS is exported here and not declared in `env:`
+          # above, and that is not a style preference. harness.RestoreCaps()
+          # distinguishes unset from set-but-empty, and set-but-empty means
+          # "no capabilities at all" — it is what the bisection driver uses.
+          # An `env:` entry whose expression evaluated to '' on 4.23/4.24
+          # would therefore not be "no override": it would strip the restore
+          # container of every capability it needs.
+          #
+          # Only 4.22 gets the variable at all. adaptation-profile B.6,
+          # "restore": on Samba 4.22.11 `samba-tool domain backup restore`
+          # fails its sysvol NT-ACL step with `py_smbd_mkdir: mkdirat
+          # error=13` under the B.2 capability set and needs DAC_OVERRIDE;
+          # 4.23.12 and 4.24.7 need nothing added. The widening reaches that
+          # one short-lived container and nothing else — no DC in this suite,
+          # including the restored one, changes capability set on any branch.
+          if [ "${BRANCH}" = "4.22" ]; then
+            export E2E_RESTORE_CAPS='SYS_ADMIN,NET_BIND_SERVICE,CHOWN,FOWNER,SETUID,SETGID,DAC_OVERRIDE'
+            echo "branch 4.22: restore container widened with DAC_OVERRIDE (adaptation-profile B.6)"
+          fi
+          # -count=1 defeats the test cache: these tests talk to docker, so a
+          # cached PASS would be a statement about a previous run's
+          # containers. -timeout 60m and not CI's 45m because a release run
+          # also pulls a published image for the upgrade test; the 10-minute
+          # default panics the process mid-suite, which skips every
+          # t.Cleanup and leaks containers, volumes and networks.
+          go test ./... -v -count=1 -timeout 60m
+
+      - name: Cross-branch upgrade from the previous series
+        # Skipped when the previous series has never been published, and
+        # absent entirely on the oldest branch in the catalog.
+        if: needs.prepare.outputs.upgrade_from_prev != ''
+        working-directory: test/e2e
+        env:
+          E2E_IMAGE: samba-ad-dc:ci
+          E2E_CLIENT_IMAGE: samba-ad-dc-e2e-client:ci
+          E2E_UPGRADE_FROM: ${{ needs.prepare.outputs.upgrade_from_prev }}
+        run: |
+          set -eu
+          # B.5 / §8.3 across series: a domain provisioned by the PREVIOUS
+          # branch's last published image must survive being started by this
+          # candidate. The suite above already proved the within-branch case;
+          # this re-runs the one test that carries the upgrade against a
+          # different subject, which is why it is a second invocation and not
+          # a second suite. The `$` anchors the pattern so it selects exactly
+          # that test and not everything sharing its prefix.
+          go test ./... -run 'TestUpgradeFromLastPublished$' -v -count=1 -timeout 30m
+
+      - name: Push platform image by digest
+        id: push
+        env:
+          IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          # push-by-digest uploads an UNTAGGED manifest: nothing a `docker
+          # pull` can name exists after this step. The only tags this
+          # pipeline ever creates are the ones `merge` assembles, once every
+          # gate above has passed on every architecture.
+          #
+          # This is a second `docker buildx build` over the same context, the
+          # same build-args file and the same warm builder cache as the image
+          # the gates ran against, so every layer is a cache hit. B.8 is
+          # explicit that bit-identical image digests are NOT claimed across
+          # rebuilds; what is claimed — same commit + same base digest + same
+          # package index state ⇒ same software content — holds here by
+          # construction, since all three are literally the same inputs and
+          # BuildKit resolves the layers from cache rather than re-running
+          # them. The rebuild exists only because `--load` and
+          # `--output type=image,push-by-digest` are mutually exclusive
+          # exporters, and because the SBOM and provenance attestations are
+          # produced by the push exporter and cannot be attached to a
+          # locally loaded image.
+          build_args=()
+          while IFS= read -r arg; do
+            build_args+=(--build-arg "${arg}")
+          done < "${RUNNER_TEMP}/build-args"
+          docker buildx build \
+            --platform "linux/${ARCH}" \
+            "${build_args[@]}" \
+            --sbom=true \
+            --provenance=mode=max \
+            --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file "${RUNNER_TEMP}/build-metadata.json" \
+            .
+          digest=$(jq -r '."containerimage.digest" // empty' "${RUNNER_TEMP}/build-metadata.json")
+          if [ -z "${digest}" ]; then
+            echo "::error::buildx reported no image digest - nothing was pushed"
+            exit 1
+          fi
+          echo "pushed ${IMAGE}@${digest}"
+
+          # The digest travels as a FILENAME, the way the reference pipeline
+          # does it: an empty file per platform, so `merge` can count them
+          # and glob them without parsing anything.
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          # No digest means the push produced nothing; that is a broken
+          # pipeline, not a warning.
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Checkout
+        # catalog.py writes the release notes and README.md is the Docker Hub
+        # description, so this job needs the tree the tag points at.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Assert the expected architectures are present
+        env:
+          EXPECTED: ${{ needs.prepare.outputs.expected_digests }}
+          DEGRADED_MODE: ${{ needs.prepare.outputs.degraded_mode }}
+        run: |
+          set -eu
+          # The count is asserted against what the degraded mode DECLARED,
+          # not against "at least one": a Mode 2 publication that quietly
+          # shipped two architectures, or a normal release that quietly
+          # shipped one, would both be manifests nobody agreed to.
+          count=$(find "${RUNNER_TEMP}/digests" -maxdepth 1 -type f | wc -l | tr -d ' ')
+          echo "platform digests: ${count}, expected ${EXPECTED} (degraded mode: ${DEGRADED_MODE})"
+          if [ "${count}" -ne "${EXPECTED}" ]; then
+            echo "::error::expected ${EXPECTED} platform digest(s), found ${count}" \
+              "- refusing to publish a manifest the declared mode does not describe"
+            exit 1
+          fi
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest lists (GHCR)
+        env:
+          ALIASES: ${{ needs.prepare.outputs.aliases }}
+        run: |
+          set -eu
+          # Every alias catalog.py listed, in one `imagetools create`: the
+          # tags then all resolve to the same index digest by construction,
+          # which is what makes `latest` and `4` and `4.24.7-r1` provably the
+          # same image rather than three images that happen to agree today.
+          # catalog.py already decided that `X` and `latest` belong to the
+          # default branch alone, so publishing an older series cannot move
+          # them.
+          mapfile -t aliases < <(printf '%s' "${ALIASES}" | jq -r '.[]')
+          tags=()
+          for alias in "${aliases[@]}"; do
+            tags+=(-t "${IMAGE}:${alias}")
+          done
+          refs=()
+          for file in "${RUNNER_TEMP}"/digests/*; do
+            refs+=("${IMAGE}@sha256:$(basename "${file}")")
+          done
+          printf 'creating %d tag(s) over %d platform digest(s)\n' "${#aliases[@]}" "${#refs[@]}"
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+
+      - name: Resolve index digest (GHCR)
+        id: digest
+        run: |
+          set -eu
+          # The index digest is what is signed, attested and documented —
+          # never a tag, which is a pointer and, for the aliases, a moving
+          # one.
+          ghcr=$(docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}" \
+            --format '{{println .Manifest.Digest}}' | head -1)
+          if [ -z "${ghcr}" ]; then
+            echo "::error::could not resolve the index digest of ${IMAGE}:${IMAGE_TAG}"
+            exit 1
+          fi
+          echo "${IMAGE}@${ghcr}"
+          echo "ghcr=${ghcr}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        with:
+          # Deliberately pinned to the cosign v2 CLI: the action's default is
+          # now cosign v3, whose signature/bundle format changes what users
+          # verify against the documented command. Moving to v3 is a
+          # conscious future change made together with the verify docs and
+          # the release-notes template in catalog.py.
+          cosign-release: v2.6.5
+
+      - name: Sign the GHCR image (keyless OIDC)
+        env:
+          DIGEST_GHCR: ${{ steps.digest.outputs.ghcr }}
+        run: |
+          set -eu
+          cosign sign --yes "${IMAGE}@${DIGEST_GHCR}"
+
+      - name: Provenance attestation (GHCR image)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ needs.prepare.outputs.ghcr_image }}
+          subject-digest: ${{ steps.digest.outputs.ghcr }}
+
+      - name: Login to Docker Hub
+        if: needs.prepare.outputs.mirror == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Mirror the manifest lists (Docker Hub)
+        if: needs.prepare.outputs.mirror == 'true'
+        env:
+          ALIASES: ${{ needs.prepare.outputs.aliases }}
+        run: |
+          set -eu
+          # The mirror is a copy of what GHCR already holds, made after every
+          # gate passed and after the source of truth was tagged — not a
+          # second push from the build legs. One place decides whether the
+          # mirror happens, and a merge that fails leaves no orphan digests
+          # on Docker Hub to explain. `imagetools create` copies the whole
+          # index, so the SBOM and provenance manifests attached to each
+          # platform travel with it.
+          mapfile -t aliases < <(printf '%s' "${ALIASES}" | jq -r '.[]')
+          tags=()
+          for alias in "${aliases[@]}"; do
+            tags+=(-t "${DOCKERHUB_IMAGE}:${alias}")
+          done
+          refs=()
+          for file in "${RUNNER_TEMP}"/digests/*; do
+            refs+=("${IMAGE}@sha256:$(basename "${file}")")
+          done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+
+      - name: Resolve index digest (Docker Hub)
+        id: hubdigest
+        if: needs.prepare.outputs.mirror == 'true'
+        run: |
+          set -eu
+          hub=$(docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:${IMAGE_TAG}" \
+            --format '{{println .Manifest.Digest}}' | head -1)
+          if [ -z "${hub}" ]; then
+            echo "::error::could not resolve the index digest of ${DOCKERHUB_IMAGE}:${IMAGE_TAG}"
+            exit 1
+          fi
+          # attest-build-provenance wants a fully qualified registry name and
+          # Docker Hub's canonical one is index.docker.io, not the docker.io
+          # alias the pull command uses.
+          subject=$(printf '%s' "${DOCKERHUB_IMAGE}" | sed 's|^docker\.io/|index.docker.io/|')
+          echo "${DOCKERHUB_IMAGE}@${hub}"
+          {
+            echo "hub=${hub}"
+            echo "subject=${subject}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sign the Docker Hub image (keyless OIDC)
+        if: needs.prepare.outputs.mirror == 'true'
+        env:
+          DIGEST_HUB: ${{ steps.hubdigest.outputs.hub }}
+        run: |
+          set -eu
+          cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST_HUB}"
+
+      - name: Provenance attestation (Docker Hub image)
+        if: needs.prepare.outputs.mirror == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ steps.hubdigest.outputs.subject }}
+          subject-digest: ${{ steps.hubdigest.outputs.hub }}
+
+      - name: Prepare the Docker Hub README (absolute links)
+        # Only from the default branch: the Docker Hub description is
+        # repository-wide, and a maintenance release of an older series must
+        # not rewrite it with that tag's tree.
+        if: needs.prepare.outputs.mirror == 'true' && needs.prepare.outputs.is_default == 'true'
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import re
+
+          with open("README.md", "r", encoding="utf-8") as fh:
+              md = fh.read()
+          # Docker Hub cannot resolve repository-relative links; point them
+          # at GitHub instead of shipping a description full of dead links.
+          md = re.sub(r'\]\((?!https?://|#)([^)]+)\)',
+                      r'](https://github.com/esitc-paris/samba-ad-dc/blob/main/\1)', md)
+          with open("README.dockerhub.md", "w", encoding="utf-8") as fh:
+              fh.write(md)
+          PY
+
+      - name: Sync the Docker Hub description
+        if: needs.prepare.outputs.mirror == 'true' && needs.prepare.outputs.is_default == 'true'
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa  # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: esitcparis/${{ vars.IMAGE_NAME || 'samba-ad-dc' }}
+          short-description: >-
+            Samba Active Directory Domain Controller built from verified upstream source. Multi-arch, signed.
+          readme-filepath: ./README.dockerhub.md
+
+      - name: Release notes
+        # A staging rehearsal never writes a Release, never touches the
+        # CHANGELOG and never moves published_tag: it exists to exercise the
+        # pipeline, and a rehearsal that left a public artefact behind would
+        # defeat that.
+        if: needs.prepare.outputs.staging != 'true'
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          CAUSE: ${{ needs.prepare.outputs.trigger_cause }}
+          DEGRADED_MODE: ${{ needs.prepare.outputs.degraded_mode }}
+          PENDING_ARCH: ${{ needs.prepare.outputs.pending_arch }}
+          DIGEST_GHCR: ${{ steps.digest.outputs.ghcr }}
+          DIGEST_HUB: ${{ steps.hubdigest.outputs.hub }}
+        run: |
+          set -eu
+          # catalog.py owns the body — including the §9.6 disclosure text,
+          # which has to say the same thing here and in the CHANGELOG. The
+          # Docker Hub line appears only when the mirror actually ran, so the
+          # notes never advertise an image that was not published.
+          args=(release-notes "${BRANCH}" --cause "${CAUSE}" --digest-ghcr "${DIGEST_GHCR}")
+          if [ -n "${DIGEST_HUB}" ]; then
+            args+=(--digest-hub "${DIGEST_HUB}")
+          fi
+          if [ "${DEGRADED_MODE}" != "none" ]; then
+            args+=(--degraded "${DEGRADED_MODE}" --pending-arch "${PENDING_ARCH}")
+          fi
+          python3 scripts/catalog.py "${args[@]}" > "${RUNNER_TEMP}/release-notes.md"
+          cat "${RUNNER_TEMP}/release-notes.md"
+
+      - name: Create the GitHub Release
+        if: needs.prepare.outputs.staging != 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body_path: ${{ runner.temp }}/release-notes.md
+          # No generated notes: GitHub would append the commits since the
+          # previous tag, which on a multi-branch catalog is the previous tag
+          # of a DIFFERENT series — wrong, not merely noisy.
+          generate_release_notes: false
+          # Only the default branch's release is the repository's "Latest":
+          # a security rebuild of 4.22 must not displace 4.24 at the top of
+          # the releases page.
+          make_latest: ${{ needs.prepare.outputs.is_default }}
+
+      - name: Job summary
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          STAGING: ${{ needs.prepare.outputs.staging }}
+          DEGRADED_MODE: ${{ needs.prepare.outputs.degraded_mode }}
+          PENDING_ARCH: ${{ needs.prepare.outputs.pending_arch }}
+          ALIASES: ${{ needs.prepare.outputs.aliases }}
+          DIGEST_GHCR: ${{ steps.digest.outputs.ghcr }}
+          DIGEST_HUB: ${{ steps.hubdigest.outputs.hub }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -eu
+          {
+            echo "## ${TAG} — branch ${BRANCH}"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| GHCR | \`${IMAGE}@${DIGEST_GHCR}\` |"
+            if [ -n "${DIGEST_HUB}" ]; then
+              echo "| Docker Hub | \`${DOCKERHUB_IMAGE}@${DIGEST_HUB}\` |"
+            else
+              echo "| Docker Hub | not mirrored |"
+            fi
+            echo "| Tags | $(printf '%s' "${ALIASES}" | jq -r 'map("`" + . + "`") | join(" ")') |"
+            if [ "${STAGING}" = "true" ]; then
+              echo "| Staging | rehearsal - no GitHub Release, no mirror, no notification |"
+            fi
+            if [ "${DEGRADED_MODE}" != "none" ]; then
+              echo "| Degraded mode | ${DEGRADED_MODE}, affected architecture \`${PENDING_ARCH}\` (SPEC §9.6) |"
+            fi
+            echo
+            echo "Verify:"
+            echo
+            echo '```'
+            echo "cosign verify ${IMAGE}@${DIGEST_GHCR} \\"
+            echo "  --certificate-identity-regexp 'https://github.com/${REPOSITORY}/.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify admin (release published)
+        if: needs.prepare.outputs.staging != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST_GHCR: ${{ steps.digest.outputs.ghcr }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          # An assigned issue is a guaranteed mail / mobile notification for
+          # the admin. Informational only — close it after reading.
+          gh issue create --title "Published ${TAG}" --assignee euca01 \
+            --body "$(printf 'Release %s was published.\n\nImage: %s:%s\nDigest: %s\nRun: %s\n\n%s' \
+              "${TAG}" "${IMAGE}" "${IMAGE_TAG}" "${DIGEST_GHCR}" "${RUN_URL}" \
+              'This is a notification issue - close it after reading.')"
+
+  notify-failure:
+    name: Notify failure
+    needs: [prepare, build, merge]
+    if: failure()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Notify admin (release failed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # prepare's output is empty when prepare itself is what failed, so
+          # the raw trigger value is the fallback: an issue that cannot name
+          # the tag is still better than no issue.
+          RAW_TAG: ${{ needs.prepare.outputs.tag || inputs.tag || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          # One open issue per broken tag; repeats add a comment instead of
+          # flooding the tracker.
+          title="Release pipeline failed for ${RAW_TAG}"
+          number=$(gh issue list --state open --json number,title \
+            --jq ".[] | select(.title==\"${title}\") | .number" | head -1)
+          if [ -n "${number}" ]; then
+            gh issue comment "${number}" --body "Failed again: ${RUN_URL}"
+          else
+            gh issue create --title "${title}" --assignee euca01 \
+              --body "$(printf 'The release pipeline failed - nothing was published.\n\nInvestigate: %s' \
+                "${RUN_URL}")"
+          fi
