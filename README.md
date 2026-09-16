@@ -58,7 +58,7 @@ identity, plus SBOM/provenance inspection commands.)*
 |-----------------|------------------|---------|-------------------------|
 | 4.24 | 4.24.7-r1 | `4.24.7`, `4.24`, `4`, `latest` | current |
 | 4.23 | 4.23.12-r1 | `4.23.12`, `4.23` | maintenance |
-| 4.22 | 4.22.11-r1 | `4.22.11`, `4.22` | security fixes only |
+| 4.22 | 4.22.11-r1 | `4.22.11`, `4.22` | security fixes only — deprecation pending (4.25 rc published) |
 <!-- matrix:end -->
 
 ## Security

@@ -323,12 +323,11 @@ when a test or a row exists without its counterpart.
   log lines outweighs the cosmetic gain. Revisit if upstream separates the
   worker log-reopen path from the configured logging backend.
 
-- **On branch 4.22, `samba-tool domain backup restore` needs
-  `CAP_DAC_OVERRIDE`, which the B.2 capability set does not grant.**
-  Measured locally on arm64, 2026-09-16, with `samba-ad-dc:4.22-dev`
-  (Samba 4.22.11) under the constrained profile every E2E DC runs in:
-  `TestOfflineBackupRestore` fails, deterministically (3 runs of 3), when
-  the restore reaches the sysvol NT-ACL step —
+- **On branch 4.22 the offline RESTORE needs `CAP_DAC_OVERRIDE`; the
+  running DC does not.** Measured locally on arm64, 2026-09-16, with
+  `samba-ad-dc:4.22-dev` (Samba 4.22.11) under the constrained profile
+  every E2E container runs in: `samba-tool domain backup restore` reaches
+  the sysvol NT-ACL step, which goes through smbd, and dies there —
 
   ```text
   py_smbd_mkdir: mkdirat error=13 (Permission denied)
@@ -337,50 +336,77 @@ when a test or a row exists without its counterpart.
       smbd.mkdir(dst, session_info, service)
   ```
 
-  — and `samba-tool domain backup restore` exits 255. The same test passes
-  on 4.23.12 and on 4.24.7 with the identical capability set, and passes
-  on 4.22.11 the moment `DAC_OVERRIDE` is added back to it (verified by
-  one throwaway run with the capability restored; nothing in the committed
-  harness was changed). This is the limit of the Phase 3 bisection being
-  honest about its own scope: that measurement was made against the 4.24
-  image, and `DAC_OVERRIDE` was dropped because *that* image proved it
-  unnecessary. A capability set is a property of an image, not of a
-  repository, and 4.22 is a different image.
-  **Open, and a maintainer's call:** either B.2 gains a per-branch
-  capability set (4.22 keeping `DAC_OVERRIDE`, with its own bisection
-  run), or offline restore under the constrained profile is recorded as
-  unsupported on 4.22. Publishing 4.22 before that is decided would ship a
-  branch whose documented backup path fails against this profile's own
-  example configuration.
+  — exiting 255, deterministically (3 runs of 3). The same restore
+  succeeds with `DAC_OVERRIDE` added, and 4.23.12 and 4.24.7 need nothing
+  added at all. The Phase 3 bisection that dropped `DAC_OVERRIDE` measured
+  the 4.24 image, and a capability set is a property of an image.
 
-- **On branches 4.22 and 4.23 the DC's self-signed TLS certificate
-  carries a byte-reversed serial, which is DER-negative about half the
-  time.** Measured locally on arm64, 2026-09-16, by provisioning DCs from
-  `samba-ad-dc:4.22-dev`, `:4.23-dev` and `:dev` within seconds of each
-  other and reading `/var/lib/samba/private/tls/cert.pem`: 4.22.11 and
-  4.23.12 write the 32-bit generation time **little-endian**
-  (`13DDAA6A`, `30DCAA6A` — the same instant 4.24.7 writes as `6AAADC52`,
-  big-endian). The leading DER byte of those serials is therefore the
-  *low* byte of the clock, which crosses 0x80 every 256 seconds, and a
-  leading byte ≥ 0x80 makes the INTEGER negative: one such certificate was
-  captured directly (`openssl x509 -serial` → `serial=-65235596`). RFC
-  5280 §4.1.2.2 requires a positive serial, so a strict parser refuses the
-  certificate outright — Go's `crypto/x509` does, which is why
-  `TestLDAPSCertificate` fails on roughly half of all 4.22/4.23 provisions
-  with `x509: negative serial number`, and passes on the other half. The
-  full E2E suite on 4.23.12 is otherwise green (2026-09-16: 16 pass, 1
-  skip, that one failure).
-  What is *not* affected: the TLS handshake itself. GnuTLS and OpenSSL
-  accept a negative serial, so `ldapsearch` over `ldaps://` — the part of
-  that same test which exercises the protocol — is unaffected, and so is
-  every real client. The defect is in what the certificate *is*, not in
-  what the DC does with it, and it is upstream's: 4.24 emits the serial
-  big-endian and is unaffected until 2038.
-  **Open, and a maintainer's call, not this repository's:** whether 4.22
-  and 4.23 are published with this recorded as a branch-specific
-  limitation, or whether `TestLDAPSCertificate` is made to assert the
-  certificate without Go's serial check on those branches. Nothing is
-  decided here; the measurement is.
+  **Ruling (2026-09-16).** The B.2 capability set — the six measured
+  capabilities — is unchanged on every branch, for every running DC,
+  including a restored one: nothing showed that it has to change, and
+  widening the set a DC *runs* under to accommodate a one-off recovery
+  command would spend a real privilege permanently to buy a transient one.
+  The widening is scoped to the restore container instead. **An operator
+  restoring a 4.22 backup adds `--cap-add DAC_OVERRIDE` to the one-off
+  container that runs `samba-tool domain backup restore`, and to nothing
+  else** — not to the DC that afterwards serves the restored domain. On
+  4.23 and 4.24 nothing is added at all.
+
+  The E2E suite expresses exactly that through `E2E_RESTORE_CAPS`
+  (`test/e2e/harness`): unset, the restore one-off gets the same
+  capabilities as everything else; set, its comma-separated list applies
+  to the restore one-off **only** — the backup one-off, the listing
+  one-off and every DC keep `DefaultCaps`/`E2E_CAPS`.
+  `TestOfflineBackupRestore` is the acceptance test on every branch, and
+  the release workflow sets the variable for 4.22. What is proven per
+  branch is therefore the procedure that branch's operators are told to
+  run.
+
+- **On branches 4.22 and 4.23 the DC's self-signed TLS certificate carries
+  a byte-reversed serial, which is DER-negative about half the time.**
+  Measured locally on arm64, 2026-09-16, by provisioning DCs from
+  `samba-ad-dc:4.22-dev`, `:4.23-dev` and `:dev` and reading
+  `/var/lib/samba/private/tls/cert.pem` with
+  `openssl x509 -noout -serial`: 4.22.11 and 4.23.12 write the 32-bit
+  generation time in **host byte order**, 4.24.7 writes it big-endian.
+
+  The decisive capture is the pair taken inside one such window, eleven
+  seconds apart. 4.23.12 produced `serial=-65235596`; `openssl` prints a
+  negative serial as a signed **hex** magnitude, so those DER bytes are
+  the two's complement of `0x65235596` over four bytes, i.e. `9ADCAA6A`.
+  Reverse them and it is `0x6AAADC9A` — unix time 1789582490, inside the
+  window the probe ran in. 4.24.7, eleven seconds later, produced
+  `6AAADCA5` = unix 1789582501, big-endian and positive. Same clock, one
+  branch storing it backwards.
+
+  The consequence is mechanical: the leading DER byte of those serials is
+  the *low* byte of the clock, which crosses 0x80 every 256 seconds, and a
+  leading byte >= 0x80 makes the INTEGER negative. RFC 5280 §4.1.2.2
+  requires a positive serial, so a strict parser refuses the certificate
+  outright — Go's `crypto/x509` does.
+
+  **What is not affected: anything a client does.** GnuTLS and OpenSSL
+  accept a negative serial, so the TLS handshake succeeds, `ldapsearch`
+  over `ldaps://` with `LDAPTLS_REQCERT=demand` against the DC's own CA
+  succeeds, and no domain member sees a problem. The defect is in what the
+  certificate *is*, not in what the DC does with it. 4.24 is unaffected —
+  its leading byte stays below 0x80 until 2038.
+
+  **Ruling (2026-09-16).** The limitation is recorded rather than worked
+  around: it is upstream's, on branches that receive only bug and security
+  fixes. `TestLDAPSCertificate` is made to survive it without giving up
+  the property it exists to assert. Its in-process inspection tolerates a
+  negative serial **and that one thing only** — any other parse failure is
+  still fatal, and wherever the certificate parses (always, on 4.24) the
+  CN check and the full chain verification run exactly as before. Where it
+  does not, the test logs why and falls back on its other half: the
+  over-the-wire `ldapsearch` pair, which verifies with `REQCERT=demand`
+  against the DC's CA as the only trust anchor and proves, through its
+  negative control, that the client is really checking. That half asserts
+  the same two properties — issued by this DC's CA, valid for this DC's
+  name — through the stack a domain member actually uses, so the coverage
+  moves rather than disappears, and the test is deterministic on all three
+  branches.
 
 - **No `nsupdate` in the image** (`bind9-dnsutils` is not installed).
   Dynamic DNS updates therefore run through
@@ -401,7 +427,7 @@ observed on 2026-09-16**:
 |--------|-----------------------------|-------------------------------|
 | 4.24 | 4.24.7 | current — default branch, owns the `4` and `latest` aliases |
 | 4.23 | 4.23.12 | maintenance |
-| 4.22 | 4.22.11 | security fixes only |
+| 4.22 | 4.22.11 | security fixes only — deprecation pending (4.25 rc published) |
 
 Each of those tarball checksums was produced by
 `sh scripts/verify-upstream-tarball.sh <X.Y.Z>`, which repeats the
@@ -416,9 +442,22 @@ would read `discontinued (EOL)`. The catalog's branch list is the only
 input, so nothing here decides upstream's lifecycle — the watcher relays
 it by adding a series or dropping the oldest, and a release candidate for
 a newer series appends a deprecation-pending note to the oldest supported
-row. The table above is a dated snapshot for a reader of this file; the
-README matrix is the always-current statement, and the two are the same
-claim only because both are derived from `versions.yaml`.
+row. The table above is a dated snapshot for a reader of this file, kept
+in step by hand; the README matrix is the rendered, always-current
+statement. They agree because both describe the same `versions.yaml`, not
+because one is generated from the other.
+
+The 4.22 row carries that deprecation-pending suffix as of 2026-09-16
+because `samba-4.25.0rc2.tar.gz` is published under
+`https://download.samba.org/pub/samba/rc/`. A release candidate for a
+series newer than the newest catalog branch is upstream's own end-of-life
+signal for the oldest branch it still supports, and §9.4 requires it to be
+relayed as soon as it is detected — so it is relayed now, by hand
+(`catalog.py update-readme-matrix --rc-series 4.25`), and by the watcher's
+rc probe from Phase 4 on. It is a *notice*, not a removal: 4.22 keeps
+receiving every patch release until upstream actually ends it, at which
+point the branch leaves the catalog and the matrix says
+`discontinued (EOL)`.
 
 ### B.8 Reproducibility (SPEC §4.3 interpretation)
 
@@ -786,13 +825,23 @@ it is harmless: Kerberos falls back to its built-in defaults.
   no `./configure` option this image passes is rejected by 4.23 or 4.22,
   so the Dockerfile stayed single. One product difference was found doing
   it and is recorded in B.6 rather than worked around: 4.22.11 and 4.23.12
-  write the self-signed TLS certificate's serial little-endian, which
+  write the self-signed TLS certificate's serial in host byte order, which
   makes it a negative DER INTEGER for about half of every 256-second
-  window and makes `TestLDAPSCertificate` fail on those provisions; 4.24.7
-  writes it big-endian. A second one, on 4.22 alone, is recorded beside
-  it: `samba-tool domain backup restore` needs `CAP_DAC_OVERRIDE` there,
-  which the B.2 set — measured on the 4.24 image — does not grant, so the
-  documented offline-restore path fails under this profile's own example
-  configuration. Both entries state what was measured and leave the ruling
-  open, deliberately: neither is this repository's bug to fix, and both
-  decide whether a branch can be published.
+  window; 4.24.7 writes it big-endian. A second, on 4.22 alone:
+  `samba-tool domain backup restore` needs `CAP_DAC_OVERRIDE` there, which
+  the B.2 set — measured on the 4.24 image — does not grant. Both are
+  ruled on in B.6, and both rulings are deliberately narrow. The
+  capability set a running DC is tested and documented under does not move
+  on any branch: what gains `DAC_OVERRIDE` is the one-off container that
+  performs a 4.22 restore — expressed in the suite as the new
+  `E2E_RESTORE_CAPS`, and in the operator procedure as one extra
+  `--cap-add` on that one command. `TestLDAPSCertificate` tolerates a
+  negative serial and nothing else, keeping its full in-process inspection
+  wherever the certificate parses and falling back to its over-the-wire
+  half where it does not, so the property stays asserted on all three
+  branches and the test is deterministic on all three.
+  B.7 also relays upstream's §9.4 deprecation signal for 4.22: 4.25.0rc2
+  is published, so the 4.22 row — here and in the rendered README matrix
+  (`update-readme-matrix --rc-series 4.25`) — carries "deprecation
+  pending". It is a notice, not a removal; 4.22 keeps receiving every
+  patch release until upstream actually ends it.
