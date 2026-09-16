@@ -1061,8 +1061,10 @@ gates.
   and becomes a measurement.** `test/capbisect/bisect.sh` re-runs the E2E
   smoke subset (provision, `kinit`, restart) once per capability with that
   capability removed, then re-runs it with only the ones that proved
-  required; report in `test/capbisect/results-arm64.txt` (local arm64,
-  image digest `sha256:198e52c9…`). Two changes to what the profile said:
+  required; report in `test/capbisect/results-arm64-2026-08-16.txt` (local
+  arm64, image digest `sha256:198e52c9…`; committed at the time as
+  `results-arm64.txt`, and kept under its date when the CI report took
+  that name over — see the 2026-09-16 entry below). Two changes to what the profile said:
   `DAC_OVERRIDE` leaves the set (the suite passes without it — everything
   runs as uid 0 over paths the entrypoint already chowned to itself), and
   `DAC_READ_SEARCH`, previously carried as a candidate to bisect, is
@@ -1292,3 +1294,60 @@ gates.
   two CI reports for the confirmation. Had they been left alone, the
   refresh would have silently re-dated a citation and orphaned the only
   `DAC_OVERRIDE` measurement in the tree.
+- 2026-09-17: Phase 5 — **closure.** The three operator guides are
+  complete and cross-checked against the tests
+  (`docs/deployment-guide.md` §10.2, `docs/update-guide.md` §10.3,
+  `docs/operations.md`), traceability holds in both directions including
+  the guides, `no-new-privileges` is in the harness, and the B.2
+  capability set is CI-measured on both architectures — each recorded in
+  its own entry above. What this entry adds is the rehearsal and the four
+  things it and the final review found.
+
+  **The staging drill.** The whole publication path was rehearsed on
+  2026-09-17 against `v4.24.7-r1` with `staging=true`:
+  [release run 35158262620](https://github.com/ESITC-Paris/samba-ad-dc/actions/runs/35158262620)
+  (18 min; both native legs ~17 min 40 s) and the
+  [post-push verification](https://github.com/ESITC-Paris/samba-ad-dc/actions/runs/35159720483)
+  it triggered, both green, over the staging package alone — no public
+  artefact, no tag, no release. Every §8 gate ran on both architectures
+  except the upgrade gates, which skipped for the documented
+  first-publication reason (no `samba-ad-dc` package on GHCR to upgrade
+  from, SPEC §8.3). The upgrade path is therefore the one part of the
+  pipeline still unexercised, and the first real publication is what
+  exercises it. Recorded with its numbers in `docs/operations.md`.
+
+  **Two follow-ups the drill could not close**, both blocked on a laptop
+  `gh` token's scopes rather than on anything in the repository, and both
+  now written into the go-live procedure as maintainer steps: the
+  `samba-ad-dc-staging` package still exists and must be deleted
+  (`delete:packages`), and — the finding that matters more — GHCR created
+  that package **private by default**. Nobody chose that. Until the
+  maintainer flips `samba-ad-dc` to public after the first release,
+  anonymous `docker pull` and `cosign verify` fail and every verification
+  instruction this repository publishes is wrong. Post-push verification
+  cannot catch it: it runs with `GITHUB_TOKEN` and reads a private
+  package happily.
+
+  **One watcher rule tightened.** `decide()` exempted any branch with no
+  state entry from the digest comparison, recording what it saw "without
+  calling it a change". That is right only while the branch still owes
+  its first publication. `apply()` writes a decision's observation into
+  `versions.yaml` as well as into `.build-state.json`, so on a branch
+  whose tag is already published the exemption re-pinned `base.*` and
+  `pkg_index_hash` under `action: none` — the catalog would claim a base
+  the published image was never built from, and that cycle's rebuild
+  would be lost, because the next run compares against the values the
+  previous one just wrote. The exemption now ends at the first
+  publication; the Release cycle section above states the rule and why.
+
+  **Two smaller corrections.** `test/e2e/go.mod` declared `go 1.24.0`
+  under a `go.work` declaring `1.25.0`, which is what the open
+  `actions/setup-go` v7 pull request fails on; and the comment on
+  `TestOfflineBackupRestore`'s FINDING 4 described a restore layout the
+  B.6 measurement contradicts — `cache directory` lands at
+  `/var/lib/samba/cache`, a sibling of `state` and not a child of it, and
+  only `state directory` and the sysvol share move down. The cosign
+  guidance is also now truthful about what was measured: the pipeline
+  signs and re-verifies with v2.6.5, a v3 CLI is *expected* to verify
+  those signatures and this project has not exercised it — the deployment
+  guide previously asserted that v3 would fail, which nothing had tested.
