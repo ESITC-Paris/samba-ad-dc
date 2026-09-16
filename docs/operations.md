@@ -319,6 +319,28 @@ of the **watcher** end to end, and unset it afterwards. Do not combine the
 two — `IMAGE_NAME=samba-ad-dc-staging` plus `-f staging=true` targets
 `samba-ad-dc-staging-staging`.
 
+**Drills.** Every rehearsal that has been run, newest first.
+
+- **2026-09-17 — `v4.24.7-r1`, passed.**
+  [Release run 35158262620](https://github.com/ESITC-Paris/samba-ad-dc/actions/runs/35158262620)
+  (18 min: `Prepare` 7 s, both native legs ~17 min 40 s, `Publish` 37 s).
+  Every §8 gate green on both architectures; `merge` created the five
+  tags of `ghcr.io/esitc-paris/samba-ad-dc-staging` over two platform
+  digests at index `sha256:1141895e45207bb3c3f3f05446f695bd4b26ab56731e6144b589393ef6b0f8e8`,
+  signed it and attested it, and skipped the mirror, the release notes,
+  the GitHub Release and the published-notification issue, while
+  `prepare` skipped the §3.2 immutability check that makes a drill
+  repeatable. The
+  [post-push verification](https://github.com/ESITC-Paris/samba-ad-dc/actions/runs/35159720483)
+  it triggered passed on the staging package it resolved from the run
+  title's ` (staging)` suffix.
+  Two gates did **not** run, for the documented first-publication reason
+  rather than a defect: no `samba-ad-dc` package existed on GHCR yet, so
+  `TestUpgradeFromLastPublished` skipped on both architectures (SPEC
+  §8.3) and the cross-branch step was absent. The upgrade path is
+  therefore the one part of the pipeline this drill did not exercise,
+  and the first real publication is what will.
+
 ### Post-push verification
 
 `.github/workflows/post-push-verify.yml` (SPEC §8.5) runs automatically on
