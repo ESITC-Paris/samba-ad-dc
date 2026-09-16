@@ -4,19 +4,19 @@
       "runtime_digest": "sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
       "builder_digest": "sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
       "gobuild_digest": "sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73",
-      "pkg_index_hash": "f5ff6c4068e9d7b0"
+      "pkg_index_hash": "6b233ad0c4404928"
     },
     "4.23": {
       "runtime_digest": "sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
       "builder_digest": "sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
       "gobuild_digest": "sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73",
-      "pkg_index_hash": "f5ff6c4068e9d7b0"
+      "pkg_index_hash": "6b233ad0c4404928"
     },
     "4.22": {
       "runtime_digest": "sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
       "builder_digest": "sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
       "gobuild_digest": "sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73",
-      "pkg_index_hash": "f5ff6c4068e9d7b0"
+      "pkg_index_hash": "6b233ad0c4404928"
     }
   }
 }

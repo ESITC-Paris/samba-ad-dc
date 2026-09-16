@@ -46,7 +46,7 @@ branches:
       # findings, all fixed in 1.25.8..1.25.13. Pinned at 1.25 for that
       # reason; the go.mod floor followed, it did not lead.
       gobuild: "golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73"
-    pkg_index_hash: "f5ff6c4068e9d7b0"  # replaced by the watcher from Phase 6 on
+    pkg_index_hash: "6b233ad0c4404928"  # replaced by the watcher from Phase 6 on
   # 2026-09-16: maintenance series upstream (bug fixes and security fixes).
   "4.23":
     samba_version: "4.23.12"
@@ -56,7 +56,7 @@ branches:
       builder: "debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132"
       runtime: "debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132"
       gobuild: "golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73"
-    pkg_index_hash: "f5ff6c4068e9d7b0"
+    pkg_index_hash: "6b233ad0c4404928"
   # 2026-09-16: oldest supported series upstream — security fixes only,
   # and deprecation pending: 4.25.0rc2 is published under pub/samba/rc/,
   # which is upstream's own end-of-life signal for this branch (§9.4). The
@@ -69,4 +69,4 @@ branches:
       builder: "debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132"
       runtime: "debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132"
       gobuild: "golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73"
-    pkg_index_hash: "f5ff6c4068e9d7b0"
+    pkg_index_hash: "6b233ad0c4404928"
