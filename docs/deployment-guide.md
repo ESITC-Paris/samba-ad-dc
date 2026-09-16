@@ -274,9 +274,21 @@ spelling the registry path uses. A regexp written with the registry's
 casing matches nothing and the verification fails on a correctly signed
 image.
 
-The images are signed with the **cosign v2** CLI. A cosign v3 verifier
-speaks a different bundle format; pin the v2 CLI, as the project's own
-verification workflow does.
+**Which cosign.** The pipeline signs with **cosign v2.6.5**
+(`sigstore/cosign-installer` pinned to that release in `release.yml`), and
+`post-push-verify.yml` verifies every published image with that same
+v2.6.5 — so v2.6.5 is the one version these signatures are known to verify
+under. `brew install cosign` now installs v3. Verifying a v2-produced
+keyless signature with a v3 CLI is expected to work — v3 reads the
+signatures v2 wrote — but this project has not exercised it, so it is an
+expectation and not a measurement. If a v3 verification of a correctly
+signed image fails, install v2.6.5 before concluding anything about the
+image:
+
+```sh
+cosign version   # what you have
+# v2.6.5 release assets: https://github.com/sigstore/cosign/releases/tag/v2.6.5
+```
 
 ### 2.2 The GitHub provenance attestation
 

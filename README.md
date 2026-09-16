@@ -26,7 +26,7 @@ repository is licensed Apache-2.0 (see `LICENSE`).
 
 ## Status
 
-<!-- GO-LIVE: delete this comment and the blockquote below once the first release is published (docs/operations.md, "Going live: the first publication", step 6). -->
+<!-- GO-LIVE: delete this comment and the blockquote below once the first release is published (docs/operations.md, "Going live: the first publication", step 7). -->
 > **Status: pre-release.** No image has been published yet. The contract
 > documented below is the contract the code is tested against, but no tag
 > exists on the registry until the watcher's first publication, so every
@@ -382,6 +382,12 @@ gh attestation verify oci://ghcr.io/esitc-paris/samba-ad-dc@<digest> \
 
 `--repo` rather than `--owner`: an attestation from any other repository
 of the organisation is not evidence about this image.
+
+The pipeline signs and re-verifies with **cosign v2.6.5**, which is the
+version these signatures are known to verify under. `brew install cosign`
+now gives v3; a v3 verification is expected to work and has not been
+exercised here, so if one fails, try v2.6.5 before concluding the image is
+bad. `docs/deployment-guide.md` §2.1 has the detail.
 
 Both attestations are attached to the image in the registry and can be
 read back without pulling it:

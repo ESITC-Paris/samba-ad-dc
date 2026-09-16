@@ -143,20 +143,88 @@ describes — and nothing about the rest of this section changes.
    group is keyed on the tag) and each one runs the complete §8 gate set
    natively on both architectures before anything user-visible exists: the
    two `build` legs run in parallel and are budgeted 150 minutes each,
-   `merge` 30. Expect the three runs to occupy four runners for a good
-   part of an afternoon.
+   `merge` 30. The budget is a ceiling, not an estimate — the 2026-09-17
+   drill's legs took about 20 minutes each. Expect six runners busy at
+   once if all three dispatch together.
 5. **Watch the three post-push verifications** (see below), which re-check
    the published artefacts from outside the pipeline.
-6. **Delete the pre-release notice in `README.md`** once the first release
+6. **Make the package public.** GHCR creates a new organisation package
+   **private by default** — measured on 2026-09-17: the staging drill's
+   `samba-ad-dc-staging` package came out private without anyone choosing
+   that. A private package is invisible to an anonymous client, so
+   `docker pull` and `cosign verify` both fail for everyone but the
+   organisation until this is done, and every verification instruction in
+   the README and the deployment guide is wrong until it is. It cannot be
+   done before the first release, because the package does not exist yet.
+
+   In the UI: the package page → *Package settings* → *Danger Zone* →
+   *Change visibility* → **Public**. (An organisation owner can instead set
+   the organisation's default package visibility to public beforehand, at
+   *Organization settings* → *Packages*, which makes this step unnecessary
+   rather than optional.)
+
+   Then confirm it from outside, logged out of everything:
+
+   ```sh
+   docker logout ghcr.io
+   docker buildx imagetools inspect ghcr.io/esitc-paris/samba-ad-dc:4.24.7-r1
+   ```
+
+   The post-push verification passing is **not** evidence of this: it runs
+   with the repository's `GITHUB_TOKEN` and can read a private package.
+7. **Delete the pre-release notice in `README.md`** once the first release
    exists — the `<!-- GO-LIVE: ... -->` comment under `## Status` and the
    blockquote beginning `> **Status: pre-release.**` immediately below it.
    The comment is there to be found (`grep -n GO-LIVE README.md`) and says
    what to delete; removing it and leaving the blockquote is the mistake it
    exists to prevent, so delete both.
+8. **Merge the open Dependabot pull requests**, each one only once CI is
+   green on it. They were left open deliberately: a dependency bump that
+   lands between the tag and the build is a change to what was tested.
+9. **Delete the staging package.** The drill left
+   `ghcr.io/esitc-paris/samba-ad-dc-staging` behind (private, and it still
+   exists at the time of writing). It is not deleted automatically and
+   nothing reads it:
+
+   ```sh
+   gh api -X DELETE \
+     /orgs/ESITC-Paris/packages/container/samba-ad-dc-staging
+   ```
+
+   That call needs `delete:packages` on the token `gh` is using — see
+   *Token scopes for package work* below.
 
 Nothing else changes state: a `publish` decision edits no tracked file by
 design, so the watcher's own commit on that run is a state-only commit or
 no commit at all.
+
+**Expected shape of the whole thing.** Three `publish` decisions, three
+tags, three `release.yml` runs, three GitHub Releases, three post-push
+verifications. Measured against the 2026-09-17 drill, each release run is
+about **20 minutes**: the two native legs run in parallel and took ~17 min
+40 s each, with `Prepare` and `Publish` under a minute between them. The
+150-minute per-leg budget is a ceiling for a slow runner, not an estimate.
+The first publication will be slower than the drill by however long the
+upgrade gates take, because those are the ones the drill could not run.
+
+### Token scopes for package work
+
+The workflows use the run's `GITHUB_TOKEN` and need nothing added. A
+**laptop** `gh` token is a different matter: the default login scopes do
+not include package access, so listing or deleting a package fails with a
+403 that names the missing scope rather than a permission problem.
+
+```sh
+gh auth refresh -h github.com -s read:packages,delete:packages
+```
+
+That is the device-code flow — it prints a one-time code and opens
+`github.com/login/device`. `read:packages` is what lists package versions
+(and is what the watcher's probe uses from CI, through `GITHUB_TOKEN`);
+`delete:packages` is needed only for the staging cleanup above and can be
+dropped again afterwards with a second `gh auth refresh` naming the scopes
+to keep.
+
 
 ## Supervision
 
@@ -340,6 +408,13 @@ two — `IMAGE_NAME=samba-ad-dc-staging` plus `-f staging=true` targets
   §8.3) and the cross-branch step was absent. The upgrade path is
   therefore the one part of the pipeline this drill did not exercise,
   and the first real publication is what will.
+  **Left behind:** the `samba-ad-dc-staging` package still exists, and
+  GHCR created it **private** — nobody chose that, which is the finding
+  that put step 6 into [Going live](#going-live-the-first-publication).
+  Deleting it is a maintainer action, not an automatic one, and it needs a
+  `gh` token carrying `delete:packages`:
+  `gh api -X DELETE /orgs/ESITC-Paris/packages/container/samba-ad-dc-staging`
+  (see [Token scopes for package work](#token-scopes-for-package-work)).
 
 ### Post-push verification
 
@@ -352,8 +427,11 @@ What it asserts: the manifest list publishes **exactly** the promised
 platforms (set equality — an unpromised architecture is as much a defect
 as a missing one); the index digest matches the one the release notes pin;
 every platform image pulls by digest; `cosign verify` succeeds against an
-identity under this repository and the GitHub Actions OIDC issuer; `gh
-attestation verify --repo` accepts the provenance over the index digest;
+identity under this repository and the GitHub Actions OIDC issuer (with
+**cosign v2.6.5**, the same version `release.yml` signs with — a v3 CLI is
+expected to verify these signatures too, but neither workflow has
+exercised that); `gh attestation verify --repo` accepts the provenance
+over the index digest;
 and the BuildKit SBOM and provenance attestations are non-empty for every
 platform. When the release notes carry a Docker Hub digest, the same
 checks run against the mirror — no Hub digest means no mirror to verify,
