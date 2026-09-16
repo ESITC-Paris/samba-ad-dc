@@ -220,6 +220,51 @@ class TestEdits(CatalogTestCase):
                       self.read("versions.yaml"))
         self.assertEqual(self.run_cli("get", "4.24", "revision"), (0, "4\n", ""))
 
+    def test_a_substitution_that_breaks_yaml_is_rolled_back(self):
+        """A failed edit must leave the pin contract exactly as it was."""
+        before = self.read("versions.yaml")
+        original = catalog._substitute
+
+        def breaks_the_file(line, key, indent, value):
+            return '    samba_version: "a": "b"\n'
+
+        catalog._substitute = breaks_the_file
+        self.addCleanup(setattr, catalog, "_substitute", original)
+        code, out, err = self.run_cli("set", "4.24", "samba_version", "4.24.7")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(self.read("versions.yaml"), before)
+        # One line, naming what failed — not a PyYAML traceback.
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertIn("samba_version", err)
+        self.assertIn("4.24", err)
+        self.assertIn("left unchanged", err)
+
+    def test_a_value_that_reads_back_differently_is_rolled_back(self):
+        before = self.read("versions.yaml")
+        code, out, err = self.run_cli("set", "4.24", "samba_version",
+                                      "4.24.7\n  bogus")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(self.read("versions.yaml"), before)
+        self.assertIn("reads back as", err)
+        self.assertIn("left unchanged", err)
+
+    def test_a_failed_multi_key_edit_rolls_back_every_key(self):
+        before = self.read("versions.yaml")
+        original = catalog._substitute
+
+        def breaks_the_file(line, key, indent, value):
+            return '    samba_version: "a": "b"\n'
+
+        catalog._substitute = breaks_the_file
+        self.addCleanup(setattr, catalog, "_substitute", original)
+        code, _, err = self.run_cli("bump-version", "4.24", "4.24.7", "abc")
+        self.assertEqual(code, 2)
+        self.assertEqual(self.read("versions.yaml"), before)
+        for key in ("samba_version", "tarball_sha256", "revision"):
+            self.assertIn(key, err)
+
     def test_bump_version_resets_revision_to_1(self):
         self.assertEqual(self.run_cli("set", "4.24", "revision", "5"),
                          (0, "", ""))

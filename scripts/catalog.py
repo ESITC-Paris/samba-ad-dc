@@ -210,9 +210,16 @@ def set_keys(root, branch, pairs):
     The re-parse is the safety net for the regex writer: if a substitution
     landed on the wrong line or produced something YAML reads differently,
     the assertion fails before anything downstream trusts the file.
+
+    The edited bytes only ever stay on disk once they have re-parsed and
+    read back what was written. versions.yaml is the build's pin contract
+    and the watcher edits it unattended, so a failed edit must leave the
+    previous file intact — a corrupted catalog would be inherited by every
+    later step of the run and by the next run.
     """
     path = catalog_path(root)
-    lines = read_text(path).splitlines(keepends=True)
+    original = read_text(path)
+    lines = original.splitlines(keepends=True)
     start, end = _branch_block(lines, branch)
     for key, value in pairs:
         if key in BASE_KEYS:
@@ -229,13 +236,24 @@ def set_keys(root, branch, pairs):
                                    value)
     write_text(path, "".join(lines))
 
-    entry = entry_of(load_catalog(root), branch)
-    for key, value in pairs:
-        got = entry["base"][key.split(".", 1)[1]] if key in BASE_KEYS \
-            else entry[key]
-        if str(got) != value:
-            raise Refusal("edit of %s did not take: wrote %r, re-read %r"
-                          % (key, value, got))
+    try:
+        entry = entry_of(load_catalog(root), branch)
+        for key, value in pairs:
+            got = entry["base"][key.split(".", 1)[1]] if key in BASE_KEYS \
+                else entry[key]
+            if str(got) != value:
+                raise Refusal("%s reads back as %r, not %r"
+                              % (key, str(got), value))
+    except (yaml.YAMLError, KeyError, Refusal) as failure:
+        # Roll back before reporting: an unparseable or wrong file is a
+        # refusal (exit 2), never a traceback and never a file left for
+        # the next command to trust. PyYAML's errors are multi-line, so
+        # they are collapsed to keep the refusal one line.
+        write_text(path, original)
+        raise Refusal(
+            "edit of %s on branch %s did not verify: %s — versions.yaml "
+            "left unchanged" % (", ".join(key for key, _ in pairs), branch,
+                                " ".join(str(failure).split())))
 
 
 # --------------------------------------------------------------------------
