@@ -8,7 +8,7 @@
 // It is invisible to the image build: the Dockerfile's gobuild stage
 // COPYs `entrypoint/` alone, so this file is not in its context and the
 // in-image build keeps resolving the entrypoint module on its own.
-go 1.24.0
+go 1.25.0
 
 use (
 	./entrypoint

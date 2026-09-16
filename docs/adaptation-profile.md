@@ -473,6 +473,35 @@ not claimed, and pinning every apt version in the Dockerfile is explicitly
 rejected — it would make security rebuilds a manual edit instead of a
 rebuild.
 
+**The base image's own packages are part of that content.** The runtime
+stage runs `apt-get upgrade` before it installs the manifest, so the
+packages inherited from `debian:trixie-slim` — `gzip`, `perl-base`,
+`libsqlite3-0`, `libpcre2-8-0` and the rest of the base's 78 — are
+brought to the state of the package index at build time rather than left
+at whatever the base image last shipped. Without it, a Debian security
+update to a base package reached this image only when Debian republished
+the base, because `apt-get install` of the manifest does not upgrade a
+package that already satisfies the request: measured on 2026-09-16, that
+left 12 fixable HIGH/CRITICAL CVEs in the 4.24.7 image, three of them
+CRITICAL, whose fixes were already in the archive the build queries.
+`upgrade` and not `dist-upgrade` on purpose — it installs no new package
+and removes none, so the shipped package **set** is still exactly
+`base ∪ apt closure of runtime-packages.txt`, which is what
+`scripts/check-image-packages.sh` proves.
+
+This does not weaken the claim above, it completes it. The third input,
+the package-index hash, is defined by `scripts/pkg-closure-hash.sh` as the
+union of two dry-runs inside the pinned base — the `upgrade` set *and* the
+manifest's install closure — rendered as `<name> <version>` pairs. So the
+base-package upgrades are inside the hash, not beside it: two builds that
+agree on commit, base digest and hash resolve the same versions for the
+base packages as well as for the manifest, and a security fix to a base
+package moves the hash, busts the package layer (§9.3) and makes the
+rebuild owed (§9bis.1.c) even though the base digest has not moved. The
+resolved versions are recorded in the published SBOM exactly as before;
+what changed is that the SBOM now records an upgraded base, and that the
+hash can see it.
+
 ## Runtime contract
 
 What the image accepts, what it does with it, and how it reports failure.
@@ -845,3 +874,34 @@ it is harmless: Kerberos falls back to its built-in defaults.
   (`update-readme-matrix --rc-series 4.25`) — carries "deprecation
   pending". It is a notice, not a removal; 4.22 keeps receiving every
   patch release until upstream actually ends it.
+- 2026-09-16: Phase 4 — **base-package updates become a build input, and
+  the §5.4 fixable-CVE gate goes green.** Measured on the 4.24.7 image of
+  that morning, the gate
+  (`trivy image --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL`)
+  reported 41 fixable HIGH/CRITICAL findings, three of them CRITICAL, from
+  three independent causes; all three are fixed at the source rather than
+  excepted, and nothing was suppressed. (1) Twelve findings came from
+  packages the image inherits from `debian:trixie-slim` and never
+  upgraded — `apt-get install` of the manifest does not touch a package
+  that already satisfies the request, so `gzip`, `perl-base` (all three
+  CRITICALs), `libsqlite3-0` and `libpcre2-8-0` stayed at the base's
+  versions while their fixes sat in the archive the build already queries.
+  The runtime stage now runs `apt-get upgrade` before the manifest
+  install, in the same layer; B.8 states why that does not weaken the
+  reproducibility claim and why it is `upgrade` and never `dist-upgrade`.
+  (2) Nineteen came from the Go stdlib compiled into the entrypoint
+  binary: the toolchain pin, not the `go.mod` floor, decides which stdlib
+  ships, so `base.gobuild` moves from `golang:1.24-trixie` (stdlib
+  1.24.13) to a `golang:1.25-trixie` digest resolving to go1.25.14. (3)
+  Ten came from `golang.org/x/crypto`, indirect via `go-ldap`, bumped
+  v0.48.0 → v0.55.0 — the newest release the 1.25 toolchain accepts, and
+  well above the v0.52.0 the advisories require. `scripts/pkg-closure-hash.sh`
+  is added as THE definition of `pkg_index_hash`, shared by the Phase 2
+  seed, the Phase 6 watcher probe and any local check: the union of an
+  `upgrade` dry-run and an `install` dry-run inside the pinned base, as
+  `<name> <version>` pairs, sha256, first 16 hex. Both halves are
+  load-bearing — an `install`-only hash is blind to exactly the
+  base-package security fix that §9bis.1.c makes a rebuild trigger. The
+  gate now reports 0/0 on both the Debian and the gobinary target, and
+  `check-image-packages.sh` still passes unchanged, because `upgrade`
+  moves versions and never the package set.

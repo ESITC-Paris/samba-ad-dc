@@ -6,10 +6,26 @@
 # stay in sync. Nothing here resolves a "latest" anything.
 ARG BUILDER_BASE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 ARG RUNTIME_BASE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
-# golang:1.24-trixie — entrypoint/go.mod declares `go 1.24.0`, so 1.24 is
+# golang:1.25-trixie — entrypoint/go.mod declares `go 1.25.0`, so 1.25 is
 # the floor, and trixie matches the runtime base so the toolchain and the
 # image agree on their libc even though the binary is built CGO_ENABLED=0.
-ARG GOBUILD_BASE=golang:1.24-trixie@sha256:5835f052b784aa39f2fe9070def3568605c8bc3fcd810f10402066348b61e716
+# The floor is not what fixes the pin, though: a Go binary carries the
+# stdlib it was compiled with, so this line decides which toolchain CVEs
+# ship inside /usr/local/bin/entrypoint. 1.24-trixie was stdlib 1.24.13
+# and trivy reported 19 fixable HIGH findings against it, every one fixed
+# in 1.25.8..1.25.13; this digest resolves to go1.25.14. Bump to whatever
+# clears the §5.4 gate, never below it.
+# This pin and entrypoint/go.mod's `golang.org/x/crypto` move together:
+# x/crypto >= v0.56.0 declares `go 1.26.0`, which `go mod tidy` would
+# propagate into go.mod and this toolchain would then refuse to build. So
+# the module is held at v0.55.0 — the newest 1.25 accepts, and well above
+# the v0.52.0 the HIGH advisories require. Two MEDIUM x/crypto findings
+# (CVE-2026-56855, CVE-2026-78662) are fixed only in v0.56.0 and are
+# therefore still present; they are below the gate's HIGH,CRITICAL
+# threshold, and clearing them means moving BOTH lines to 1.26 at once.
+# A bare `go get -u` that bumps x/crypto without this ARG is a red build,
+# not a silent one — the gobuild stage fails on the go directive.
+ARG GOBUILD_BASE=golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73
 
 # ---------------------------------------------------------------------------
 # builder — compiles Samba with bundled Heimdal into DESTDIR=/dest
@@ -277,9 +293,29 @@ COPY runtime-packages.txt /usr/share/samba-ad-dc/runtime-packages.txt
 # builder: the inputs are pinned (base image digest, PKG_INDEX_HASH) and the
 # resolved package versions are recorded in the published SBOM (SPEC §4.3
 # interpretation in the adaptation profile).
-# hadolint ignore=DL3008,SC2046
+# `apt-get upgrade` before the install, and in the SAME RUN: a package the
+# base image already carries is never touched by `apt-get install` of the
+# manifest — apt does not upgrade an already-satisfying package — so a
+# Debian security update to a base-inherited package reached this image
+# only when Debian republished debian:trixie-slim. Measured on the
+# 4.24.7 build of 2026-09-16: gzip 1.13-1, perl-base 5.40.1-6 (three
+# CRITICALs), libsqlite3-0 3.46.1-7+deb13u1 and libpcre2-8-0
+# 10.46-1~deb13u1 shipped with 12 fixable HIGH/CRITICAL CVEs whose fixes
+# were already sitting in the archive this very RUN queries. SPEC
+# §9bis.1.c makes a package-index change a build input, and that is what
+# this line honours: the upgrade set is the FIRST of the two dry-runs
+# scripts/pkg-closure-hash.sh folds into PKG_INDEX_HASH, so a security
+# fix to a base package moves the hash, busts this layer and forces the
+# rebuild even when the base digest has not moved.
+# `upgrade`, deliberately NOT `dist-upgrade`: upgrade installs no new
+# package and removes none, so the package SET stays base ∪ closure —
+# which is exactly what scripts/check-image-packages.sh proves and what
+# the hash's first dry-run models. dist-upgrade may do both and would
+# make the shipped set unexplainable from the manifest.
+# hadolint ignore=DL3005,DL3008,SC2046
 RUN echo "pkg-index=${PKG_INDEX_HASH}" \
     && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        $(sed 's/#.*//' /usr/share/samba-ad-dc/runtime-packages.txt) \
     && rm -rf /var/lib/apt/lists/*
