@@ -278,12 +278,15 @@ image.
 (`sigstore/cosign-installer` pinned to that release in `release.yml`), and
 `post-push-verify.yml` verifies every published image with that same
 v2.6.5 — so v2.6.5 is the one version these signatures are known to verify
-under. `brew install cosign` now installs v3. Verifying a v2-produced
-keyless signature with a v3 CLI is expected to work — v3 reads the
-signatures v2 wrote — but this project has not exercised it, so it is an
-expectation and not a measurement. If a v3 verification of a correctly
-signed image fails, install v2.6.5 before concluding anything about the
-image:
+under. `brew install cosign` now installs v3.
+
+Verifying a v2-produced keyless signature with a **v3** CLI is expected to
+work: upstream states that v3 is backwards-compatible with v2 layouts (the
+incompatibility runs the other way — a v2 CLI cannot verify a signature v3
+produced in the new bundle format). That is upstream's claim, not this
+project's measurement: no workflow here has been run against a v3 CLI. So
+if a v3 verification of a correctly signed image fails, install v2.6.5 and
+retry before concluding anything about the image:
 
 ```sh
 cosign version   # what you have
