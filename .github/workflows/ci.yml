@@ -59,18 +59,13 @@ jobs:
         # names the rule, file, line and commit - which is what the person
         # revoking the credential actually needs.
         run: |
-          # One accepted finding, pinned by its gitleaks fingerprint rather
-          # than by excluding a path or switching a rule off: the
-          # generic-api-key rule matches the Samba release key's PRIMARY
-          # FINGERPRINT in keys/PINNING.md (SPEC §4.4), which is public by
-          # construction - it is the value every signature check is
-          # verified against. Pinning the fingerprint keeps every other
-          # line of that file, and any future commit touching that line,
-          # in scope: a rotation produces a new fingerprint and turns this
-          # gate red until a human re-reads it.
-          cat > "${RUNNER_TEMP}/gitleaksignore" <<'IGNORE'
-          0033e25d89c638ab61444b481ca631bd4995302c:keys/PINNING.md:generic-api-key:5
-          IGNORE
+          # The accepted findings live in the tracked .gitleaksignore at
+          # the repository root, which gitleaks reads by itself from the
+          # tree it scans - so this step is a plain `detect`, and a
+          # developer running the same command locally accepts exactly the
+          # same set. Each line there is pinned by gitleaks fingerprint
+          # and carries why the matched value is not a credential.
+
           # safe.directory as environment rather than as config: the
           # runner's checkout belongs to uid 1001 and this container runs
           # as root, and git >= 2.35.2 refuses such a repository outright
@@ -82,13 +77,11 @@ jobs:
           # gate into a fatal, or worse, into a silent pass.
           docker run --rm \
             -v "${PWD}:/repo:ro" \
-            -v "${RUNNER_TEMP}/gitleaksignore:/gitleaksignore:ro" \
             -e GIT_CONFIG_COUNT=1 \
             -e GIT_CONFIG_KEY_0=safe.directory \
             -e GIT_CONFIG_VALUE_0=/repo \
             "${GITLEAKS_IMAGE}" \
-            detect --source /repo --no-banner --redact --verbose \
-            --gitleaks-ignore-path /gitleaksignore
+            detect --source /repo --no-banner --redact --verbose
 
       - name: yamllint
         run: pipx run yamllint==1.38.0 --strict .

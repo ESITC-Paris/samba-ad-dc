@@ -1,0 +1,25 @@
+# Accepted gitleaks findings, pinned by FINGERPRINT
+# (<commit>:<path>:<rule>:<line>) rather than by excluding a path or
+# switching a rule off. gitleaks reads this file automatically from the
+# root of the repository it scans, so CI and a developer running the same
+# command locally accept exactly the same set — the previous home for
+# this line was a heredoc inside .github/workflows/ci.yml, which only CI
+# ever saw.
+#
+# Adding a line here is a security decision. Each one carries WHY the
+# matched value is not a credential; a line without that is a suppression,
+# which SPEC §5.3 does not allow.
+
+# The generic-api-key rule matches the Samba Distribution Verification
+# Key's PRIMARY FINGERPRINT on line 5 of keys/PINNING.md (SPEC §4.4). It
+# is a 40-hex string with the entropy of a token and none of the secrecy
+# — it is the PUBLIC pin every upstream tarball signature in this
+# repository is verified against, and publishing it is the entire point
+# of the file it sits in. (The value is deliberately not repeated here:
+# a second copy would be a second finding, on a line no fingerprint
+# covers yet — this allowlist would turn the gate red on itself.)
+# Pinning the fingerprint keeps every other line of keys/PINNING.md, and
+# any future commit touching this one, in scope: a key rotation produces
+# a new gitleaks fingerprint and turns the gate red until a human
+# re-reads it.
+0033e25d89c638ab61444b481ca631bd4995302c:keys/PINNING.md:generic-api-key:5
