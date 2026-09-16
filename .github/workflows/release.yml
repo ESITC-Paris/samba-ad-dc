@@ -96,7 +96,10 @@ jobs:
       staging: ${{ steps.tag.outputs.staging }}
       branch: ${{ steps.catalog.outputs.branch }}
       is_default: ${{ steps.catalog.outputs.is_default }}
-      aliases: ${{ steps.catalog.outputs.aliases }}
+      # The tags this run actually creates, and whether the mutable ones are
+      # among them — narrowed by the degraded mode, not by the catalog.
+      aliases: ${{ steps.target.outputs.aliases }}
+      aliases_move: ${{ steps.target.outputs.aliases_move }}
       samba_version: ${{ steps.catalog.outputs.samba_version }}
       tarball_sha256: ${{ steps.catalog.outputs.tarball_sha256 }}
       builder_base: ${{ steps.catalog.outputs.builder_base }}
@@ -193,8 +196,10 @@ jobs:
 
           # The alias list is catalog.py's decision, including the rule that
           # `X` and `latest` belong to the default branch alone. Carried as
-          # JSON because a GITHUB_OUTPUT value is a single line.
-          aliases=$(python3 scripts/catalog.py aliases "${branch}" \
+          # JSON because a GITHUB_OUTPUT value is a single line. The first
+          # entry is the immutable `X.Y.Z-rN`; the degraded-mode step below
+          # is what decides how many of the rest are actually created.
+          aliases_full=$(python3 scripts/catalog.py aliases "${branch}" \
             | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')
 
           # The commit actually checked out, not github.sha: on a staging
@@ -206,11 +211,11 @@ jobs:
           # runners would not.
           created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          echo "branch=${branch} (default: ${default_branch}) aliases=${aliases}"
+          echo "branch=${branch} (default: ${default_branch}) aliases=${aliases_full}"
           {
             echo "branch=${branch}"
             echo "is_default=${is_default}"
-            echo "aliases=${aliases}"
+            echo "aliases_full=${aliases_full}"
             echo "samba_version=$(get samba_version)"
             echo "tarball_sha256=$(get tarball_sha256)"
             echo "builder_base=$(get base.builder)"
@@ -230,6 +235,7 @@ jobs:
           DEGRADED_MODE: ${{ inputs.degraded_mode || 'none' }}
           STAGGERED_ARCH: ${{ inputs.staggered_arch || 'amd64' }}
           TRIGGER_CAUSE: ${{ inputs.trigger_cause || 'manual' }}
+          ALIASES_FULL: ${{ steps.catalog.outputs.aliases_full }}
         run: |
           set -eu
           image="${GHCR_IMAGE}"
@@ -288,8 +294,32 @@ jobs:
           expected_digests=$(printf '%s' "${build_matrix}" \
             | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["include"]))')
 
+          # Which tags this run creates. Normally all of them; under Mode 2
+          # ONLY the immutable `X.Y.Z-rN`, which is the first entry.
+          #
+          # §9.6 Mode 2 says the pending architecture's users "remain on the
+          # previous revision" — and they only can if nothing they follow
+          # moves. `latest`, `X`, `X.Y` and `X.Y.Z` are how a deployment
+          # follows a branch, so pointing them at a single-architecture index
+          # would not leave those users on the previous revision: it would
+          # break their pull outright, which is a worse outcome than the
+          # incident the mode exists to survive. The reduced manifest is
+          # therefore reachable only by the one tag that is immutable and was
+          # never promised to be complete; the aliases move at the recovery
+          # `r(N+1)` release, which is an ordinary complete release and moves
+          # them the ordinary way.
+          aliases="${ALIASES_FULL}"
+          aliases_move=true
+          if [ "${DEGRADED_MODE}" = "staggered" ]; then
+            aliases=$(printf '%s' "${ALIASES_FULL}" | jq -c '.[0:1]')
+            aliases_move=false
+            echo "::warning::§9.6 Mode 2: only the immutable tag is created;" \
+              "latest / X / X.Y / X.Y.Z keep pointing at the previous complete manifest"
+          fi
+
           echo "target=${image} mode=${DEGRADED_MODE} legs=${expected_digests}"
           echo "matrix=${build_matrix}"
+          echo "tags=${aliases} (mutable aliases move: ${aliases_move})"
           {
             echo "ghcr_image=${image}"
             echo "build_matrix=${build_matrix}"
@@ -297,6 +327,8 @@ jobs:
             echo "degraded_mode=${DEGRADED_MODE}"
             echo "pending_arch=${pending_arch}"
             echo "trigger_cause=${TRIGGER_CAUSE}"
+            echo "aliases=${aliases}"
+            echo "aliases_move=${aliases_move}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Docker Hub mirror availability
@@ -365,11 +397,36 @@ jobs:
           # The org path is lowercase and spelled out: GHCR package paths are
           # case-sensitive, and github.repository_owner carries the
           # display-cased `ESITC-Paris`.
+          #
+          # 404 and "anything else" are NOT the same answer, and collapsing
+          # them is how this step would delete both upgrade gates in silence:
+          # an empty result makes TestUpgradeFromLastPublished skip and the
+          # cross-branch step not run at all, and the release then publishes
+          # green having tested no upgrade path. 404 is the normal state of a
+          # package nobody has published yet; a 403 is a missing
+          # `packages: read`, an org package-visibility policy, or a token
+          # that cannot see the package — a broken gate, not an empty one.
+          # scripts/watch.py's published_tags() draws the same line for the
+          # same reason; this is that rule in shell.
+          status=0
           tags=$(gh api "/orgs/esitc-paris/packages/container/${PACKAGE}/versions" \
-            --paginate --jq '.[].metadata.container.tags[]' 2>/dev/null || true)
-          if [ -z "${tags}" ]; then
-            echo "::warning::no published tag found for ${PACKAGE} on GHCR" \
-              "(first publication, or the package listing is not readable) - the upgrade tests will skip"
+            --paginate --jq '.[].metadata.container.tags[]' \
+            2> "${RUNNER_TEMP}/gh-packages.err") || status=$?
+          if [ "${status}" -ne 0 ]; then
+            error=$(cat "${RUNNER_TEMP}/gh-packages.err")
+            case "${error}" in
+              *"HTTP 404"*|*"Not Found"*|*"not found"*)
+                echo "::warning::no package esitc-paris/${PACKAGE} on GHCR yet" \
+                  "(first publication anywhere) - both upgrade tests will skip, loudly, naming the variable"
+                tags=""
+                ;;
+              *)
+                echo "${error}"
+                echo "::error::could not list the published tags of esitc-paris/${PACKAGE}:" \
+                  "the upgrade gates cannot be resolved, and a release that skips them silently is not gated"
+                exit 1
+                ;;
+            esac
           fi
 
           # The highest X.Y.Z-rN of one branch. Sorted on the two numbers
@@ -390,6 +447,13 @@ jobs:
           newest=$(highest "${BRANCH}")
           if [ -n "${newest}" ]; then
             upgrade_from="${IMAGE}:${newest}"
+          else
+            # The package exists but this series has never been published:
+            # §8.3's first-release case, legitimate but never silent. The
+            # difference between "no tag to upgrade from" and "the listing
+            # broke" is now visible in the log without reading the step above.
+            echo "::warning::no published ${BRANCH} tag on GHCR (first release of the series," \
+              "SPEC §8.3) - TestUpgradeFromLastPublished will skip"
           fi
 
           # The catalog lists branches ascending, so the line before this one
@@ -397,10 +461,15 @@ jobs:
           previous=$(python3 scripts/catalog.py branches \
             | awk -v want="${BRANCH}" '$0 == want { print seen; exit } { seen = $0 }')
           upgrade_from_prev=""
-          if [ -n "${previous}" ]; then
+          if [ -z "${previous}" ]; then
+            echo "${BRANCH} is the oldest branch in the catalog: no cross-branch upgrade to run"
+          else
             newest_prev=$(highest "${previous}")
             if [ -n "${newest_prev}" ]; then
               upgrade_from_prev="${IMAGE}:${newest_prev}"
+            else
+              echo "::warning::no published ${previous} tag on GHCR - the cross-branch upgrade step" \
+                "will not run for this release"
             fi
           fi
 
@@ -944,13 +1013,14 @@ jobs:
           ALIASES: ${{ needs.prepare.outputs.aliases }}
         run: |
           set -eu
-          # Every alias catalog.py listed, in one `imagetools create`: the
-          # tags then all resolve to the same index digest by construction,
-          # which is what makes `latest` and `4` and `4.24.7-r1` provably the
-          # same image rather than three images that happen to agree today.
-          # catalog.py already decided that `X` and `latest` belong to the
-          # default branch alone, so publishing an older series cannot move
-          # them.
+          # Every tag `prepare` decided on, in one `imagetools create`: they
+          # then all resolve to the same index digest by construction, which
+          # is what makes `latest` and `4` and `4.24.7-r1` provably the same
+          # image rather than three images that happen to agree today.
+          # This step is deliberately data-driven and makes no policy of its
+          # own: catalog.py already decided that `X` and `latest` belong to
+          # the default branch alone, and `prepare` already narrowed the list
+          # to the immutable tag under §9.6 Mode 2.
           mapfile -t aliases < <(printf '%s' "${ALIASES}" | jq -r '.[]')
           tags=()
           for alias in "${aliases[@]}"; do
@@ -1072,8 +1142,13 @@ jobs:
       - name: Prepare the Docker Hub README (absolute links)
         # Only from the default branch: the Docker Hub description is
         # repository-wide, and a maintenance release of an older series must
-        # not rewrite it with that tag's tree.
-        if: needs.prepare.outputs.mirror == 'true' && needs.prepare.outputs.is_default == 'true'
+        # not rewrite it with that tag's tree. Never under §9.6 Mode 2: the
+        # description documents `latest`, which that mode deliberately leaves
+        # pointing at the previous, complete manifest.
+        if: >-
+          needs.prepare.outputs.mirror == 'true'
+          && needs.prepare.outputs.is_default == 'true'
+          && needs.prepare.outputs.aliases_move == 'true'
         run: |
           set -eu
           python3 - <<'PY'
@@ -1090,7 +1165,10 @@ jobs:
           PY
 
       - name: Sync the Docker Hub description
-        if: needs.prepare.outputs.mirror == 'true' && needs.prepare.outputs.is_default == 'true'
+        if: >-
+          needs.prepare.outputs.mirror == 'true'
+          && needs.prepare.outputs.is_default == 'true'
+          && needs.prepare.outputs.aliases_move == 'true'
         uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa  # v5.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -1142,8 +1220,11 @@ jobs:
           generate_release_notes: false
           # Only the default branch's release is the repository's "Latest":
           # a security rebuild of 4.22 must not displace 4.24 at the top of
-          # the releases page.
-          make_latest: ${{ needs.prepare.outputs.is_default }}
+          # the releases page. And never a §9.6 Mode 2 release, for the same
+          # reason its image aliases do not move — "Latest" would advertise a
+          # reduced manifest as the thing to install.
+          make_latest: ${{ needs.prepare.outputs.is_default == 'true'
+            && needs.prepare.outputs.aliases_move == 'true' }}
 
       - name: Job summary
         env:
@@ -1174,6 +1255,11 @@ jobs:
             fi
             if [ "${DEGRADED_MODE}" != "none" ]; then
               echo "| Degraded mode | ${DEGRADED_MODE}, affected architecture \`${PENDING_ARCH}\` (SPEC §9.6) |"
+            fi
+            if [ "${DEGRADED_MODE}" = "staggered" ]; then
+              echo "| Aliases | NOT moved - \`latest\`, \`X\`, \`X.Y\` and \`X.Y.Z\` still point at the" \
+                "previous complete manifest, so users on \`${PENDING_ARCH}\` stay on the previous" \
+                "revision (§9.6 Mode 2). They move at the recovery r(N+1) release. |"
             fi
             echo
             echo "Verify:"
@@ -1218,17 +1304,51 @@ jobs:
           # the tag is still better than no issue.
           RAW_TAG: ${{ needs.prepare.outputs.tag || inputs.tag || github.ref_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Which job failed decides what this issue is allowed to claim.
+          MERGE_RESULT: ${{ needs.merge.result }}
+          IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+          ALIASES: ${{ needs.prepare.outputs.aliases }}
         run: |
           set -eu
+          # "Nothing was published" is true when the failure happened before
+          # `merge` ran, and only then. `merge` creates the tags with
+          # `imagetools create` BEFORE it signs, attests and cuts the
+          # Release, so a merge-time failure can leave real, pullable tags
+          # behind that carry no signature - and the operator has to know
+          # that before retrying, because §3.2's immutability check will
+          # refuse a re-run of the same tag by design. A notification that
+          # asserted the opposite would send them to re-dispatch a run that
+          # cannot succeed, and would let an unsigned tag sit unnoticed.
+          if [ "${MERGE_RESULT}" = "failure" ]; then
+            tags=""
+            if [ -n "${ALIASES}" ]; then
+              tags=$(printf '%s' "${ALIASES}" | jq -r --arg image "${IMAGE}" \
+                'map("- " + $image + ":" + .) | join("\n")')
+            fi
+            body=$(printf '%s\n\n%s\n%s\n\n%s\n\n%s\n%s\n\nInvestigate: %s' \
+              'The release pipeline failed in the merge job.' \
+              'Tags MAY already exist: the merge job creates them before signing,' \
+              'attestation and the GitHub Release. These may be published, unsigned:' \
+              "${tags:-(the tag list could not be resolved - inspect the run)}" \
+              'CHECK GHCR BEFORE RETRYING. A re-run of the same tag is refused by' \
+              'the SPEC 3.2 immutability check - delete the partial tags, or ship r(N+1).' \
+              "${RUN_URL}")
+          else
+            body=$(printf '%s\n\nInvestigate: %s' \
+              'The release pipeline failed before anything was published - no tag was created.' \
+              "${RUN_URL}")
+          fi
+
           # One open issue per broken tag; repeats add a comment instead of
           # flooding the tracker.
           title="Release pipeline failed for ${RAW_TAG}"
           number=$(gh issue list --state open --json number,title \
             --jq ".[] | select(.title==\"${title}\") | .number" | head -1)
           if [ -n "${number}" ]; then
-            gh issue comment "${number}" --body "Failed again: ${RUN_URL}"
+            # The repeat carries the same body, not just the run URL: a
+            # second failure can reach `merge` where the first did not, and
+            # the "tags may exist" warning is exactly what would be lost.
+            gh issue comment "${number}" --body "$(printf 'Failed again.\n\n%s' "${body}")"
           else
-            gh issue create --title "${title}" --assignee euca01 \
-              --body "$(printf 'The release pipeline failed - nothing was published.\n\nInvestigate: %s' \
-                "${RUN_URL}")"
+            gh issue create --title "${title}" --assignee euca01 --body "${body}"
           fi
