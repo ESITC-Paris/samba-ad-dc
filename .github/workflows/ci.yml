@@ -71,9 +71,21 @@ jobs:
           cat > "${RUNNER_TEMP}/gitleaksignore" <<'IGNORE'
           0033e25d89c638ab61444b481ca631bd4995302c:keys/PINNING.md:generic-api-key:5
           IGNORE
+          # safe.directory as environment rather than as config: the
+          # runner's checkout belongs to uid 1001 and this container runs
+          # as root, and git >= 2.35.2 refuses such a repository outright
+          # (`fatal: detected dubious ownership`), which gitleaks would
+          # report as a scan of zero commits. v8.30.1's image happens to
+          # carry `safe.directory = *` in root's gitconfig, so it does not
+          # trip today - stating the exception at the call site is what
+          # keeps a future tag bump that drops that file from turning this
+          # gate into a fatal, or worse, into a silent pass.
           docker run --rm \
             -v "${PWD}:/repo:ro" \
             -v "${RUNNER_TEMP}/gitleaksignore:/gitleaksignore:ro" \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0=/repo \
             "${GITLEAKS_IMAGE}" \
             detect --source /repo --no-banner --redact --verbose \
             --gitleaks-ignore-path /gitleaksignore
@@ -310,6 +322,13 @@ jobs:
       # per-architecture, and so is the vulnerability set it carries - an
       # amd64-only scan would state nothing about the arm64 image that is
       # published under the same tag.
+      #
+      # Copy contract for release.yml: these steps assume a single-arch
+      # image already loaded in the local docker daemon under the tag
+      # `samba-ad-dc:ci`, and a `matrix.arch` value that makes the report
+      # file and the artifact name unique per leg. A copy that keeps the
+      # steps but drops either one produces colliding artifacts or scans
+      # the wrong image.
       #
       # All three trivy invocations go through the pinned action instead of
       # a hand-installed binary, for one reason: it caches the
