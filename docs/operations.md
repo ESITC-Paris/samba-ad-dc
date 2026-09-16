@@ -173,11 +173,31 @@ Four independent layers, each of which fails loudly on its own:
    [releases page](https://github.com/ESITC-Paris/samba-ad-dc/releases)
    (subscribe with Watch → Custom → Releases) and in `CHANGELOG.md`.
 
-Two signals are deliberately *not* failures and arrive as assigned issues
-instead: *"New upstream series X.Y — catalog decision required"* and
-*"Deprecation pending: branch X.Y (Z.W rc published)"*. Both are decisions
-the automation must not make; see
-[What needs a human](adaptation-profile.md#what-needs-a-human).
+Three signals are deliberately *not* failures and arrive as assigned
+issues instead:
+
+- *"New upstream series X.Y — catalog decision required"* and
+  *"Deprecation pending: branch X.Y (Z.W rc published)"* — catalog
+  decisions the automation must not make; see
+  [What needs a human](adaptation-profile.md#what-needs-a-human).
+- *"CVE advisory: branch `<X.Y>` (`<X.Y.Z-rN>`)"* — one per published
+  branch, opened when a package the ledger did **not** list before gains
+  an unfixed HIGH/CRITICAL finding in that branch's published image. A new
+  CVE on a package already listed opens nothing and comments nothing — the
+  ledger is still synced, but silently: otherwise every refresh of the
+  vulnerability feed would reopen the same issue. It is
+  informational, and there is nothing to build: a finding with no
+  available fix cannot be resolved by rebuilding (§9bis.8.c), the sync has
+  already written the entries into `security/cve-exceptions.yaml`, and
+  each new one carries a 90-day `review_by`. What to do is read those
+  entries: confirm each package still has no fixed version and record why
+  the finding does not apply, or delete the entry once a fix ships — a fix
+  arrives as a package-closure change and becomes a build trigger by
+  itself. Extending a `review_by` is a human edit of the file; a sync
+  never moves one, and `check-cve-exceptions.py` fails the build once one
+  has passed. While the package list keeps moving the **open** issue is
+  commented rather than recreated; close it when the review is done, and
+  the next new package opens a fresh one.
 
 The CVE advisory step is `continue-on-error` on purpose: it can never
 trigger a build (§9bis.1.d), so its failure must not fail a run whose
@@ -473,4 +493,5 @@ job summary carries the same statement.
 | *"Release pipeline failed"* | the linked run's failed job | a §8 gate — nothing was published; the tag exists and can be re-dispatched once the cause is fixed |
 | Release fails on the immutability check | GHCR tag list | the tag is already published; bump the revision |
 | Mirror missing from the notes | the `prepare` job's warning | `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` unset |
+| *"CVE advisory: branch …"* | the named packages in `security/cve-exceptions.yaml` | a component gained an unfixed HIGH/CRITICAL CVE — informational, no rebuild can fix it; confirm each entry or delete it once a fix ships |
 | A `publish` decision every hour | GHCR, for the tag it names | the image genuinely is not there — the dispatch is being lost; the tag itself is not re-created and is not the problem |
