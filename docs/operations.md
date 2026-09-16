@@ -115,6 +115,14 @@ watcher decision (`action=publish`, `cause=first-publication`) rather than
 a special case. On the first hourly run the three catalog branches are all
 in that state, so the run decides `publish` three times.
 
+One caveat on that expectation: the closure hashes committed in
+`.build-state.json` were measured on 2026-09-16, and the Debian package
+index moves on its own schedule. If it has moved since, the first hourly
+run decides `revision` with cause `pkg-update` instead, and the first
+published tags are `-r2` rather than `-r1`. That is correct behaviour, not
+a fault — the image would genuinely differ from the one the committed hash
+describes — and nothing about the rest of this section changes.
+
 1. **Optional — add the Docker Hub secrets.** Without them the first three
    releases publish to GHCR only and warn; the mirror can be added later
    and picks up from the next release onward. Nothing back-fills it.
@@ -372,6 +380,28 @@ The matrix re-render is a convenience, not a contract: `apply` re-renders
 it on every watcher run that acts, adding the §9.4 deprecation-pending
 suffix the run a candidate is detected and removing it the run it stops
 applying. `versions.yaml` is what must be right.
+
+Then seed `.build-state.json` for the new branch, in the same commit, with
+the values the new block pins:
+
+```sh
+# The three digests are the ones you just pinned in the new branch block —
+# copy each `base.*` ref's part after the `@`.
+python3 scripts/catalog.py state set 4.25 runtime_digest sha256:<runtime>
+python3 scripts/catalog.py state set 4.25 builder_digest sha256:<builder>
+python3 scripts/catalog.py state set 4.25 gobuild_digest sha256:<gobuild>
+# The closure hash is measured, not copied: the same script the probe runs.
+python3 scripts/catalog.py state set 4.25 pkg_index_hash \
+  "$(sh scripts/pkg-closure-hash.sh debian:trixie-slim@sha256:<runtime>)"
+```
+
+`decide()` already treats a branch with no state entry as "no prior
+observation" — it records what it sees instead of reading it as a moved
+base digest, so an unseeded branch reaches the `publish` self-heal and
+gets its r1 rather than a spurious `-r2`. Seeding is the belt to that
+brace: it makes the first run's recorded values reviewable in the pull
+request that adds the series, instead of arriving in a bot commit an hour
+later.
 
 Adding the **newest** series also changes the default branch
 (`default_branch:` in `versions.yaml`), which decides which release is
