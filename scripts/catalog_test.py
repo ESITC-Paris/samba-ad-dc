@@ -598,6 +598,36 @@ class TestCveExceptions(CatalogTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.strip(), "cve exceptions: 2 entries, none expired")
 
+    def test_an_expired_package_entry_is_named_by_package(self):
+        # The synchronised shape has no `cve` key: its CVEs live under
+        # `cves`. Naming it "entry 1" would leave the gate's only output
+        # with nothing a reviewer could act on.
+        code, _, err = self.check(
+            "exceptions:\n"
+            "  - package: libxml2\n"
+            "    installed: 2.9.14+dfsg-1.3\n"
+            "    branches: [\"4.24\"]\n"
+            "    cves: [\"CVE-2026-00010\", \"CVE-2026-00011\"]\n"
+            "    reason: no fixed version available\n"
+            "    introduced: 4.24.6-r1\n"
+            "    review_by: %s\n" % self.day(-1))
+        self.assertEqual(code, 1)
+        self.assertIn("libxml2 2.9.14+dfsg-1.3", err)
+        self.assertNotIn("entry 1", err)
+        # No `component` key on this shape, so no empty parenthetical.
+        self.assertNotIn("unspecified", err)
+
+    def test_a_package_entry_without_review_by_is_named_by_package(self):
+        code, _, err = self.check(
+            "exceptions:\n  - package: libxml2\n    installed: 2.9.14-1\n")
+        self.assertEqual(code, 1)
+        self.assertIn("libxml2 2.9.14-1: no review_by date", err)
+
+    def test_an_entry_with_neither_key_falls_back_to_its_position(self):
+        code, _, err = self.check("exceptions:\n  - reason: nothing here\n")
+        self.assertEqual(code, 1)
+        self.assertIn("entry 1", err)
+
     def test_entry_missing_review_by_is_refused(self):
         code, _, err = self.check(
             "exceptions:\n  - cve: CVE-2026-00003\n    component: libfoo\n")

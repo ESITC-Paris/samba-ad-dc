@@ -162,6 +162,33 @@ class CarryOver(Fixture):
         # A new CVE on a package already listed updates the entry in place.
         self.assertEqual(entry["cves"], ["CVE-2026-0001", "CVE-2026-0099"])
 
+    def test_a_human_written_reason_survives_a_sync(self):
+        # `reason` is the one field of an entry that carries judgement.
+        # A sync that overwrote it with the machine default would erase a
+        # reviewer's work silently, every hour.
+        self.write_report([vulnerability("libxml2", "CVE-2026-0001")])
+        self.sync()
+        entries = self.read_entries()
+        entries[0]["reason"] = ("bundled by Samba, not reachable from the "
+                                "DC role; tracked upstream as BUG-1234")
+        self.write_ledger(entries)
+        self.write_report([vulnerability("libxml2", "CVE-2026-0001"),
+                           vulnerability("libxml2", "CVE-2026-0099")])
+        self.sync(now="2026-10-01")
+        entry = self.read_entries()[0]
+        self.assertIn("tracked upstream as BUG-1234", entry["reason"])
+        # The rest of the entry still syncs.
+        self.assertEqual(entry["cves"], ["CVE-2026-0001", "CVE-2026-0099"])
+
+    def test_the_machine_default_reason_is_still_refreshed(self):
+        # An entry nobody has touched keeps tracking the default, so a
+        # future change of wording reaches every untouched entry.
+        self.write_report([vulnerability("libxml2", "CVE-2026-0001")])
+        self.sync()
+        self.assertEqual(self.read_entries()[0]["reason"], ledger.REASON)
+        self.sync(now="2026-10-01")
+        self.assertEqual(self.read_entries()[0]["reason"], ledger.REASON)
+
     def test_introduced_keeps_the_tag_that_first_shipped_the_package(self):
         self.write_report([vulnerability("libxml2", "CVE-2026-0001")])
         self.sync(tag="4.24.7-r1")
