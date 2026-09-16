@@ -216,7 +216,11 @@ marker at `/var/lib/samba/.image-state.json` records the Samba version
 that wrote the state: a volume written by a **newer** Samba is refused
 with exit 22, an older one triggers `samba-tool dbcheck` before the
 daemons start and the marker is moved forward only if it passes. A
-restart never modifies existing state.
+marker whose version cannot be parsed is a configuration error, refused
+with exit 10 before any check runs — unlike an *absent* marker, which is
+adopted after a dbcheck, because a volume that never carried one is a
+pre-existing volume rather than a damaged one. A restart never modifies
+existing state.
 
 ### Argv
 

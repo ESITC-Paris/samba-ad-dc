@@ -1224,3 +1224,10 @@ gates.
   one guide; every backticked `Test…` token in the guides a mapped ID or
   an exempt infrastructure test), matching whole backticked IDs so that
   `TestProvision` cannot stand in for `TestProvisionOverStateRefused`.
+- 2026-09-16: Phase 5 — one correction to the Phase 4 entry above: the
+  README's pre-release notice is *not* a bare blockquote any more. It
+  carries a `<!-- GO-LIVE: … -->` marker naming the going-live step that
+  deletes it, so the step in `docs/operations.md` is still a hand edit,
+  but a greppable one — and it now says to delete the marker *and* the
+  blockquote, because deleting only the marker is the failure it exists
+  to prevent.

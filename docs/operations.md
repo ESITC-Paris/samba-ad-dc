@@ -148,9 +148,11 @@ describes — and nothing about the rest of this section changes.
 5. **Watch the three post-push verifications** (see below), which re-check
    the published artefacts from outside the pipeline.
 6. **Delete the pre-release notice in `README.md`** once the first release
-   exists — the paragraph beginning `> **Status: pre-release.**`. It is a
-   plain blockquote with no HTML marker around it, so this is a hand edit,
-   not a scripted one. (Phase 5 rewrites the README around it anyway.)
+   exists — the `<!-- GO-LIVE: ... -->` comment under `## Status` and the
+   blockquote beginning `> **Status: pre-release.**` immediately below it.
+   The comment is there to be found (`grep -n GO-LIVE README.md`) and says
+   what to delete; removing it and leaving the blockquote is the mistake it
+   exists to prevent, so delete both.
 
 Nothing else changes state: a `publish` decision edits no tracked file by
 design, so the watcher's own commit on that run is a state-only commit or
