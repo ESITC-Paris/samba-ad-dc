@@ -126,9 +126,19 @@ jobs:
               --format '{{json .SBOM}}' \
               | python3 -c 'import json,sys; json.dump((json.load(sys.stdin) or {}).get("SPDX", {}), sys.stdout)' \
               > "sbom-${branch}.json"
+            # The cache mount is shared by the branches of THIS run only
+            # (RUNNER_TEMP dies with the job), so the vulnerability database
+            # is downloaded once per run and not once per branch. That
+            # download comes from ghcr.io, whose anonymous quota is per IP
+            # and therefore shared with every other job on the runner fleet;
+            # TRIVY_USERNAME/TRIVY_PASSWORD make it an authenticated pull
+            # against this repository's own quota, which is what the trivy
+            # action does for the gates in ci.yml.
             docker run --rm \
               -v "${PWD}:/work" -w /work \
               -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+              -e TRIVY_USERNAME="${GITHUB_ACTOR}" \
+              -e TRIVY_PASSWORD="${GH_TOKEN}" \
               "${TRIVY_IMAGE}" sbom \
               --severity HIGH,CRITICAL --format json \
               --output "trivy-${branch}.json" "sbom-${branch}.json"
