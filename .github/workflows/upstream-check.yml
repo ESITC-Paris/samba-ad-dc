@@ -1,0 +1,304 @@
+name: Upstream check
+
+# The watcher (SPEC §9bis). Triggered hourly by an external scheduler — a
+# cron timer on ESITC infrastructure calling the workflow_dispatch API, see
+# docs/operations.md. No GitHub `schedule:` trigger on purpose: §9bis.7
+# requires a real execution guarantee at the polling frequency, and cron in
+# Actions provides none (runs are delayed or skipped under load, and the
+# trigger is disabled entirely after 60 days of repository inactivity).
+# The trigger does not need to be trusted, only the executor (§4.5): the
+# worst a compromised trigger can do is start runs that publicly pass or
+# fail the §8 gates.
+on:
+  workflow_dispatch:
+    inputs:
+      security_release:
+        description: >-
+          Pre-announced Samba security release: publish a new upstream
+          version with a 0 h soak (§9bis.5) instead of waiting out
+          RELEASE_SOAK_HOURS.
+        type: boolean
+        default: false
+      dry_run:
+        description: >-
+          Compute and print the plan, change nothing — no commit, no tag,
+          no dispatch, no issue.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write     # commits the state/catalog updates and pushes tags
+  actions: write      # dispatches release.yml against a new tag
+  issues: write       # lifecycle, CVE advisory and failure notifications
+  packages: read      # lists the tags already published on GHCR
+
+# One watcher at a time, and never cancel one: a cancelled run can leave a
+# tag pushed with no release dispatched, which the next run would have to
+# self-heal anyway.
+concurrency:
+  group: upstream-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-24.04
+    # Everything here is network probes and file edits; the slowest step is
+    # the package-closure dry-run inside the base image (~1 min). A hung
+    # call must not hold the concurrency group for the default six hours.
+    timeout-minutes: 20
+    env:
+      IMAGE_NAME: ${{ vars.IMAGE_NAME || 'samba-ad-dc' }}
+      GHCR_IMAGE: ghcr.io/esitc-paris/${{ vars.IMAGE_NAME || 'samba-ad-dc' }}
+      # Version-matched to the gates in ci.yml and release.yml, and pinned
+      # by digest like every other linter/scanner container in this
+      # repository. The advisory scan runs the CLI directly rather than
+      # through the action because it scans a list of SBOM files in a shell
+      # loop, which a step-level action cannot express.
+      TRIVY_IMAGE: >-
+        ghcr.io/aquasecurity/trivy:0.71.2@sha256:f5d0e600ecda7449e2a9b272805aef698631d3bb3f3a739a750de2c6819acdc9
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+
+      - name: Set up Buildx
+        # `docker buildx imagetools inspect` is how the base-image digests
+        # and the published SBOMs are read: a registry query, no pull.
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Observe
+        env:
+          # Needed by the published-tags probe (`gh api .../packages/...`).
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # A dry run must not persist the conditional-request cache under
+          # `sources.*` either: "change nothing" includes the state file.
+          if [ "${DRY_RUN}" = "true" ]; then
+            set -- --dry-run
+          fi
+          python3 scripts/watch.py observe --output observation.json "$@"
+
+      - name: Plan
+        env:
+          # §9bis.5 ratifies 24 h; the variable exists so a drill can shorten
+          # it without editing this file.
+          SOAK_HOURS: ${{ vars.RELEASE_SOAK_HOURS || '24' }}
+          SECURITY: ${{ inputs.security_release }}
+        run: |
+          if [ "${SECURITY}" = "true" ]; then
+            set -- --security
+          fi
+          python3 scripts/watch.py plan \
+            --observe observation.json \
+            --soak-hours "${SOAK_HOURS}" \
+            --output plan.json "$@" \
+            | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      - name: CVE advisory
+        # §9bis.1.d / §9bis.8.c: ADVISORY only. A CVE without an available
+        # fix can never trigger a build — rebuilding would change nothing —
+        # so this step writes the §5.4 ledger and, at most, opens an issue.
+        # It never produces a tag or a dispatch, and its failure never fails
+        # the run: the release decisions were made by the step above.
+        continue-on-error: true
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # Only branches whose current tag is actually on the registry: an
+          # unpublished branch has no image to scan, which is every branch
+          # until the first release.
+          python3 scripts/watch.py published --observe observation.json \
+            > published.txt
+          if [ ! -s published.txt ]; then
+            echo "no published image yet — nothing to advise on"
+            exit 0
+          fi
+          while IFS="$(printf '\t')" read -r branch tag; do
+            [ -n "${branch}" ] || continue
+            echo "::group::CVE advisory for branch ${branch} (${tag})"
+            # The published SBOM, not the image: syft already walked this
+            # exact artifact at release time, and reading one blob costs a
+            # few MB where pulling the image costs ~540.
+            docker buildx imagetools inspect "${GHCR_IMAGE}:${tag}" \
+              --format '{{json .SBOM}}' \
+              | python3 -c 'import json,sys; json.dump((json.load(sys.stdin) or {}).get("SPDX", {}), sys.stdout)' \
+              > "sbom-${branch}.json"
+            docker run --rm \
+              -v "${PWD}:/work" -w /work \
+              -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+              "${TRIVY_IMAGE}" sbom \
+              --severity HIGH,CRITICAL --format json \
+              --output "trivy-${branch}.json" "sbom-${branch}.json"
+            python3 scripts/cve-ledger.py sync "${branch}" \
+              "trivy-${branch}.json" --tag "${tag}" \
+              --issue-body "advisory-${branch}.md" > "ledger-${branch}.env"
+            cat "ledger-${branch}.env"
+            # A NEW package, not merely a new CVE on one already listed:
+            # otherwise every feed refresh would reopen the same issue.
+            new_packages=$(sed -n 's/^new_packages=//p' "ledger-${branch}.env")
+            if [ -z "${new_packages}" ]; then
+              echo "::endgroup::"
+              continue
+            fi
+            title="CVE advisory: branch ${branch} (${tag})"
+            number=$(gh issue list --state open --json number,title \
+              --jq ".[] | select(.title==\"${title}\") | .number" | head -1)
+            if [ -n "${number}" ]; then
+              gh issue comment "${number}" --body-file "advisory-${branch}.md"
+            else
+              gh issue create --title "${title}" --assignee euca01 \
+                --body-file "advisory-${branch}.md"
+            fi
+            echo "::endgroup::"
+          done < published.txt
+
+      - name: Apply
+        id: apply
+        if: ${{ !inputs.dry_run }}
+        # Runs even when every branch decided `none`: a branch that just
+        # entered its soak has no bump and no tag, but its `pending` record
+        # must reach the commit below or the soak restarts on every run.
+        run: python3 scripts/watch.py apply --decisions plan.json >> "${GITHUB_OUTPUT}"
+
+      - name: Commit, tag and dispatch
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAGS: ${{ steps.apply.outputs.tags }}
+          DISPATCH: ${{ steps.apply.outputs.dispatch }}
+          CAUSES: ${{ steps.apply.outputs.causes }}
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Explicit paths: nothing else in this tree is the watcher's to
+          # commit. Dockerfile is in the list because its ARG defaults
+          # mirror the default branch's pins and check-pins-consistency.sh
+          # asserts the pair — a catalog bump that left it behind would push
+          # a commit whose own CI is red.
+          git add -- versions.yaml Dockerfile .build-state.json CHANGELOG.md \
+            README.md security/cve-exceptions.yaml
+          if git diff --cached --quiet; then
+            echo "nothing changed — no commit, no tag, no dispatch"
+            exit 0
+          fi
+          if [ -z "${TAGS}" ]; then
+            # The state-only commit: a soak clock, a refreshed source cache
+            # or a ledger sync, with no release owed. `[skip ci]` because
+            # there is nothing here for CI to gate.
+            git commit -m "chore(watch): state update [skip ci]"
+            git push origin HEAD:main
+            echo "state-only update pushed"
+            exit 0
+          fi
+          git commit -m "chore: ${TAGS} (${CAUSES}) [skip ci]"
+          # shellcheck disable=SC2086  # deliberate word splitting: one tag per word
+          for tag in ${TAGS}; do
+            git tag "${tag}"
+          done
+          # --atomic so a rejected main (someone pushed first) cannot leave
+          # the tags behind on the remote: a stranded tag makes every later
+          # run fail with "already exists" until a human deletes it. Only
+          # these tags, never --tags.
+          # shellcheck disable=SC2086  # same
+          git push --atomic origin HEAD:main ${TAGS}
+          failures=0
+          # shellcheck disable=SC2086  # same
+          for item in ${DISPATCH}; do
+            branch=${item%%:*}
+            rest=${item#*:}
+            tag=${rest%%:*}
+            cause=${rest##*:}
+            echo "dispatching release.yml for ${branch} at ${tag} (${cause})"
+            dispatched=0
+            # A tag pushed with GITHUB_TOKEN does not trigger workflows, so
+            # the release has to be dispatched explicitly. The push already
+            # happened, so a failed dispatch would otherwise be a silent,
+            # permanent missed release — except that it is not permanent
+            # here: the next hourly run sees the tag unpublished and decides
+            # `publish` again. Retried anyway, then reported.
+            for attempt in 1 2 3 4 5; do
+              if gh workflow run release.yml --ref "${tag}" \
+                   -f tag="${tag}" -f trigger_cause="${cause}"; then
+                dispatched=1
+                break
+              fi
+              echo "dispatch attempt ${attempt} failed; retrying in 15s"
+              sleep 15
+            done
+            if [ "${dispatched}" -ne 1 ]; then
+              echo "::error::release dispatch failed after 5 attempts for ${tag}"
+              echo "::error::run it manually: gh workflow run release.yml" \
+                "--ref ${tag} -f tag=${tag} -f trigger_cause=${cause}"
+              failures=$((failures + 1))
+            fi
+          done
+          [ "${failures}" -eq 0 ]
+
+      - name: Lifecycle issues
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # §9bis.1.e / §9.4: a new upstream series and a release candidate
+          # for one are relayed to a human. Both are deduplicated by title,
+          # so an open issue gets nothing and a closed one is reopened by a
+          # fresh issue only when the signal is still true.
+          # The count goes to a FILE, not to $GITHUB_ENV: a variable exported
+          # there is visible to later steps only, never to the rest of the
+          # step that wrote it.
+          python3 - <<'PY'
+          import json
+
+          with open("plan.json", encoding="utf-8") as handle:
+              decisions = json.load(handle)
+          lifecycle = [d for d in decisions
+                       if d.get("action") in ("new_series", "rc_series")]
+          for index, decision in enumerate(lifecycle):
+              with open("lifecycle-%d.title" % index, "w",
+                        encoding="utf-8") as handle:
+                  handle.write(decision["title"])
+              with open("lifecycle-%d.md" % index, "w",
+                        encoding="utf-8") as handle:
+                  handle.write(decision["body"] + "\n")
+          with open("lifecycle.count", "w", encoding="utf-8") as handle:
+              handle.write("%d\n" % len(lifecycle))
+          PY
+          count=$(cat lifecycle.count)
+          index=0
+          while [ "${index}" -lt "${count}" ]; do
+            title=$(cat "lifecycle-${index}.title")
+            number=$(gh issue list --state all --limit 100 --json number,title \
+              --jq ".[] | select(.title==\"${title}\") | .number" | head -1)
+            if [ -n "${number}" ]; then
+              echo "lifecycle issue already tracked: #${number} ${title}"
+            else
+              gh issue create --title "${title}" --assignee euca01 \
+                --body-file "lifecycle-${index}.md"
+            fi
+            index=$((index + 1))
+          done
+
+      - name: Notify admin on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          # One open issue per problem, assigned to the admin (a guaranteed
+          # mail / mobile notification). Repeated failures comment on the
+          # same issue instead of flooding the tracker.
+          title="Upstream check is failing"
+          number=$(gh issue list --state open --json number,title \
+            --jq ".[] | select(.title==\"${title}\") | .number" | head -1)
+          if [ -n "${number}" ]; then
+            gh issue comment "${number}" --body "Failed again: ${RUN_URL}"
+          else
+            gh issue create --title "${title}" --assignee euca01 \
+              --body "The hourly upstream check failed. Investigate: ${RUN_URL}"
+          fi
