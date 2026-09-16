@@ -1,0 +1,502 @@
+name: Post-push verification
+
+# SPEC §8.5. A release is not finished when the pipeline says so; it is
+# finished when the artifact a user pulls verifies. This workflow re-reads
+# the published image from the registry with no access to anything the
+# release produced - no build cache, no artifact, no local daemon state -
+# and asserts what the release notes promise: both architectures present,
+# every platform image pullable by digest, a cosign keyless signature
+# issued to a workflow of this repository, a GitHub provenance attestation
+# over the index digest, and BuildKit SBOM + provenance for each platform.
+# It publishes nothing and can repair nothing: its only output is a green
+# run or an issue.
+on:
+  # Chained rather than scheduled: the moment worth checking is the one
+  # right after the push, and the Release run's own conclusion is what says
+  # a push happened at all. Note this only fires for release.yml as it
+  # exists on the default branch.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Release tag to re-verify (vX.Y.Z-rN). The image must already be
+          published - this workflow never publishes anything.
+        required: true
+      staging:
+        description: >-
+          Verify the staging image (<image>-staging) instead of the
+          production one. Mirrors release.yml's own staging input.
+        type: boolean
+        default: false
+
+# Read-only everywhere except the tracker. Two scopes are deliberately
+# absent:
+#   id-token - keyless VERIFICATION needs no OIDC token. Only signing does;
+#              cosign verify reads the certificate and the transparency log
+#              entry that are already attached to the image.
+#   actions  - the triggering run is read from the event payload, never
+#              from the Actions API, so nothing here needs to read runs.
+permissions:
+  contents: read  # gh release view, for the published release notes
+  packages: read  # pull the published image from GHCR
+  issues: write   # the failure issue below
+
+concurrency:
+  # Keyed on what is known before the first step runs, which is an
+  # approximation of the tag (a staging drill runs on main, so head_branch
+  # is not the tag there). Nothing is ever cancelled: a cancelled
+  # verification is indistinguishable from one that never ran, and two runs
+  # racing on the same release would file the same issue twice.
+  group: post-push-verify-${{ github.event.workflow_run.head_branch || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify
+    # A Release run that failed published nothing: there is nothing to
+    # verify, and an issue here would be noise on top of the one release.yml
+    # already filed.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    # Registry metadata reads plus one full pull per platform per registry.
+    # Generous, but bounded: a hung registry must not hold a runner for the
+    # default six hours.
+    timeout-minutes: 30
+    env:
+      # Same expression as release.yml and upstream-check.yml, so a staging
+      # drill retargets every workflow at once by setting the variable.
+      GHCR_IMAGE: ghcr.io/esitc-paris/${{ vars.IMAGE_NAME || 'samba-ad-dc' }}
+      DOCKERHUB_IMAGE: docker.io/esitcparis/${{ vars.IMAGE_NAME || 'samba-ad-dc' }}
+      OIDC_ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - name: Resolve the release under verification
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_STAGING: ${{ inputs.staging }}
+          RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$'
+          TAG=""
+          STAGING="false"
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG}"
+            STAGING="${INPUT_STAGING}"
+          else
+            # head_branch is the tag ref name when the Release ran on the
+            # tag, which is the normal path: the watcher dispatches
+            # release.yml with --ref <tag>. A staging drill runs on main
+            # instead, so there head_branch is "main" and the tag only
+            # exists in the run name - which is what release.yml's run-name
+            # is for.
+            if printf '%s' "${RUN_HEAD}" | grep -Eq "${TAG_RE}"; then
+              TAG="${RUN_HEAD}"
+            else
+              TAG="$(printf '%s' "${RUN_TITLE}" \
+                | grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+' | head -n 1 || true)"
+            fi
+            # release.yml appends " (staging)" to its run name. The
+            # parenthesised form is matched rather than the bare word
+            # because display_title falls back to the commit subject when a
+            # workflow has no run-name, and a commit subject is free text.
+            case "${RUN_TITLE}" in
+              *'(staging)'*) STAGING="true" ;;
+            esac
+          fi
+
+          if ! printf '%s' "${TAG}" | grep -Eq "${TAG_RE}"; then
+            echo "::error::no release tag could be resolved" \
+                 "(input='${INPUT_TAG}', head_branch='${RUN_HEAD}', run title='${RUN_TITLE}')"
+            exit 1
+          fi
+
+          # The image tag is the git tag without its leading v (SPEC §3.1);
+          # catalog.py is not consulted because that would read the working
+          # tree, and this workflow may only trust the registry.
+          IMAGE="${GHCR_IMAGE}"
+          if [ "${STAGING}" = "true" ]; then
+            IMAGE="${GHCR_IMAGE}-staging"
+          fi
+
+          {
+            echo "tag=${TAG}"
+            echo "image_tag=${TAG#v}"
+            echo "image=${IMAGE}"
+            echo "staging=${STAGING}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Verifying ${IMAGE}:${TAG#v} (staging=${STAGING})"
+
+      - name: Log in to GHCR
+        # A staging package is private until somebody makes it public, and
+        # even a public one is served through a token endpoint whose
+        # anonymous quota is shared by the whole runner fleet. The token
+        # below carries packages:read and nothing else.
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror credentials
+        id: mirror
+        # `secrets` is not available in a step-level `if:`, so the presence
+        # of the mirror credentials is turned into a step output first. Read
+        # through env, like every other value here, so no secret-derived
+        # expression is ever expanded into the shell text itself.
+        env:
+          AVAILABLE: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          echo "available=${AVAILABLE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to Docker Hub
+        # Only to raise the pull quota: the mirror is public, but anonymous
+        # Docker Hub pulls are rate-limited per source IP, which on hosted
+        # runners means "shared with everyone else". Unauthenticated
+        # verification would fail for a reason that has nothing to do with
+        # what it verifies.
+        if: steps.mirror.outputs.available == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Buildx
+        # `imagetools` is a buildx subcommand: it is how the manifest list,
+        # the SBOM and the provenance are read as registry metadata, without
+        # pulling anything.
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Read the published release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Defaults are the strict case: a complete multi-arch manifest and
+          # no mirror claim to check.
+          PLATFORMS="linux/amd64 linux/arm64"
+          DIGEST_GHCR=""
+          DIGEST_HUB=""
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json body --jq .body > notes.md; then
+            echo "Read $(wc -c < notes.md) bytes of release notes for ${TAG}."
+          else
+            # Expected for a staging drill - release.yml creates no GitHub
+            # Release there. Otherwise it is a deleted release or a
+            # transient API error. A warning rather than a failure: the gate
+            # is the image, and "no notes" already falls back to the
+            # strictest expectations.
+            echo "::warning::no GitHub Release body for ${TAG}; verifying with default expectations"
+            : > notes.md
+          fi
+
+          # SPEC §9.6 Mode 2 is the only degraded mode that changes what
+          # must be published. Mode 1 (emulated) still ships both
+          # architectures, so it is deliberately not an exception here. The
+          # disclosure paragraph that catalog.py writes is the marker, and
+          # it names the architecture that is absent.
+          if grep -q 'architecture-staggered publication' notes.md; then
+            # The backticks below are Markdown in the release notes, not
+            # command substitution.
+            # shellcheck disable=SC2016
+            MISSING="$(sed -n 's/.*does not include `\([a-z0-9]*\)`.*/\1/p' notes.md | head -n 1)"
+            case "${MISSING}" in
+              amd64) PLATFORMS="linux/arm64" ;;
+              arm64) PLATFORMS="linux/amd64" ;;
+              *)
+                echo "::error::staggered release notes name no supported architecture (got '${MISSING}')"
+                exit 1
+                ;;
+            esac
+            echo "::notice::staggered publication declared; ${MISSING} is expected to be absent"
+          fi
+
+          # The digests the notes advertise. They are cross-checked against
+          # what the tags actually resolve to, because the notes are what a
+          # user pins from.
+          # shellcheck disable=SC2016  # Markdown backticks again
+          DIGEST_GHCR="$(sed -n 's/.*GHCR `\(sha256:[0-9a-f]*\)`.*/\1/p' notes.md | head -n 1)"
+          # shellcheck disable=SC2016  # same
+          DIGEST_HUB="$(sed -n 's/.*Docker Hub `\(sha256:[0-9a-f]*\)`.*/\1/p' notes.md | head -n 1)"
+
+          {
+            echo "platforms=${PLATFORMS}"
+            echo "digest_ghcr=${DIGEST_GHCR}"
+            echo "digest_hub=${DIGEST_HUB}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify the GHCR manifest list
+        id: ghcr
+        env:
+          IMAGE: ${{ steps.target.outputs.image }}
+          IMAGE_TAG: ${{ steps.target.outputs.image_tag }}
+          PLATFORMS: ${{ steps.notes.outputs.platforms }}
+          DIGEST_GHCR: ${{ steps.notes.outputs.digest_ghcr }}
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}" --format '{{json .Manifest}}' > manifest.json
+          INDEX_DIGEST="$(jq -r '.digest' manifest.json)"
+
+          # Attestation manifests ride in the same index with platform
+          # "unknown/unknown"; they are checked further down, not counted as
+          # architectures. The variant is dropped on purpose - containerd
+          # normalises linux/arm64 to linux/arm64/v8 on some paths and not
+          # others, and the architecture is what is being asserted.
+          jq -r '[.manifests[]? | select((.platform.os // "unknown") != "unknown")
+                  | .platform.os + "/" + .platform.architecture] | unique | .[]' manifest.json > found.txt
+          printf '%s\n' "${PLATFORMS}" | tr ' ' '\n' | sed '/^$/d' | sort -u > expected.txt
+
+          # Set equality, not "contains": an architecture nobody promised is
+          # as much a defect as a missing one.
+          if ! diff -u expected.txt found.txt; then
+            echo "::error::${IMAGE}:${IMAGE_TAG} does not publish exactly the promised platforms"
+            exit 1
+          fi
+
+          if [ -n "${DIGEST_GHCR}" ] && [ "${DIGEST_GHCR}" != "${INDEX_DIGEST}" ]; then
+            echo "::error::the release notes pin ${DIGEST_GHCR} but ${IMAGE}:${IMAGE_TAG}" \
+                 "resolves to ${INDEX_DIGEST}"
+            exit 1
+          fi
+
+          jq -r '.manifests[]? | select((.platform.os // "unknown") != "unknown")
+                 | .platform.os + "/" + .platform.architecture + " " + .digest' manifest.json > platforms.txt
+
+          echo "index_digest=${INDEX_DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "Index ${INDEX_DIGEST} carries:"
+          cat platforms.txt
+
+      - name: Pull every GHCR platform image by digest
+        env:
+          IMAGE: ${{ steps.target.outputs.image }}
+        run: |
+          set -euo pipefail
+          # SPEC §8.5 "pull by digest": manifest metadata can be intact while
+          # a layer blob is missing or unreadable, and only a real pull says
+          # otherwise. A foreign-architecture manifest referenced by its own
+          # digest pulls fine on an amd64 runner - no --platform, which
+          # would re-resolve through the index instead of proving this
+          # descriptor.
+          while read -r plat digest; do
+            echo "== ${plat} ${digest}"
+            docker pull --quiet "${IMAGE}@${digest}"
+          done < platforms.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        with:
+          # Pinned to the cosign v2 CLI for the same reason release.yml
+          # signs with it: the action's default is now v3, whose bundle
+          # format differs, and a verifier must speak what the signer wrote.
+          cosign-release: v2.6.5
+
+      - name: Verify the cosign signature
+        env:
+          IMAGE: ${{ steps.target.outputs.image }}
+          INDEX_DIGEST: ${{ steps.ghcr.outputs.index_digest }}
+        run: |
+          set -euo pipefail
+          # The certificate SAN is the signing job's job_workflow_ref, e.g.
+          # https://github.com/ESITC-Paris/samba-ad-dc/.github/workflows/release.yml@refs/tags/v4.24.7-r1
+          # which is why the identity is built from GITHUB_REPOSITORY
+          # instead of being spelled out: the owner's DISPLAY casing is what
+          # lands in the certificate, not the lowercase registry spelling
+          # that every hand-written copy of this command uses. (?i) is then
+          # belt-and-braces - it changes nothing today, and it means the one
+          # way a correctly signed image could still fail this gate does not
+          # exist. It cannot widen the identity to another repository, since
+          # GitHub account names are unique irrespective of case. The ref is
+          # deliberately not pinned: a staging drill signs from
+          # refs/heads/main, not from a tag.
+          IDENTITY_RE="(?i)^https://github\.com/${GITHUB_REPOSITORY}/.*"
+          cosign verify "${IMAGE}@${INDEX_DIGEST}" \
+            --certificate-identity-regexp "${IDENTITY_RE}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}"
+
+      - name: Verify the GitHub provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.target.outputs.image }}
+          INDEX_DIGEST: ${{ steps.ghcr.outputs.index_digest }}
+        run: |
+          set -euo pipefail
+          # --repo rather than --owner: tighter for the same cost. An
+          # attestation from any other repository of the organisation is not
+          # evidence about this image. gh prints its result only on a
+          # terminal, so in Actions the exit code is the whole signal.
+          gh attestation verify "oci://${IMAGE}@${INDEX_DIGEST}" --repo "${GITHUB_REPOSITORY}"
+          echo "provenance attestation verified for ${IMAGE}@${INDEX_DIGEST}"
+
+      - name: Verify the SBOM and provenance attestations
+        env:
+          IMAGE: ${{ steps.target.outputs.image }}
+          IMAGE_TAG: ${{ steps.target.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          # BuildKit's --sbom/--provenance attestations, read back as
+          # registry metadata. imagetools keys both maps by normalised
+          # platform (linux/arm64, never linux/arm64/v8), which is the same
+          # spelling expected.txt holds. An image with no attestations at
+          # all answers `{}` here, which is why emptiness is asserted rather
+          # than assumed.
+          docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}" --format '{{json .SBOM}}' > sbom.json
+          docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}" \
+            --format '{{json .Provenance}}' > provenance.json
+
+          while read -r plat; do
+            for kind in sbom provenance; do
+              if ! jq -e --arg p "${plat}" 'has($p) and ((.[$p] | length) > 0)' "${kind}.json" > /dev/null; then
+                echo "::error::${kind} attestation missing or empty for ${plat} on ${IMAGE}:${IMAGE_TAG}"
+                exit 1
+              fi
+              echo "${kind}: ${plat} OK"
+            done
+          done < expected.txt
+
+      - name: Verify the Docker Hub mirror
+        # Driven by the notes, which are the only machine-readable record
+        # that the mirror was actually pushed: no Docker Hub digest means no
+        # mirror to verify (staging, or a release published without the
+        # mirror credentials), not a silent skip of something promised.
+        if: steps.notes.outputs.digest_hub != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_TAG: ${{ steps.target.outputs.image_tag }}
+          DIGEST_HUB: ${{ steps.notes.outputs.digest_hub }}
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:${IMAGE_TAG}" \
+            --format '{{json .Manifest}}' > hub-manifest.json
+          HUB_DIGEST="$(jq -r '.digest' hub-manifest.json)"
+
+          if [ "${HUB_DIGEST}" != "${DIGEST_HUB}" ]; then
+            echo "::error::the release notes pin ${DIGEST_HUB} on Docker Hub but" \
+                 "${DOCKERHUB_IMAGE}:${IMAGE_TAG} resolves to ${HUB_DIGEST}"
+            exit 1
+          fi
+
+          jq -r '[.manifests[]? | select((.platform.os // "unknown") != "unknown")
+                  | .platform.os + "/" + .platform.architecture] | unique | .[]' hub-manifest.json > hub-found.txt
+          if ! diff -u expected.txt hub-found.txt; then
+            echo "::error::the mirror does not publish the same platforms as GHCR"
+            exit 1
+          fi
+
+          jq -r '.manifests[]? | select((.platform.os // "unknown") != "unknown")
+                 | .platform.os + "/" + .platform.architecture + " " + .digest' \
+                 hub-manifest.json > hub-platforms.txt
+          while read -r plat digest; do
+            echo "== ${plat} ${digest}"
+            docker pull --quiet "${DOCKERHUB_IMAGE}@${digest}"
+          done < hub-platforms.txt
+
+          # Same identity as GHCR: the mirror is signed by the same job of
+          # the same repository, so a signature that verifies under a
+          # different identity is exactly the finding this step exists for.
+          IDENTITY_RE="(?i)^https://github\.com/${GITHUB_REPOSITORY}/.*"
+          cosign verify "${DOCKERHUB_IMAGE}@${HUB_DIGEST}" \
+            --certificate-identity-regexp "${IDENTITY_RE}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}"
+
+          # index.docker.io, not the docker.io alias: that is the canonical
+          # name attest-build-provenance recorded as the subject, and the
+          # spelling release.yml normalises to before attesting the mirror.
+          # Both resolve to the same repository, so this costs nothing if gh
+          # only ever matches on the digest.
+          ATTEST_REF="$(printf '%s' "${DOCKERHUB_IMAGE}" | sed 's|^docker\.io/|index.docker.io/|')"
+          gh attestation verify "oci://${ATTEST_REF}@${HUB_DIGEST}" --repo "${GITHUB_REPOSITORY}"
+
+          docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:${IMAGE_TAG}" \
+            --format '{{json .SBOM}}' > hub-sbom.json
+          docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:${IMAGE_TAG}" \
+            --format '{{json .Provenance}}' > hub-provenance.json
+          while read -r plat; do
+            for kind in hub-sbom hub-provenance; do
+              if ! jq -e --arg p "${plat}" 'has($p) and ((.[$p] | length) > 0)' "${kind}.json" > /dev/null; then
+                echo "::error::${kind#hub-} attestation missing or empty for ${plat} on the mirror"
+                exit 1
+              fi
+            done
+          done < expected.txt
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.target.outputs.image }}
+          IMAGE_TAG: ${{ steps.target.outputs.image_tag }}
+          TAG: ${{ steps.target.outputs.tag }}
+          STAGING: ${{ steps.target.outputs.staging }}
+          INDEX_DIGEST: ${{ steps.ghcr.outputs.index_digest }}
+          PLATFORMS: ${{ steps.notes.outputs.platforms }}
+          DIGEST_HUB: ${{ steps.notes.outputs.digest_hub }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Post-push verification: ${TAG}"
+            echo
+            echo "| check | value |"
+            echo "| --- | --- |"
+            echo "| image | \`${IMAGE}:${IMAGE_TAG}\` |"
+            echo "| index digest | \`${INDEX_DIGEST}\` |"
+            echo "| platforms | ${PLATFORMS} |"
+            echo "| staging | ${STAGING} |"
+            echo "| mirror | ${DIGEST_HUB:-not published} |"
+            echo
+            echo "Pulled by digest, cosign signature and GitHub provenance verified,"
+            echo "SBOM and provenance attestations present for every platform."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Open the failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+          RAW_TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+          STAGING: ${{ steps.target.outputs.staging }}
+          IMAGE: ${{ steps.target.outputs.image }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          # A staging failure files an issue too: rehearsing the release
+          # path is the whole point of the drill, and a drill whose failures
+          # are silent rehearses nothing. The title carries "(staging)" so
+          # it never dedups against a real one.
+          SUBJECT="${TAG:-${RAW_TAG:-unknown}}"
+          TITLE="Post-push verification failed: ${SUBJECT}"
+          if [ "${STAGING}" = "true" ]; then
+            TITLE="${TITLE} (staging)"
+          fi
+          BODY="$(printf '%s\n\nImage: %s\nVerification run: %s\nRelease run: %s\n\n%s\n' \
+            "The image published for ${SUBJECT} did not verify after the push (SPEC §8.5)." \
+            "${IMAGE:-unknown}" "${RUN_URL}" "${SOURCE_RUN_URL:-n/a}" \
+            "Nothing was changed or republished: the image is still live, so decide whether to yank it.")"
+
+          # One open issue per broken release; repeats comment on it rather
+          # than flooding the tracker. --limit is well above the default 30
+          # because a dedup that silently stops looking is a dedup that does
+          # not work.
+          NUM="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --limit 200 \
+            --json number,title --jq ".[] | select(.title==\"${TITLE}\") | .number" | head -n 1)"
+
+          if [ -n "${NUM}" ]; then
+            gh issue comment "${NUM}" --repo "${GITHUB_REPOSITORY}" \
+              --body "Failed again: ${RUN_URL}"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${TITLE}" \
+              --assignee euca01 --body "${BODY}"
+          fi
