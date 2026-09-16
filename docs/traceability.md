@@ -11,9 +11,10 @@ are tied together:
 - **§10.6** requires every guide section to carry a reference to the E2E
   test that covers it. The three guides now exist — `README.md`
   (§10.1), `docs/deployment-guide.md` (§10.2) and `docs/update-guide.md`
-  (§10.3) — and each carries its citations inline, plus a *Section →
-  test map* of its own. The **doc section** column below is the reverse
-  index: for each row, the guide section that documents that use case.
+  (§10.3) — and each carries its citations inline; the two `docs/`
+  guides close with a *Section → test map* table as well, the README
+  does not. The **doc section** column below is the reverse index: for
+  each row, the guide section that documents that use case.
   The row set and the test IDs did not change when the column was
   filled in; they are the same 17 Phase 3 froze.
 
@@ -77,9 +78,11 @@ The **doc section** links are relative to this file's directory, and each
 names the *primary* section — the one whose subject is that use case.
 Several rows legitimately share one (§1.5 documents both secret refusals,
 §3.4 both state refusals and the restart), and several use cases are
-touched by a second guide as well; the forward index is each guide's own
-*Section → test map*, and check (f) of `scripts/check-traceability.sh`
-holds the citation set to exactly this table's, in both directions.
+touched by a second guide as well; the forward index is the *Section →
+test map* closing each of the two `docs/` guides, plus the README's
+inline `Covered by:` lines, and check (f) of
+`scripts/check-traceability.sh` holds the citation set to exactly this
+table's, in both directions.
 
 ### Cross-cutting properties, deliberately not rows
 

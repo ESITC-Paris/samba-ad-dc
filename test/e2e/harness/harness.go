@@ -2,13 +2,21 @@
 //
 // The CLI — not the Docker SDK — is the interface used deliberately: it is
 // the stable, always-present surface on every CI runner, and what the
-// operator documentation tells people to type. Every container this
-// package starts runs the *constrained profile* of the adaptation profile
-// (SPEC Annex B.2): read-only rootfs, tmpfs for the writable runtime
-// paths, `--cap-drop ALL` plus the minimal capability set, and
-// `--security-opt no-new-privileges:true`. Nothing here ever uses
-// `--privileged` (§5.2), and the profile is therefore proven on every
-// single E2E run rather than asserted in prose.
+// operator documentation tells people to type. Every DC container this
+// package starts — the running DCs and the short-lived `samba-tool`
+// one-offs that go through the same startDC — runs the *constrained
+// profile* of the adaptation profile (SPEC Annex B.2): read-only rootfs,
+// tmpfs for the writable runtime paths, `--cap-drop ALL` plus the
+// minimal capability set, and `--security-opt no-new-privileges:true`.
+// Nothing here ever uses `--privileged` (§5.2), and the profile is
+// therefore proven on every single E2E run rather than asserted in
+// prose.
+//
+// The one container deliberately OUTSIDE that profile is the test client
+// (client.go), which runs unconstrained. It is not the product: it plays
+// a domain member talking to the DC from the network, and constraining
+// it would prove something about the throwaway client image instead of
+// about this image.
 package harness
 
 import (
