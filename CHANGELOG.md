@@ -5,4 +5,6 @@ records: image tag, embedded Samba version, fixed CVEs, image changes,
 and the trigger cause (`samba-release | pkg-update | base-digest |
 manual`) per SPEC.md §10.4.
 
-*No releases yet.*
+Entries below are written automatically by the release watcher at bump time
+(`scripts/catalog.py changelog-entry`); the digests, signature and
+attestations for each tag live in its GitHub Release.
