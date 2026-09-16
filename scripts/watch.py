@@ -290,13 +290,26 @@ def decide(branch, entry, state, obs, now, soak_hours, security=False):
                      % (pending.get("version"), latest, current_version))
         decision["clear_pending"] = True
 
-    # 2bis — a branch nobody has observed yet (§9bis.1.c has nothing to
-    # compare against). A freshly added series has no state entry, so every
-    # digest and the closure hash below would read as "moved" and bump a
-    # revision for a branch that never published an r1. The observation is
-    # recorded and the run falls through to the self-heal, whose first
-    # publication IS the build that these values describe.
-    if not any(state.get(name) for name in OBSERVED_KEYS):
+    # 2bis — a branch nobody has observed yet whose tag is not published
+    # (§9bis.1.c has nothing to compare against). A freshly added series
+    # has no state entry, so every digest and the closure hash below would
+    # read as "moved" and bump a revision for a branch that never published
+    # an r1. The observation is recorded and the run falls through to the
+    # self-heal, whose first publication IS the build that these values
+    # describe.
+    #
+    # An unseeded entry on a PUBLISHED branch is deliberately excluded and
+    # goes on to the ordinary comparison below. The quiet path there would
+    # record digests that no build of ours is known to have used, and
+    # `apply()` writes a decision's `state` into the catalog as well as
+    # into the state file: `base.*` and `pkg_index_hash` would be re-pinned
+    # under `action: none`, so the catalog would claim a base the published
+    # image was never built from, and that cycle's rebuild would be lost
+    # for good — the next run compares against the values this one just
+    # wrote and sees nothing moved. Falling through instead costs one
+    # revision the branch may not have needed; it never costs a rebuild.
+    if not any(state.get(name) for name in OBSERVED_KEYS) \
+            and current_tag not in (obs.get("published_tags") or []):
         notes.append("no prior observation for %s: recording the observed "
                      "digests and closure hash without calling them a change"
                      % branch)

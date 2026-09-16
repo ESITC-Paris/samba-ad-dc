@@ -852,6 +852,18 @@ For every catalog branch, first match wins:
    procedure exists.
 5. Otherwise → `action=none`.
 
+One rule runs before 2 and 3: a branch the watcher has **never observed**
+— no digests and no closure hash in `.build-state.json` — and whose
+catalog tag is **not yet published** has nothing to compare against, so
+its observation is recorded without being called a change and the run
+falls through to 4, whose first publication is the build those values
+describe. Once the tag is published the exemption ends: an empty state
+entry is then compared like any other and yields a `revision`. It has to,
+because a decision's recorded observation is written into `versions.yaml`
+as well as into `.build-state.json` — recording it quietly on a published
+branch would pin a base that no published image was built from and lose
+that cycle's rebuild.
+
 An empty answer from a probe is never a change: an empty digest compares
 unequal to the stored one, and writing it would make every later run bump
 again. `observe` fails the run instead, and `decide` refuses to act on one

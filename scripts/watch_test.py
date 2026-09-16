@@ -332,13 +332,49 @@ class DecisionTable(unittest.TestCase):
         self.assertEqual(decision["state"]["pkg_index_hash"], HASH_A)
         self.assertIn("no prior observation", " ".join(decision["notes"]))
 
-    def test_a_first_observation_of_a_published_branch_stays_quiet(self):
-        # The seeding case: the operator added the branch and the tag is
-        # already on the registry. Recording what was seen must not, by
-        # itself, produce a rebuild.
+    def test_an_unseeded_published_branch_is_compared_normally(self):
+        # The quiet path is only for a branch that owes its first
+        # publication. On a branch whose tag IS published, recording the
+        # observation quietly would have `apply()` re-pin `base.*` and
+        # `pkg_index_hash` in the catalog under `action: none` — the
+        # catalog would then claim a base the published image was never
+        # built from. The entry is compared like any other instead, and an
+        # unseeded state compares unequal to every observed value.
         decision = decide(observation(), st={})
-        self.assertEqual(decision["action"], "none")
+        self.assertEqual(decision["action"], "revision")
+        self.assertEqual(decision["cause"], "base-digest")
         self.assertEqual(decision["state"]["pkg_index_hash"], HASH_A)
+        self.assertNotIn("no prior observation", " ".join(decision["notes"]))
+
+    def test_an_unseeded_entry_never_swallows_a_published_branch_rebuild(self):
+        # The regression this rule exists for: the base moved, the branch
+        # happens to have no state entry, and the quiet path would record
+        # the NEW digest against the OLD published image and call it no
+        # change. The rebuild that cycle owed would then be lost for good,
+        # because the next run compares against the value just written.
+        decision = decide(observation(runtime_digest=DIGEST_B), st={})
+        self.assertEqual(decision["action"], "revision")
+        self.assertEqual(decision["cause"], "base-digest")
+        self.assertEqual(decision["state"]["runtime_digest"], DIGEST_B)
+
+    def test_no_decision_that_does_nothing_ever_carries_a_catalog_pin(self):
+        # apply() writes a decision's `state` into versions.yaml as well as
+        # into the state file, so `action: none` with a populated `state`
+        # is always a catalog pin nothing rebuilt behind. No row of the
+        # table may produce one.
+        cases = {
+            "unchanged": (observation(), None),
+            "unseeded and published": (observation(), {}),
+            "downgrade ignored": (observation(latest_patch="4.24.6"), None),
+            "no listing": (observation(latest_patch=""), None),
+            "empty digest": (observation(runtime_digest=""), None),
+            "soaking": (observation(latest_patch="4.24.8"), None),
+        }
+        for name, (obs, st) in cases.items():
+            decision = decide(obs, st=st)
+            if decision["action"] != "none":
+                continue
+            self.assertEqual(decision["state"], {}, name)
 
     def test_a_first_observation_still_takes_an_upstream_release(self):
         # No prior observation is not an excuse to sit on a new upstream

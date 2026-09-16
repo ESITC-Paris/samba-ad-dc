@@ -419,13 +419,21 @@ python3 scripts/catalog.py state set 4.25 pkg_index_hash \
   "$(sh scripts/pkg-closure-hash.sh debian:trixie-slim@sha256:<runtime>)"
 ```
 
-`decide()` already treats a branch with no state entry as "no prior
-observation" — it records what it sees instead of reading it as a moved
-base digest, so an unseeded branch reaches the `publish` self-heal and
-gets its r1 rather than a spurious `-r2`. Seeding is the belt to that
-brace: it makes the first run's recorded values reviewable in the pull
-request that adds the series, instead of arriving in a bot commit an hour
-later.
+`decide()` already treats a branch with no state entry **whose tag is not
+yet published** as "no prior observation" — it records what it sees
+instead of reading it as a moved base digest, so a newly added branch
+reaches the `publish` self-heal and gets its r1 rather than a spurious
+`-r2`. That quiet path stops at the first publication on purpose: once the
+branch's tag is on the registry, an empty state entry is compared like any
+other and earns the branch a `revision`, because recording the observation
+quietly there would re-pin `base.*` and `pkg_index_hash` in `versions.yaml`
+under `action: none` — the catalog would claim a base the published image
+was never built from, and the rebuild that cycle owed would be lost.
+Seeding is the belt to that brace: it makes the first run's recorded values
+reviewable in the pull request that adds the series, instead of arriving in
+a bot commit an hour later, and it is what keeps a branch added after its
+first publication (a re-seed, a hand-edited state file) from taking an
+unnecessary `-r2`.
 
 Adding the **newest** series also changes the default branch
 (`default_branch:` in `versions.yaml`), which decides which release is
