@@ -913,6 +913,8 @@ downgrade) are in
 
 ---
 
+<a id="backup-and-restore-runbook"></a>
+
 ## 7. Backup and restore runbook
 
 *Covered by:* `TestOfflineBackupRestore`
