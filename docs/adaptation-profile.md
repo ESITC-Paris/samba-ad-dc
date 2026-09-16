@@ -19,9 +19,12 @@ Heimdal** Kerberos — the configuration upstream recommends for this role,
 whereas distribution packages typically build it against MIT KRB5, which
 upstream still flags as experimental for the AD DC. Consequence, stated
 plainly: security integration responsibility is ours, with no distribution
-safety net; the watcher monitors the Samba security announcement channel
-directly, and pre-announced security releases use the armed detection mode
-(§9bis.1.a). Layout is FHS so paths match distribution conventions.
+safety net; the watcher polls upstream's release directory hourly (see
+**Release cycle** below), and a pre-announced security release is published
+without the 24-hour soak when the maintainer dispatches the check with
+`security_release=true`. The announcement mailing list is **not**
+machine-parsed in v1 and the §9bis.1.a armed mode is roadmap, both stated
+as limitations in B.6. Layout is FHS so paths match distribution conventions.
 
 **What "bundled Heimdal" does and does not mean for the shipped image.**
 The shipped image contains MIT krb5 runtime libraries (`libkrb5.so.3`,
@@ -230,6 +233,21 @@ when a test or a row exists without its counterpart.
   that never crosses one. Making chronyd drop privileges is what would
   turn `CAP_KILL` into a measurable question, and that change would come
   with its own bisection run.
+
+- **The Samba announcement mailing list is not machine-parsed (v1).**
+  §9bis.1.a asks for two detection paths — the release directory *and* the
+  announcement push channel, with an "armed" mode of tight conditional
+  polling over a pre-announced window. What is implemented is the
+  directory probe, hourly; `samba-announce` is read by a human. The
+  consequence is bounded and is stated rather than implied: a security
+  release is *detected* within the hour either way, because the tarball
+  lands in the same directory the watcher already polls, and what the
+  announcement would buy is skipping the soak automatically. Until then a
+  maintainer does it explicitly — `gh workflow run upstream-check.yml -f
+  security_release=true` sets the soak to 0 h — so the only cost of the
+  gap is that an unattended security release waits out the same 24 hours
+  as an ordinary one. Parsing the announce list and the armed polling mode
+  are roadmap.
 
 - **Sysvol replication is not provided by Samba** (no DFS-R): with
   multiple DCs, group policy content does not replicate by itself. An
@@ -739,6 +757,190 @@ PID 1 — that is the only form which also reaches commands an operator runs
 in the container. Pointing at the file before the first provision created
 it is harmless: Kerberos falls back to its built-in defaults.
 
+## Release cycle
+
+The release cycle is automated end to end and the automation lives in this
+repository: `.github/workflows/upstream-check.yml` is the watcher,
+`scripts/watch.py` is what it decides, `scripts/catalog.py` is what it
+edits, and `.github/workflows/release.yml` is what it dispatches. SPEC
+§9bis ratified an out-of-repo daemon and roadmap decision D4 placed it in
+a separate repository; that decision was **reversed on 2026-09-16** in
+favour of an in-repo workflow. The contract is unchanged — the difference
+is that the state the watcher remembers is a tracked file anyone can read,
+and every decision it makes is a commit with a cause in its message.
+
+### What is watched
+
+Four sources, probed once per run by `watch.py observe`:
+
+| Source | Probe | SPEC |
+|--------|-------|------|
+| Upstream releases | `https://download.samba.org/pub/samba/stable/`, tarball names only, one `latest_patch` per catalog branch | §9bis.1.a |
+| Upstream candidates | `https://download.samba.org/pub/samba/rc/`, tarball names only | §9bis.1.e |
+| Base images | `docker buildx imagetools inspect <tag>` for each of `base.builder`, `base.runtime`, `base.gobuild` | §9bis.1.c |
+| Package closure | `scripts/pkg-closure-hash.sh <base.runtime>` | §9bis.1.c |
+
+Plus one probe of our own publications: the tags already on GHCR
+(`gh api /orgs/esitc-paris/packages/container/<image>/versions`), which is
+what makes the first publication and a lost dispatch self-healing rather
+than a manual step. A package that has never been published answers 404,
+which reads as "no tags"; every other failure is a failure.
+
+Both listings are requested conditionally (`If-None-Match` /
+`If-Modified-Since`) and the validators are stored under `sources.*` in
+`.build-state.json`, per §9bis.2. Measured 2026-09-16:
+`download.samba.org` sends neither `ETag` nor `Last-Modified` on these
+listings and answers a conditional request with a full 200, so the cache
+is inert today — the request is made anyway because it costs nothing and
+starts working by itself the day the server grows a validator. The
+listings are fetched gzip-encoded (319 KB plain, 14 KB gzipped).
+
+Two probes are deliberately **not** made. The Samba announcement mailing
+list is not read by any code (B.6), and no CVE feed is polled: a CVE
+without an available fix can never trigger a build, and one with a fix
+arrives as a package-closure delta, which is already probed.
+
+### The decision, in order
+
+For every catalog branch, first match wins:
+
+1. **A strictly greater upstream patch release, past its soak** →
+   `action=version`, `cause=samba-release`. Strictly greater under numeric
+   comparison (`4.24.10` is above `4.24.9`), and release candidates are
+   excluded by construction: the regex requires `.tar.gz` immediately
+   after the patch number. A reported version *below* the pin is ignored
+   with a warning and never acted on — a partial listing must not be able
+   to publish a downgrade as `:latest`.
+2. **A moved base-image digest** → `action=revision`, `cause=base-digest`.
+3. **A moved package-closure hash** → `action=revision`,
+   `cause=pkg-update`.
+4. **The catalog's current `X.Y.Z-rN` is not on the registry** →
+   `action=publish`, `cause=first-publication`. Nothing is edited: the tag
+   is created if missing and the release is dispatched. This is the state
+   of every branch until the first release, and the reason no bootstrap
+   procedure exists.
+5. Otherwise → `action=none`.
+
+An empty answer from a probe is never a change: an empty digest compares
+unequal to the stored one, and writing it would make every later run bump
+again. `observe` fails the run instead, and `decide` refuses to act on one
+as a second line of defence.
+
+### Soak, and the two ways past it
+
+§9bis.5 ratifies a **24-hour soak** on a new upstream version, to absorb
+upstream retags and withdrawn releases. The first run that sees a higher
+patch release records `pending: {version, first_seen}` in
+`.build-state.json` and does nothing else; the release is decided on the
+first run at least `RELEASE_SOAK_HOURS` (repository variable, default 24)
+later. A newer version appearing mid-soak restarts the clock on the new
+version rather than inheriting the old one's; a version that disappears
+from the listing is forgotten.
+
+Two things bypass it. A **security release** does: dispatching the watcher
+with `security_release=true` sets the soak to 0 h (§9bis.5). And a
+**maintainer** does, by editing `versions.yaml` and pushing a tag by hand —
+`release.yml` keeps its `push: tags` trigger for exactly that.
+
+### The necessity criterion (§9bis.8)
+
+A release is dispatched only when the image is **certain** to differ from
+the last published one: a new upstream version, a new base digest, or a
+new package closure — nothing else. The two halves of the package
+criterion are both load-bearing and are documented at the probe itself
+(`scripts/pkg-closure-hash.sh`): the hash covers the union of an `upgrade`
+dry-run and an `install` dry-run, so a security fix to a package the base
+image already carries moves it, and a republication of the index that
+changes no version does not (§9bis.8.b).
+
+A detected upstream release is **confirmed against the authoritative
+source before anything is written** (§9bis.8.a):
+`scripts/verify-upstream-tarball.sh` downloads the tarball and its
+signature and verifies it against the pinned release key, and its output
+is where the new `tarball_sha256` comes from. A checksum is a
+trusted-forever pin; it is never minted from an unverified download.
+
+### What the watcher writes, and where
+
+`.build-state.json` is the watcher's memory: per branch the three digests,
+the package-closure hash, the tag last dispatched and any version still
+soaking; at the top level, the conditional-request cache per source. It is
+machine-owned and rewritten whole.
+
+`versions.yaml` is the pin contract, and the watcher edits it through
+`catalog.py` — the same entry point a human uses — so the file's comments
+survive and every write is re-parsed before it is accepted. A version bump
+also moves the Dockerfile's `ARG` defaults for the **default branch**,
+because those defaults mirror that branch's pins so a bare `docker build .`
+reproduces the pinned build, and `scripts/check-pins-consistency.sh`
+asserts every pair. The catalog and its mirror therefore move in one
+commit or CI is red on the watcher's own push. `ARG PKG_INDEX_HASH` is
+excluded from that mirror on purpose: its default is a bare fallback and
+CI injects the catalog value.
+
+**State-only commits.** A branch that is soaking, a refreshed source cache
+and a CVE-ledger sync all change tracked files without owing a release. The
+watcher commits them as `chore(watch): state update [skip ci]` and pushes
+`main` with no tag and no dispatch — without which `first_seen` would be
+lost and the soak would restart on every hourly run. An unchanged tree
+yields no commit, which is what makes the hourly run idempotent (§9bis.3).
+
+### What needs a human
+
+- **A new upstream series.** When the highest series in the stable listing
+  is not a catalog branch, the watcher opens one deduplicated issue,
+  `New upstream series X.Y — catalog decision required`, and stops there.
+  Adding a series is a commitment to publish it on every release (§3.6).
+- **Removing a branch.** Never automatic. A release candidate for a newer
+  series is relayed as a *notice* — the README matrix gains the §9.4
+  deprecation-pending suffix on the oldest branch and one issue is opened
+  — and that branch keeps receiving every patch release until upstream
+  actually ends it.
+- **Renewing a CVE review date.** The ledger is synchronised by
+  `scripts/cve-ledger.py` and the dates in it are never moved by a sync;
+  `scripts/check-cve-exceptions.py` fails the build once one has passed
+  (§5.4).
+- **Anything the watcher refused.** Every refusal is a failed run, and a
+  failed run opens (or comments on) one issue assigned to the maintainer.
+
+### The CVE ledger is synchronised, not hand-written
+
+§9bis.1.d makes the CVE feed **advisory**: a finding with no available fix
+can never trigger a build. Once per run, for every branch whose current tag
+is published, the watcher reads that image's published SBOM — a few MB,
+against ~540 MB for the image — scans it with the same trivy release the
+gates use, and runs `scripts/cve-ledger.py sync`, which rewrites
+`security/cve-exceptions.yaml` as **one entry per affected package**, not
+per CVE. Ruling R-ledger (2026-09-16), on a measurement: the 4.24.7 image
+carries 287 findings with no available fix, 77 of them HIGH/CRITICAL, over
+27 packages. One entry per CVE is a document nobody re-reads, and a ledger
+nobody re-reads is the permanent suppression list §5.4 forbids. A package
+appearing for the first time opens one deduplicated issue per branch; a new
+CVE on a package already listed does not. Failure of this step is logged
+and never fails the run.
+
+### The package-closure hash is measured on one architecture
+
+The probe runs on the watcher's runner, which is amd64, against the pinned
+runtime base. Debian's package versions are architecture-uniform apart from
+binNMUs, so an arm64-only binNMU is invisible to it. The consequence is
+narrow and worth stating plainly: the hash decides **when** a rebuild is
+owed, never **what** gets installed. Every release builds both
+architectures natively against the index as it exists at build time, so an
+arm64-only package movement ships with the next rebuild whatever triggered
+it — it just does not trigger one by itself.
+
+### Scheduling
+
+There is no `schedule:` trigger. §9bis.7 requires a real execution
+guarantee at the polling frequency and GitHub's cron provides none — runs
+are delayed or dropped under load, and the trigger is disabled after 60
+days of repository inactivity. The watcher is dispatched hourly through the
+API by a timer on our own infrastructure (`docs/operations.md`). The
+trigger does not need to be trusted, only the executor (§4.5): the worst a
+compromised trigger can do is start runs that publicly pass or fail the §8
+gates.
+
 ## Profile changelog
 
 - 2026-08-16: created from SPEC.md v1.2 Annex B; B.6 shell-entrypoint
@@ -905,3 +1107,29 @@ it is harmless: Kerberos falls back to its built-in defaults.
   gate now reports 0/0 on both the Debian and the gobinary target, and
   `check-image-packages.sh` still passes unchanged, because `upgrade`
   moves versions and never the package set.
+- 2026-09-16: Phase 4 — **the release cycle becomes a workflow in this
+  repository.** New **Release cycle** section: what is watched (the two
+  upstream directory listings, the three base-image digests, the package
+  closure, and our own published tags), the decision order, the soak and
+  the two ways past it, the necessity criterion, what the watcher never
+  decides, and where its state lives. Roadmap decision D4 (watcher in a
+  separate repository) is reversed and the reversal is dated in the
+  roadmap: the state the watcher remembers is now a tracked file, and every
+  decision is a commit carrying its cause. Three things the profile now
+  says plainly that it did not before. (1) B.1's claim that the watcher
+  monitors the Samba announcement channel is corrected to what is actually
+  implemented — an hourly probe of the release directory — and the
+  announcement list is recorded in B.6 as not machine-parsed in v1, with
+  the bound on that gap measured rather than asserted: detection is
+  unaffected, only the automatic soak bypass is. (2) The package-closure
+  hash is measured on the runner's architecture (amd64) alone; the section
+  states what that does and does not mean — the hash decides *when* a
+  rebuild is owed, never *what* is installed, and both architectures are
+  always built natively against the index of the day. (3) The §5.4 ledger
+  stops being hand-written: `scripts/cve-ledger.py` synchronises
+  `security/cve-exceptions.yaml` from the published image's SBOM as one
+  entry per affected package, because the 4.24.7 image carries 287
+  findings with no available fix (77 HIGH/CRITICAL) over 27 packages and a
+  per-CVE ledger of that size is the suppression list §5.4 forbids. The
+  review dates are never moved by a sync — renewing one is a human review,
+  and `check-cve-exceptions.py` is still the clock.

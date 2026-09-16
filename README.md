@@ -4,6 +4,10 @@ Production-grade container image for a **Samba Active Directory Domain
 Controller**, built from verified upstream source with Samba's bundled
 Heimdal Kerberos.
 
+[![CI](https://github.com/esitc-paris/samba-ad-dc/actions/workflows/ci.yml/badge.svg)](https://github.com/esitc-paris/samba-ad-dc/actions/workflows/ci.yml)
+[![Upstream check](https://github.com/esitc-paris/samba-ad-dc/actions/workflows/upstream-check.yml/badge.svg)](https://github.com/esitc-paris/samba-ad-dc/actions/workflows/upstream-check.yml)
+[![Release](https://github.com/esitc-paris/samba-ad-dc/actions/workflows/release.yml/badge.svg)](https://github.com/esitc-paris/samba-ad-dc/actions/workflows/release.yml)
+
 > **Status: pre-release.** No image has been published yet. Everything
 > below the status line describes the target state and is completed
 > before the first release; empty sections are intentionally present as

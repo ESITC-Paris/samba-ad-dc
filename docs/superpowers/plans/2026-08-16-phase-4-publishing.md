@@ -1,4 +1,9 @@
-# Phase 4 — Publishing Pipeline Implementation Plan
+# Phase 4 — Publishing Pipeline Implementation Plan (SUPERSEDED)
+
+> **SUPERSEDED 2026-09-16** by `2026-09-16-phase-4-release-automation.md`,
+> which implements this phase against the three-branch catalog and an
+> in-repo watcher (roadmap D4 reversed). Kept for the decisions it
+> records; do not execute it.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or

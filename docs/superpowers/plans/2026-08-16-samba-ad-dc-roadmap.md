@@ -94,6 +94,17 @@ binding adaptation profile for this image.
 | D5 | Initial catalog scope | **Bring-up on the newest upstream stable branch only; activate remaining supported branches in Phase 7 before first public announcement** | §3.6 requires all branches *published*; doing bring-up on one branch first is a repo-internal staging matter as long as nothing is announced/published before Phase 7 completes |
 | D6 | Dead-man switch (§9bis.6) | **healthchecks.io free tier ping from the watcher timer** | External to our machine (a machine down = alert), 2 h grace configurable, zero infra |
 
+**D4 REVERSED 2026-09-16 by maintainer instruction** — the watcher is an
+in-repo workflow (`.github/workflows/upstream-check.yml` plus
+`scripts/watch.py`), modelled on `ESITC-Paris/unbound-distroless`, and its
+state lives in `.build-state.json` in this tree. The reasons D4 gave for a
+separate repository still hold for a multi-image catalog and are not
+disputed; they are outweighed here by having one fewer deployment, one
+fewer credential path, and a decision history that is this repository's own
+commit log. See `2026-09-16-phase-4-release-automation.md` and the **Release
+cycle** section of `docs/adaptation-profile.md`. D6's dead-man switch is
+unaffected: it watches the external timer that dispatches the workflow.
+
 ---
 
 ## 1. Subsystem decomposition
