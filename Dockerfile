@@ -4,8 +4,8 @@
 #
 # Every pin below mirrors versions.yaml (branch 4.24); CI asserts they
 # stay in sync. Nothing here resolves a "latest" anything.
-ARG BUILDER_BASE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
-ARG RUNTIME_BASE=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+ARG BUILDER_BASE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+ARG RUNTIME_BASE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 # golang:1.24-trixie — entrypoint/go.mod declares `go 1.24.0`, so 1.24 is
 # the floor, and trixie matches the runtime base so the toolchain and the
 # image agree on their libc even though the binary is built CGO_ENABLED=0.
@@ -19,8 +19,8 @@ FROM ${BUILDER_BASE} AS builder
 # bash (not dash) so `set -o pipefail` is honoured inside RUN pipelines.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG SAMBA_VERSION=4.24.6
-ARG SAMBA_TARBALL_SHA256=810cc955acb367e9bde556dccfb50db177a02b7c553aa1629a0b905fa7616267
+ARG SAMBA_VERSION=4.24.7
+ARG SAMBA_TARBALL_SHA256=45b7747a47452eff2b2159a44cc63eb43690d339fd1069088e023a015fed06c7
 # Primary key of the Samba Distribution Verification Key (keys/PINNING.md).
 ARG SAMBA_SIGNING_FINGERPRINT=81F5E2832BD2545A1897B713AA99442FB680B620
 
@@ -214,7 +214,7 @@ RUN set -eux; \
 # impossible to ship around them.
 FROM ${GOBUILD_BASE} AS gobuild
 
-ARG SAMBA_VERSION=4.24.6
+ARG SAMBA_VERSION=4.24.7
 
 WORKDIR /src
 
@@ -250,7 +250,7 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM ${RUNTIME_BASE} AS runtime
 
-ARG SAMBA_VERSION=4.24.6
+ARG SAMBA_VERSION=4.24.7
 # The hash of the distribution package index the runtime closure was
 # resolved against (SPEC §9bis.1.c); the watcher edits it in versions.yaml
 # and CI injects it with --build-arg. The default below is a bare fallback
@@ -264,7 +264,7 @@ ARG PKG_INDEX_HASH=bootstrap
 ARG VCS_REF=dev
 ARG CREATED=1970-01-01T00:00:00Z
 ARG BASE_NAME=debian:trixie-slim
-ARG BASE_DIGEST=sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+ARG BASE_DIGEST=sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
 # The manifest is shipped inside the image so that what an operator can
 # read is exactly what was installed (SPEC §5.1).
