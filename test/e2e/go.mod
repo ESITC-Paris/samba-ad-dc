@@ -4,4 +4,4 @@
 // `go test` from the repository root or from CI.
 module github.com/esitc-paris/samba-ad-dc/test/e2e
 
-go 1.24.0
+go 1.25.0

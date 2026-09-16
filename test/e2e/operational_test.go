@@ -441,11 +441,15 @@ func TestOfflineBackupRestore(t *testing.T) {
 	harness.Exec(t, restored.Name, "samba-tool", "user", "show", "dave")
 
 	// FINDING 4 — the restored tree is not laid out like a provisioned one,
-	// but the relocation stops short of the MS-SNTP signing socket. The
-	// restored smb.conf points `state directory`, `cache directory` and the
-	// sysvol share into /var/lib/samba/state (and leaves `lock directory` at
-	// /var/lib/samba), which is why operator documentation must derive those
-	// paths rather than hardcode them (B.6). It does NOT set `ntp signd
+	// but the relocation stops short of the MS-SNTP signing socket. Measured
+	// (B.6): the restored smb.conf moves `state directory` and the sysvol
+	// share one level down, to /var/lib/samba/state and
+	// /var/lib/samba/state/sysvol, and leaves the other two flat —
+	// `cache directory = /var/lib/samba/cache`, a sibling of state and not a
+	// child of it, and `lock directory = /var/lib/samba`. That is why
+	// operator documentation must derive those paths from smb.conf rather
+	// than hardcode them: no single rule maps a provisioned path to its
+	// restored one. It does NOT set `ntp signd
 	// socket directory`, and samba's compile-time default for that parameter
 	// does not track `state directory` — so a restored DC keeps the signing
 	// socket exactly where a provisioned one does. This was measured, after
