@@ -5,9 +5,10 @@
 // operator documentation tells people to type. Every container this
 // package starts runs the *constrained profile* of the adaptation profile
 // (SPEC Annex B.2): read-only rootfs, tmpfs for the writable runtime
-// paths, `--cap-drop ALL` plus the minimal capability set. Nothing here
-// ever uses `--privileged` (§5.2), and the profile is therefore proven on
-// every single E2E run rather than asserted in prose.
+// paths, `--cap-drop ALL` plus the minimal capability set, and
+// `--security-opt no-new-privileges:true`. Nothing here ever uses
+// `--privileged` (§5.2), and the profile is therefore proven on every
+// single E2E run rather than asserted in prose.
 package harness
 
 import (
@@ -147,6 +148,22 @@ var DefaultCaps = []string{
 // pure cache — nothing there needs to survive a restart — so a tmpfs is
 // the correct answer rather than a volume.
 var DefaultTmpfs = []string{"/run", "/tmp", "/var/cache/samba"}
+
+// DefaultSecurityOpt is the `--security-opt` set every DC container gets.
+//
+// `no-new-privileges:true` is in every deployment example the guides
+// publish (deployment-guide §1.8, README quickstart), and
+// docs/traceability.md states that the suite runs under it. It is here so
+// that statement is true: tested is documented, and a setting only the
+// documentation carries is a setting nobody has ever run.
+//
+// Unlike DefaultCaps it is NOT a measured minimum — nothing in the image
+// escalates privilege at exec time, so the suite would be just as green
+// without it. What the flag buys is the guarantee that it stays costless:
+// if a future change to the image ever needed a setuid helper, the suite
+// goes red here instead of an operator's production DC going red on the
+// profile the guides told them to use.
+var DefaultSecurityOpt = []string{"no-new-privileges:true"}
 
 // Image returns the DC image under test.
 func Image() string {
@@ -820,6 +837,9 @@ func startDC(t *testing.T, net, name, mode string, env map[string]string, mustLi
 	args = append(args, "--cap-drop", "ALL")
 	for _, c := range s.caps {
 		args = append(args, "--cap-add", c)
+	}
+	for _, o := range DefaultSecurityOpt {
+		args = append(args, "--security-opt", o)
 	}
 	args = append(args,
 		"-v", s.stateVol+":/var/lib/samba",

@@ -90,11 +90,16 @@ Two entries deserve a note:
   branch. The single exception is the one-off container that runs
   `samba-tool domain backup restore` **on branch 4.22** — see §7.4.
 
-`security_opt: ["no-new-privileges:true"]` is set in every example here.
-It is a defence-in-depth setting rather than a measured requirement:
-nothing in the image escalates privilege at `exec` time, so it costs
-nothing, and the E2E suite's own profile (read-only rootfs, `cap-drop
-ALL` plus the six) is what the tests exercise.
+`security_opt: ["no-new-privileges:true"]` is set in every example here,
+and **the E2E suite runs under it too**: `harness.DefaultSecurityOpt`
+puts `--security-opt no-new-privileges:true` on every container the suite
+starts, so the profile these examples publish is the profile the tests
+exercise, flag for flag. It remains defence-in-depth rather than a
+measured requirement — nothing in the image escalates privilege at
+`exec` time, so the suite would be equally green without it. What the
+flag buys is that this stays true: a future change that needed a setuid
+helper turns the suite red instead of turning an operator's DC red on
+the profile this guide told them to use.
 
 ### 1.3 Filesystem: xattr and POSIX ACLs
 

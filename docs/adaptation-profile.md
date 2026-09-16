@@ -146,6 +146,16 @@ them.
   created by the entrypoint for the same mount-hiding reason), so the
   clock estimate survives a restart instead of being lost with the
   tmpfs.
+  The E2E harness starts **every** DC container on exactly this profile —
+  `--read-only`, those three tmpfs mounts, `--cap-drop ALL` plus the
+  capability set above, and `--security-opt no-new-privileges:true` — so
+  the block the deployment guide publishes as *the hardened profile*
+  (§1.8) and the block the suite runs are the same list of flags. The
+  last of them is defence-in-depth rather than a measured requirement:
+  nothing in the image escalates privilege at `exec` time, and the suite
+  is green with or without it. It is applied anyway so that a change
+  which ever needed a setuid helper is caught by a test instead of by a
+  deployment following this profile.
 
 ### B.3 Non-negotiable deployment constraints
 
@@ -1189,3 +1199,20 @@ gates.
   `workflow_run` trigger a maintainer has to know before the first
   release: it fires only for `release.yml` as it exists on the default
   branch, and only for a Release run that concluded `success`.
+- 2026-09-16: Phase 5 — **`no-new-privileges` stops being a documentation
+  claim and becomes a tested one.** Every deployment example the guides
+  publish carries `security_opt: ["no-new-privileges:true"]`, B.2 above
+  describes the constrained profile, and `docs/traceability.md` stated
+  that `harness.StartDC` applied it — but the harness emitted no
+  `--security-opt` at all. The setting is now `DefaultSecurityOpt` in
+  `test/e2e/harness`, applied to every container the suite starts (DCs
+  and the backup/restore/marker one-offs alike), and the whole suite was
+  re-run under it locally on arm64 against `samba-ad-dc:dev`: 17 pass,
+  1 skip (`TestUpgradeFromLastPublished`, with `E2E_UPGRADE_FROM` unset),
+  0 fail. It is defence-in-depth rather than a measured minimum —
+  the suite is green either way — and that is exactly why it belongs in
+  the harness: a change that ever needed a setuid helper must fail in CI
+  rather than on a deployment that followed §1.8 of the deployment guide.
+  The alternative, deleting the setting from the guides, was rejected:
+  nothing measured it as harmful, and "tested = documented" is satisfied
+  by testing it.
