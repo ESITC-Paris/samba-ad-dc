@@ -1216,3 +1216,11 @@ gates.
   The alternative, deleting the setting from the guides, was rejected:
   nothing measured it as harmful, and "tested = documented" is satisfied
   by testing it.
+- 2026-09-16: Phase 5 — the traceability map's **doc section** column is
+  filled: 17 anchors into the three guides, each verified by computing
+  the GitHub slug of the heading it names. `scripts/check-traceability.sh`
+  gains check (f), which holds the guides' citations to exactly the
+  matrix's ID set in both directions (every mapped ID cited by at least
+  one guide; every backticked `Test…` token in the guides a mapped ID or
+  an exempt infrastructure test), matching whole backticked IDs so that
+  `TestProvision` cannot stand in for `TestProvisionOverStateRefused`.
