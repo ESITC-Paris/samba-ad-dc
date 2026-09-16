@@ -540,13 +540,27 @@ process listing for the life of the command. Interactively, drop the
 
 ### 4.5 LDAPS with the DC's own certificate
 
-Copy the DC's CA out and use it as the **only** trust anchor:
+Copy the DC's CA out, get it into the member, and use it as the **only**
+trust anchor. The certificate is public material, so it travels as an
+ordinary file — nothing here is secret.
+
+On the host:
 
 ```sh
 docker cp dc1:/var/lib/samba/private/tls/ca.pem ./ca.pem
 ```
 
-then, from the member:
+Start the member with that file mounted — the `docker run` from the §4
+preamble, plus one bind:
+
+```sh
+docker run --rm -it --network <your-addc-network> --dns 192.0.2.10 \
+  -e PW \
+  -v "$PWD/ca.pem:/tmp/ca.pem:ro" \
+  <your-client-image> sh
+```
+
+and from inside it:
 
 ```sh
 LDAPTLS_CACERT=/tmp/ca.pem LDAPTLS_REQCERT=demand \
@@ -932,6 +946,25 @@ points at it rather than at a copy, and why the volumes are mounted
 Everything runs as **one-off containers of the image**, never as a shell
 inside a live DC.
 
+**What this runbook assumes, and why the names change.** The worked
+example restores the **single-DC domain of §3** — `dc1` on
+`dc1-state`/`dc1-conf` — into a new DC called `dc3`, on new volumes
+`dc3-state`/`dc3-conf`, at a new address. The identity is deliberately
+*not* `dc2`'s: §5 gave that name and those volumes to the joined DC, and
+reusing either here is a way to lose a working domain rather than recover
+one.
+
+- Reusing the **name** fails the way finding 1 below describes — `Entry
+  CN=DC2,OU=Domain Controllers,... already exists` — because the restore
+  adds the new DC's account before removing the backed-up ones.
+- Reusing the **volumes** is worse: it would restore over a live replica's
+  state. The `rmdir` in §7.3 is the safety net for exactly this — it fails
+  on a non-empty directory, so the command cannot eat a volume that holds
+  a domain — but a safety net is not a plan.
+
+On a multi-DC domain, choose a name no DC in the directory holds and a
+volume pair nothing is using, and read §7.2 before running anything.
+
 ### 7.1 Take the backup
 
 ```sh
@@ -1011,15 +1044,17 @@ name, then the update aborts). This is a **procedural requirement of the
 restore**, not a test convenience.
 
 **4 — The restored DC does not have a provisioned DC's layout.** The
-restored `smb.conf` points `state directory`, `cache directory` and the
-sysvol share **into `/var/lib/samba/state`**, and leaves `lock directory`
-at `/var/lib/samba`. Measured on a restored DC that had reached healthy:
+restored `smb.conf` points `state directory` and the sysvol share **into
+`/var/lib/samba/state`**. It does not move everything, and the difference
+is measured rather than inferred: `cache directory` and `lock directory`
+stay exactly where a provisioned DC has them. Measured on a restored DC
+that had reached healthy:
 
 | parameter | provisioned DC | restored DC |
 |---|---|---|
 | `state directory` | `/var/lib/samba` | `/var/lib/samba/state` |
-| `cache directory` | `/var/lib/samba/cache` (image default) | `/var/lib/samba/cache` under the restored tree |
-| `lock directory` | `/var/lib/samba` | `/var/lib/samba` |
+| `cache directory` | `/var/lib/samba/cache` | `/var/lib/samba/cache` — unchanged |
+| `lock directory` | `/var/lib/samba` | `/var/lib/samba` — unchanged |
 | sysvol `path` | `/var/lib/samba/sysvol` | `/var/lib/samba/state/sysvol` |
 | `ntp signd socket directory` | `/var/lib/samba/ntp_signd` | **`/var/lib/samba/ntp_signd`** — unchanged |
 
@@ -1054,12 +1089,12 @@ volume written by a newer Samba than the image provides is refused with
 exit 22 (§6.4).
 
 ```sh
-docker volume create dc2-state
-docker volume create dc2-conf
+docker volume create dc3-state
+docker volume create dc3-conf
 
 docker run --rm \
-  -v dc2-state:/var/lib/samba \
-  -v dc2-conf:/etc/samba \
+  -v dc3-state:/var/lib/samba \
+  -v dc3-conf:/etc/samba \
   -v dc1-backup:/backup:ro \
   --read-only \
   --tmpfs /run --tmpfs /tmp --tmpfs /var/cache/samba \
@@ -1074,7 +1109,7 @@ rmdir /var/lib/samba/private /var/lib/samba/bind-dns
 samba-tool domain backup restore \
   --backup-file="$(ls /backup/samba-backup-*.tar.bz2)" \
   --targetdir=/var/lib/samba \
-  --newservername=dc2
+  --newservername=dc3
 cp /var/lib/samba/etc/smb.conf /etc/samba/smb.conf
 '
 ```
@@ -1086,9 +1121,11 @@ the target directory, **including its own `etc/smb.conf` with every path
 rewritten to match** (finding 4). Copying it to `/etc/samba/smb.conf` is
 what puts it where the image reads it from.
 
-`--newservername=dc2` must be a name that does not already exist in the
-domain (finding 1) and, since this container will later be started as a
-DC, at most 15 characters (§1.7).
+`--newservername=dc3` must be a name **no DC in the domain already
+holds** (finding 1) — `dc1` and, if you followed §5, `dc2` are both taken
+— and, since this container will later be started as a DC, at most 15
+characters (§1.7). `dc3-state` and `dc3-conf` must likewise be volumes
+nothing is using.
 
 ### 7.4 Branch 4.22 only: `--cap-add DAC_OVERRIDE` on the restore
 
@@ -1129,19 +1166,19 @@ printf 'nameserver 127.0.0.1\n' > ./restored-resolv.conf
 ```
 
 ```yaml
-  dc2:
+  dc3:
     image: ghcr.io/esitc-paris/samba-ad-dc:4.24.7-r1
-    container_name: dc2
-    hostname: dc2
+    container_name: dc3
+    hostname: dc3
     environment:
       SAMBA_MODE: run              # the domain already exists on the volume
     volumes:
-      - dc2-state:/var/lib/samba
-      - dc2-conf:/etc/samba
+      - dc3-state:/var/lib/samba
+      - dc3-conf:/etc/samba
       - ./restored-resolv.conf:/etc/resolv.conf:ro
     networks:
       addc:
-        ipv4_address: 192.0.2.11   # REPLACE
+        ipv4_address: 192.0.2.12   # REPLACE
     # --- the hardened profile (§1.8), unchanged: no DAC_OVERRIDE here ---
     read_only: true
     tmpfs: [/run, /tmp, /var/cache/samba]
@@ -1176,17 +1213,17 @@ entrypoint: volume adopted: marker written for samba 4.24.7
 ```sh
 # the domain that came back is the one that was backed up, not an empty
 # one wearing its name
-docker exec dc2 samba-tool user show <a-user-you-know-existed>
+docker exec dc3 samba-tool user show <a-user-you-know-existed>
 
 # the health verdict
-docker inspect --format '{{.State.Health.Status}}' dc2
+docker inspect --format '{{.State.Health.Status}}' dc3
 
 # signed-NTP wiring survived the smb.conf rewrite (§4.6)
-docker exec dc2 sh -c 'testparm -s --parameter-name="ntp signd socket directory"'
-docker exec dc2 grep '^ntpsigndsocket' /run/chrony/chrony.conf
+docker exec dc3 sh -c 'testparm -s --parameter-name="ntp signd socket directory"'
+docker exec dc3 grep '^ntpsigndsocket' /run/chrony/chrony.conf
 
 # and the time service really answers, from a member (§4.6)
-chronyd -Q -t 30 "server 192.0.2.11 iburst"
+chronyd -Q -t 30 "server 192.0.2.12 iburst"
 ```
 
 Sysvol content is **not** verified by any of this; see §8.
