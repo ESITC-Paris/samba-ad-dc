@@ -449,7 +449,7 @@ class TestChangelog(CatalogTestCase):
         self.assertIn("- Fixed CVEs: see the GitHub Release\n", text)
         self.assertIn(
             "- Digests, signature and attestations: "
-            "https://github.com/esitc-paris/samba-ad-dc/releases/tag/"
+            "https://github.com/ESITC-Paris/samba-ad-dc/releases/tag/"
             "v4.24.6-r1\n", text)
 
     def test_notes_replace_the_none_placeholder(self):
@@ -508,7 +508,7 @@ class TestReleaseNotes(CatalogTestCase):
             "cosign verify ghcr.io/esitc-paris/samba-ad-dc@sha256:aaa", out)
         self.assertIn(
             "--certificate-identity-regexp "
-            "'https://github.com/esitc-paris/samba-ad-dc/.*'", out)
+            "'https://github.com/ESITC-Paris/samba-ad-dc/.*'", out)
         self.assertIn("--certificate-oidc-issuer "
                       "https://token.actions.githubusercontent.com", out)
 

@@ -40,7 +40,11 @@ except ImportError:  # pragma: no cover - environment failure, not logic
 # notes, cosign commands), so they live here rather than in each workflow.
 GHCR_IMAGE = "ghcr.io/esitc-paris/samba-ad-dc"
 HUB_IMAGE = "docker.io/esitcparis/samba-ad-dc"
-REPO_URL = "https://github.com/esitc-paris/samba-ad-dc"
+# The owner is spelled `ESITC-Paris` here, not lowercase like the registry
+# names: this URL is also the Fulcio certificate identity that cosign matches
+# with --certificate-identity-regexp, and that match is case-sensitive. GitHub
+# web URLs are case-insensitive, so the CHANGELOG and Release links still work.
+REPO_URL = "https://github.com/ESITC-Paris/samba-ad-dc"
 OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 
 # SPEC §10.4 causes plus the two this repository adds: `base-digest` for a
