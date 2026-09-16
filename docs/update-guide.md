@@ -342,7 +342,12 @@ refuses to start at all.
 *Covered by:* `TestUpgradeFromLastPublished` (both supported paths, per the
 bound stated in B.6 of `docs/adaptation-profile.md`). No test covers a
 skipped-branch upgrade — that is the point of calling it unsupported. The
-cross-branch CI run is described in `docs/operations.md`.
+two paths are one test run twice: `.github/workflows/release.yml` resolves
+the branch's own latest published tag into `E2E_UPGRADE_FROM` for the main
+suite, then re-runs that single test in a *Cross-branch upgrade from the
+previous series* step against the previous series' latest published tag.
+That second step is absent on the oldest branch in the catalog and skipped
+while the previous series has never been published.
 
 ---
 
