@@ -240,9 +240,26 @@ when a test or a row exists without its counterpart.
   runners in the public pipeline); protocol-level equivalents are tested.
   A non-blocking out-of-band validation with a real Windows client is a
   roadmap item.
-- **Cross-branch upgrade tests** (e.g. 4.21 → 4.22) are committed alongside
-  multi-branch activation; intra-branch upgrades are tested on every
-  build.
+- **Cross-branch upgrade coverage is bounded, and the bound is stated
+  rather than implied.** Exactly two upgrade paths are tested and
+  supported: *intra-branch* — the branch's previously published
+  `X.Y.Z-rN` to the tag being released — on every release of any branch;
+  and *previous branch → current branch* — `X.(Y-1)` to `X.Y` — on every
+  release of the current branch. `TestUpgradeFromLastPublished` is the
+  acceptance test for both; which of the two it exercises is decided
+  entirely by the image `E2E_UPGRADE_FROM` names, so no second test
+  exists. First evidence for the cross-branch path, local arm64,
+  2026-09-16: a domain provisioned by `samba-ad-dc:4.23-dev`
+  (Samba 4.23.12) started on the same volumes under `samba-ad-dc:dev`
+  (Samba 4.24.7) — PASS in 27.2 s, the pre-upgrade user still resolvable,
+  `dbcheck` clean, the state marker moved forward and `initialized_at`
+  carried over rather than restamped.
+  Every other path is **unsupported**: skipping a branch (4.22 → 4.24),
+  and downgrading in any form. Nothing prevents a skipped-branch start
+  mechanically — the guard in front of the database only refuses an
+  *older* Samba (`TestDowngradeRefused`) — so "unsupported" here means
+  untested and unclaimed, not blocked. An operator two branches behind
+  upgrades one branch at a time.
 - Backup strategy: **offline backup is the primary, CI-tested path**
   (credential-free, automation-friendly); online backup is a documented
   alternative requiring administrator credentials.
@@ -306,6 +323,65 @@ when a test or a row exists without its counterpart.
   log lines outweighs the cosmetic gain. Revisit if upstream separates the
   worker log-reopen path from the configured logging backend.
 
+- **On branch 4.22, `samba-tool domain backup restore` needs
+  `CAP_DAC_OVERRIDE`, which the B.2 capability set does not grant.**
+  Measured locally on arm64, 2026-09-16, with `samba-ad-dc:4.22-dev`
+  (Samba 4.22.11) under the constrained profile every E2E DC runs in:
+  `TestOfflineBackupRestore` fails, deterministically (3 runs of 3), when
+  the restore reaches the sysvol NT-ACL step —
+
+  ```text
+  py_smbd_mkdir: mkdirat error=13 (Permission denied)
+  ERROR(<class 'SystemError'>): uncaught exception - <built-in function mkdir> returned NULL without setting an exception
+    File ".../samba/ntacls.py", line 631, in backup_restore
+      smbd.mkdir(dst, session_info, service)
+  ```
+
+  — and `samba-tool domain backup restore` exits 255. The same test passes
+  on 4.23.12 and on 4.24.7 with the identical capability set, and passes
+  on 4.22.11 the moment `DAC_OVERRIDE` is added back to it (verified by
+  one throwaway run with the capability restored; nothing in the committed
+  harness was changed). This is the limit of the Phase 3 bisection being
+  honest about its own scope: that measurement was made against the 4.24
+  image, and `DAC_OVERRIDE` was dropped because *that* image proved it
+  unnecessary. A capability set is a property of an image, not of a
+  repository, and 4.22 is a different image.
+  **Open, and a maintainer's call:** either B.2 gains a per-branch
+  capability set (4.22 keeping `DAC_OVERRIDE`, with its own bisection
+  run), or offline restore under the constrained profile is recorded as
+  unsupported on 4.22. Publishing 4.22 before that is decided would ship a
+  branch whose documented backup path fails against this profile's own
+  example configuration.
+
+- **On branches 4.22 and 4.23 the DC's self-signed TLS certificate
+  carries a byte-reversed serial, which is DER-negative about half the
+  time.** Measured locally on arm64, 2026-09-16, by provisioning DCs from
+  `samba-ad-dc:4.22-dev`, `:4.23-dev` and `:dev` within seconds of each
+  other and reading `/var/lib/samba/private/tls/cert.pem`: 4.22.11 and
+  4.23.12 write the 32-bit generation time **little-endian**
+  (`13DDAA6A`, `30DCAA6A` — the same instant 4.24.7 writes as `6AAADC52`,
+  big-endian). The leading DER byte of those serials is therefore the
+  *low* byte of the clock, which crosses 0x80 every 256 seconds, and a
+  leading byte ≥ 0x80 makes the INTEGER negative: one such certificate was
+  captured directly (`openssl x509 -serial` → `serial=-65235596`). RFC
+  5280 §4.1.2.2 requires a positive serial, so a strict parser refuses the
+  certificate outright — Go's `crypto/x509` does, which is why
+  `TestLDAPSCertificate` fails on roughly half of all 4.22/4.23 provisions
+  with `x509: negative serial number`, and passes on the other half. The
+  full E2E suite on 4.23.12 is otherwise green (2026-09-16: 16 pass, 1
+  skip, that one failure).
+  What is *not* affected: the TLS handshake itself. GnuTLS and OpenSSL
+  accept a negative serial, so `ldapsearch` over `ldaps://` — the part of
+  that same test which exercises the protocol — is unaffected, and so is
+  every real client. The defect is in what the certificate *is*, not in
+  what the DC does with it, and it is upstream's: 4.24 emits the serial
+  big-endian and is unaffected until 2038.
+  **Open, and a maintainer's call, not this repository's:** whether 4.22
+  and 4.23 are published with this recorded as a branch-specific
+  limitation, or whether `TestLDAPSCertificate` is made to assert the
+  certificate without Go's serial check on those branches. Nothing is
+  decided here; the measurement is.
+
 - **No `nsupdate` in the image** (`bind9-dnsutils` is not installed).
   Dynamic DNS updates therefore run through
   `samba_dnsupdate --use-samba-tool`, which the entrypoint pins (Phase 2);
@@ -317,6 +393,32 @@ All Samba stable branches currently supported upstream are published
 simultaneously (§3.6), each receiving every patch release; branch
 lifecycle relayed per §9.4 (release candidates of a new series trigger the
 deprecation notice for the oldest branch).
+
+Activated branches, pinned in `versions.yaml`, with upstream's status **as
+observed on 2026-09-16**:
+
+| Branch | Upstream patch level pinned | Upstream status on 2026-09-16 |
+|--------|-----------------------------|-------------------------------|
+| 4.24 | 4.24.7 | current — default branch, owns the `4` and `latest` aliases |
+| 4.23 | 4.23.12 | maintenance |
+| 4.22 | 4.22.11 | security fixes only |
+
+Each of those tarball checksums was produced by
+`sh scripts/verify-upstream-tarball.sh <X.Y.Z>`, which repeats the
+builder stage's own gunzip-then-OpenPGP chain against the pinned
+fingerprint before the value is allowed into the catalog.
+
+**The rule the published matrix follows.** The README matrix is generated
+(`catalog.py render-matrix`) and the status column is *positional*, not
+stored: branches sorted newest first, the first is `current`, the second
+`maintenance`, the third `security fixes only`, and a fourth or older
+would read `discontinued (EOL)`. The catalog's branch list is the only
+input, so nothing here decides upstream's lifecycle — the watcher relays
+it by adding a series or dropping the oldest, and a release candidate for
+a newer series appends a deprecation-pending note to the oldest supported
+row. The table above is a dated snapshot for a reader of this file; the
+README matrix is the always-current statement, and the two are the same
+claim only because both are derived from `versions.yaml`.
 
 ### B.8 Reproducibility (SPEC §4.3 interpretation)
 
@@ -669,3 +771,28 @@ it is harmless: Kerberos falls back to its built-in defaults.
   smbd/rpcd workers (cosmetic; all real logs go to stdout per §6.4;
   silencing deferred because every lever risks losing diagnostics). B.5
   gains a back-link to `docs/traceability.md`.
+- 2026-09-16: Phase 4 — **the catalog stops being a single branch.** B.7
+  lists the three branches activated at their current upstream patch
+  levels (4.24.7, 4.23.12, 4.22.11), each pinned in `versions.yaml` from a
+  checksum produced by the new `scripts/verify-upstream-tarball.sh`, and
+  states the rule the README matrix follows: the lifecycle column is
+  positional over the catalog's branch list, so upstream's status is
+  relayed and never decided here. B.6's cross-branch upgrade entry stops
+  being a promise and becomes a bounded claim with evidence: intra-branch
+  on every release, previous-branch → current on every release of the
+  current branch, everything else untested and unclaimed — proven for
+  4.23.12 → 4.24.7 locally on arm64 (PASS, 27.2 s, data intact, marker
+  moved forward). Both older branches built and ran the suite unchanged:
+  no `./configure` option this image passes is rejected by 4.23 or 4.22,
+  so the Dockerfile stayed single. One product difference was found doing
+  it and is recorded in B.6 rather than worked around: 4.22.11 and 4.23.12
+  write the self-signed TLS certificate's serial little-endian, which
+  makes it a negative DER INTEGER for about half of every 256-second
+  window and makes `TestLDAPSCertificate` fail on those provisions; 4.24.7
+  writes it big-endian. A second one, on 4.22 alone, is recorded beside
+  it: `samba-tool domain backup restore` needs `CAP_DAC_OVERRIDE` there,
+  which the B.2 set — measured on the 4.24 image — does not grant, so the
+  documented offline-restore path fails under this profile's own example
+  configuration. Both entries state what was measured and leave the ruling
+  open, deliberately: neither is this repository's bug to fix, and both
+  decide whether a branch can be published.
