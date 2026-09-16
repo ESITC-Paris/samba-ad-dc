@@ -72,7 +72,10 @@ SYS_ADMIN  NET_BIND_SERVICE  CHOWN  FOWNER  SETUID  SETGID
 
 This set is **measured, not assumed**: it was established by capability
 bisection (local arm64, 2026-08-16, driver `test/capbisect/bisect.sh`,
-report `test/capbisect/results-arm64.txt`), and the E2E suite re-proves
+report `test/capbisect/results-arm64-2026-08-16.txt`) and confirmed on
+both architectures by the CI bisection of 2026-09-16 (reports
+`test/capbisect/results-amd64.txt` and `test/capbisect/results-arm64.txt`,
+both `=> AGREE`), and the E2E suite re-proves
 its sufficiency on every run because `test/e2e/harness.DefaultCaps`
 carries exactly this list. What breaks when each one is removed is
 tabulated in [B.2](adaptation-profile.md#b2-deviations-from-generic-requirements-112-justifications).

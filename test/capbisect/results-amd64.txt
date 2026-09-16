@@ -1,10 +1,10 @@
 capability bisection report
 ===========================
 
-date (UTC)     : 2026-09-16T21:47:25Z
-architecture   : arm64 (Linux aarch64)
+date (UTC)     : 2026-09-16T21:49:11Z
+architecture   : amd64 (Linux x86_64)
 image          : samba-ad-dc:dev
-image digest   : sha256:ace92ca9ae2c34516f90f342bcfc59b79d803a762cbfc4d2f3f83bdfbfbf2f43
+image digest   : sha256:8d1451a1ee46e33a533882b10a8ed2347b8a802d0748f479285ec97b0c15ece0
 docker server  : 28.0.4
 subset         : go test -run 'TestProvision$|TestKerberosKinit|TestIdempotentRestart'
 per-run timeout: 40m
@@ -29,29 +29,30 @@ measurements
 (appended as each run finishes, so an interrupted run still leaves
 every verdict it reached; evidence lines are quoted from the run log)
 
-  baseline           PASS           42s
-  SYS_ADMIN          REQUIRED       27s
+  baseline           PASS           45s
+  SYS_ADMIN          REQUIRED       26s
                                    | set_nt_acl_conn: fset_nt_acl returned NT_STATUS_ACCESS_DENIED.
                                    | _setntacl(sysvol)
                                    | File "/usr/lib/python3.13/site-packages/samba/provision/__init__.py", line 1750, in _setntacl
-  NET_BIND_SERVICE   DROPPABLE      34s
+  NET_BIND_SERVICE   DROPPABLE      35s
                                    | the subset passes without it
-  CHOWN              REQUIRED       27s
+  CHOWN              REQUIRED       26s
                                    | Security context active token stack underflow!
-                                   | INTERNAL ERROR: Security context active token stack underflow! in  () () pid 16 (4.24.7)
-                                   | PANIC (pid 16): Security context active token stack underflow! in 4.24.7
-  FOWNER             REQUIRED       27s
+                                   | INTERNAL ERROR: Security context active token stack underflow! in  () () pid 14 (4.24.7)
+                                   | PANIC (pid 14): Security context active token stack underflow! in 4.24.7
+  FOWNER             REQUIRED       26s
                                    | set_nt_acl_conn: fset_nt_acl returned NT_STATUS_ACCESS_DENIED.
                                    | setntacl(lp, path, acl, domsid, session_info, use_ntvfs=use_ntvfs, skip_invalid_chown=True, pass
                                    | File "/usr/lib/python3.13/site-packages/samba/ntacls.py", line 229, in setntacl
-  SETUID             REQUIRED      977s
+  SETUID             REQUIRED      978s
                                    | /usr/sbin/smbd: INTERNAL ERROR: failed to set uid
-                                   | /usr/sbin/smbd: PANIC (pid 119): failed to set uid
-                                   | /usr/sbin/smbd: PANIC (pid 133): failed to set uid
-  SETGID             REQUIRED       35s
+                                   | /usr/sbin/smbd: PANIC (pid 110): failed to set uid
+                                   | /usr/sbin/smbd: PANIC (pid 123): failed to set uid
+  SETGID             REQUIRED       34s
                                    | /usr/sbin/smbd: INTERNAL ERROR: sys_setgroups failed in smbd () () pid 36 (4.24.7)
                                    | /usr/sbin/smbd: PANIC (pid 36): sys_setgroups failed in 4.24.7
-  verify-minimal     PASS           34s
+                                   | /usr/sbin/smbd: INTERNAL ERROR: sys_setgroups failed in smbd () () pid 35 (4.24.7)
+  verify-minimal     PASS           35s
                                    | measured directly
   DAC_READ_SEARCH    NOT NEEDED      0s
                                    | candidate named by B.2; absent from the verified minimal set, which passes
@@ -114,4 +115,4 @@ SHIPPED-SET COMPARISON
   => AGREE. The shipped capability set is confirmed by measurement
      on this architecture, against this image.
 
-total runtime: 1204s
+total runtime: 1208s

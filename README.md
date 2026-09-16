@@ -285,12 +285,14 @@ writes extended attributes in the `security.*` namespace, which requires
 636). The mitigation is a minimal capability set — `SYS_ADMIN`,
 `NET_BIND_SERVICE`, `CHOWN`, `FOWNER`, `SETUID`, `SETGID` on top of
 `cap_drop: ALL` — **established by capability bisection**, not assumed
-(driver `test/capbisect/bisect.sh`, report
-`test/capbisect/results-arm64.txt`, what each removal breaks tabulated in
-B.2). **Do not run this image with `--privileged`:** it is never
-required, and it discards the whole point of the measured set. The
-read-only root filesystem is CI-proven; the writable paths are the two
-volumes plus tmpfs at `/run`, `/tmp` and `/var/cache/samba`.
+(driver `test/capbisect/bisect.sh`, reports
+`test/capbisect/results-amd64.txt` and `test/capbisect/results-arm64.txt`
+from the CI bisection that confirmed the set on both architectures, what
+each removal breaks tabulated in B.2). **Do not run this image with
+`--privileged`:** it is never required, and it discards the whole point
+of the measured set. The read-only root filesystem is CI-proven; the
+writable paths are the two volumes plus tmpfs at `/run`, `/tmp` and
+`/var/cache/samba`.
 
 ## Volumes and backup
 

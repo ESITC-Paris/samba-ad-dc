@@ -58,21 +58,38 @@ them.
   SYS_ADMIN  NET_BIND_SERVICE  CHOWN  FOWNER  SETUID  SETGID
   ```
 
-  **established by capability bisection** — local arm64, 2026-08-16,
-  image digest
+  **established by capability bisection** — first locally (arm64,
+  2026-08-16, image digest
   `sha256:198e52c9896718a6bcf273f58ab1d092800fbb63aa18a8a8b1d4e4862f27fb3e`,
-  driver `test/capbisect/bisect.sh`, report
-  `test/capbisect/results-arm64.txt`. **CI confirmation on both
-  architectures is pending the first run of
-  `.github/workflows/capbisect.yml`** (`workflow_dispatch`; it cannot run
-  before the repository has a GitHub remote). This is no longer a
-  hypothesis: each capability was removed from a real run of the E2E
-  smoke subset (provision, `kinit`, restart) against that image, and what
-  broke is what makes it "required". `test/e2e/harness.DefaultCaps`
-  carries exactly this list, so every E2E run re-proves that the set is
-  sufficient, and the driver fails when its own recommendation stops
-  matching `DefaultCaps` — which is what lets a CI run report "B.2 is
-  still true" rather than merely "the bisection completed".
+  report `test/capbisect/results-arm64-2026-08-16.txt`), driver
+  `test/capbisect/bisect.sh`. **CI has now confirmed it on both
+  architectures.** The first `workflow_dispatch` of
+  `.github/workflows/capbisect.yml` —
+  <https://github.com/ESITC-Paris/samba-ad-dc/actions/runs/35153558018>,
+  2026-09-16 — re-measured the shipped set on a native runner per
+  architecture, and both legs ended `=> AGREE`: amd64 in
+  `test/capbisect/results-amd64.txt` (image digest
+  `sha256:8d1451a1ee46e33a533882b10a8ed2347b8a802d0748f479285ec97b0c15ece0`)
+  and arm64 in `test/capbisect/results-arm64.txt` (image digest
+  `sha256:ace92ca9ae2c34516f90f342bcfc59b79d803a762cbfc4d2f3f83bdfbfbf2f43`).
+  The two kernels agreed capability for capability — the same five
+  REQUIRED, the same `NET_BIND_SERVICE` DROPPABLE. That agreement is a
+  result, not a formality: `.github/workflows/capbisect.yml` runs the two
+  legs on native runners precisely because a capability check is kernel
+  code and "is `SYS_ADMIN` required" is a question the two architectures
+  are entitled to answer differently. Here they did not. Note also that
+  `test/capbisect/results-arm64.txt` is now that CI report and no longer
+  the local one; the local run is kept beside it under its date because
+  it is the only committed measurement of `DAC_OVERRIDE`.
+
+  This is no longer a hypothesis: each capability was removed from a real
+  run of the E2E smoke subset (provision, `kinit`, restart) against that
+  image, and what broke is what makes it "required".
+  `test/e2e/harness.DefaultCaps` carries exactly this list, so every E2E
+  run re-proves that the set is sufficient, and the driver fails when its
+  own recommendation stops matching `DefaultCaps` — which is what lets a
+  CI run report "B.2 is still true" rather than merely "the bisection
+  completed".
 
   **What CI confirmation will and will not re-measure.** A bisection
   starts from the set the harness ships and removes one capability at a
@@ -89,7 +106,11 @@ them.
       sh test/capbisect/bisect.sh
   ```
 
-  which is exactly how the committed report was produced.
+  which is exactly how `test/capbisect/results-arm64-2026-08-16.txt` was
+  produced — and why that dated report is kept rather than superseded.
+  The two reports the CI run wrote cover the shipped six and nothing
+  else, so the dated one is the only committed evidence for the
+  `DAC_OVERRIDE` row of the table below.
 
   | capability | verdict | what removing it does |
   | --- | --- | --- |
@@ -1231,3 +1252,31 @@ gates.
   but a greppable one — and it now says to delete the marker *and* the
   blockquote, because deleting only the marker is the failure it exists
   to prevent.
+- 2026-09-16: Phase 5 — **the B.2 capability set is confirmed by CI on
+  both architectures**, which closes the "CI confirmation … is pending"
+  qualifier the Phase 3 entry above left open. The first
+  `workflow_dispatch` of `.github/workflows/capbisect.yml`
+  (<https://github.com/ESITC-Paris/samba-ad-dc/actions/runs/35153558018>)
+  bisected the shipped set on a native runner per architecture and both
+  legs ended `=> AGREE`, capability for capability: `SYS_ADMIN`, `CHOWN`,
+  `FOWNER`, `SETUID`, `SETGID` REQUIRED and `NET_BIND_SERVICE` DROPPABLE
+  on amd64 and on arm64 alike. Nothing in the set changed as a result —
+  the value of the run is that the claim is now measured on the kernel
+  the image ships against rather than on a maintainer's laptop, and that
+  a capability question the two architectures were entitled to answer
+  differently they did not. Reports committed as
+  `test/capbisect/results-amd64.txt` (new) and
+  `test/capbisect/results-arm64.txt` (refreshed from the CI leg).
+  **Refreshing the arm64 report moved evidence, so four citations were
+  re-pointed in the same commit.** The CI bisection starts from
+  `harness.DefaultCaps`, which no longer contains `DAC_OVERRIDE`, so its
+  reports do not measure it; the local run that did is
+  `test/capbisect/results-arm64-2026-08-16.txt`, already committed and
+  byte-identical to the pre-refresh `results-arm64.txt`. B.2's provenance
+  sentence, B.2's `CAPBISECT_SET` recipe ("exactly how the committed
+  report was produced"), §1.2 of the deployment guide and the
+  `harness.DefaultCaps` doc comment all named `results-arm64.txt` for a
+  local 2026-08-16 run; each now names the dated report for that, and the
+  two CI reports for the confirmation. Had they been left alone, the
+  refresh would have silently re-dated a citation and orphaned the only
+  `DAC_OVERRIDE` measurement in the tree.

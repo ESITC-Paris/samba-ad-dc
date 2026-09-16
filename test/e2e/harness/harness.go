@@ -115,8 +115,12 @@ const (
 // whole suite reads it from, and the set adaptation-profile B.2
 // documents. It is no longer a hypothesis: every entry below was
 // MEASURED by test/capbisect/bisect.sh, which re-runs the smoke subset
-// once per capability with that capability taken away (report:
-// test/capbisect/results-arm64.txt, arm64, 2026-08-16).
+// once per capability with that capability taken away. Reports:
+// test/capbisect/results-amd64.txt and results-arm64.txt, both from the
+// CI bisection of 2026-09-16 and both ending "=> AGREE" against this
+// list; results-arm64-2026-08-16.txt is the local run that first
+// established it, kept because it is the only one that also measured
+// DAC_OVERRIDE.
 //
 // Five of the six are required because the image visibly breaks without
 // them — the failure each removal produces is quoted in B.2. The sixth,
