@@ -171,13 +171,28 @@ jobs:
         # Runs even when every branch decided `none`: a branch that just
         # entered its soak has no bump and no tag, but its `pending` record
         # must reach the commit below or the soak restarts on every run.
-        run: python3 scripts/watch.py apply --decisions plan.json >> "${GITHUB_OUTPUT}"
+        run: |
+          set -eu
+          # The tags the remote already carries. A `publish` decision is
+          # replayed every hour until the image exists, so the tag it names
+          # can already be there from a run whose dispatch was lost —
+          # re-creating it would be rejected on push, and `--atomic` would
+          # take `main` down with it on that run and on every run after.
+          # `^{}` lines are the peeled annotated-tag refs, not tag names.
+          : > existing-tags.txt
+          git ls-remote --tags origin \
+            | sed -n 's#.*refs/tags/##p' \
+            | grep -v '\^{}$' >> existing-tags.txt || true
+          python3 scripts/watch.py apply --decisions plan.json \
+            --existing-tags-file existing-tags.txt >> "${GITHUB_OUTPUT}"
 
       - name: Commit, tag and dispatch
         if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAGS: ${{ steps.apply.outputs.tags }}
+          NEW_TAGS: ${{ steps.apply.outputs.new_tags }}
+          EXISTING_TAGS: ${{ steps.apply.outputs.existing_tags }}
           DISPATCH: ${{ steps.apply.outputs.dispatch }}
           CAUSES: ${{ steps.apply.outputs.causes }}
         run: |
@@ -191,30 +206,46 @@ jobs:
           # a commit whose own CI is red.
           git add -- versions.yaml Dockerfile .build-state.json CHANGELOG.md \
             README.md security/cve-exceptions.yaml
+          committed=0
           if git diff --cached --quiet; then
-            echo "nothing changed — no commit, no tag, no dispatch"
-            exit 0
-          fi
-          if [ -z "${TAGS}" ]; then
+            # No file delta is NOT the end of the run: a `publish` decision
+            # edits nothing by design, so a release can still be owed here.
+            echo "no file changes to commit"
+          elif [ -n "${TAGS}" ]; then
+            git commit -m "chore: ${TAGS} (${CAUSES}) [skip ci]"
+            committed=1
+          else
             # The state-only commit: a soak clock, a refreshed source cache
             # or a ledger sync, with no release owed. `[skip ci]` because
             # there is nothing here for CI to gate.
             git commit -m "chore(watch): state update [skip ci]"
-            git push origin HEAD:main
-            echo "state-only update pushed"
-            exit 0
+            committed=1
           fi
-          git commit -m "chore: ${TAGS} (${CAUSES}) [skip ci]"
+          # Only tags the remote does not have. `watch.py apply` did the
+          # split; this loop must never widen it.
           # shellcheck disable=SC2086  # deliberate word splitting: one tag per word
-          for tag in ${TAGS}; do
+          for tag in ${NEW_TAGS}; do
             git tag "${tag}"
           done
-          # --atomic so a rejected main (someone pushed first) cannot leave
-          # the tags behind on the remote: a stranded tag makes every later
-          # run fail with "already exists" until a human deletes it. Only
-          # these tags, never --tags.
-          # shellcheck disable=SC2086  # same
-          git push --atomic origin HEAD:main ${TAGS}
+          if [ "${committed}" -eq 1 ] || [ -n "${NEW_TAGS}" ]; then
+            # --atomic so a rejected main (someone pushed first) cannot
+            # leave the tags behind on the remote: a stranded tag makes
+            # every later run fail with "already exists" until a human
+            # deletes it. Only these tags, never --tags.
+            # shellcheck disable=SC2086  # same
+            git push --atomic origin HEAD:main ${NEW_TAGS}
+          else
+            echo "nothing to push"
+          fi
+          if [ -n "${EXISTING_TAGS}" ]; then
+            echo "::notice::dispatching tags the remote already carries" \
+              "(a previous run created them and lost its dispatch):" \
+              "${EXISTING_TAGS}"
+          fi
+          if [ -z "${DISPATCH}" ]; then
+            echo "no release to dispatch"
+            exit 0
+          fi
           failures=0
           # shellcheck disable=SC2086  # same
           for item in ${DISPATCH}; do
@@ -225,11 +256,12 @@ jobs:
             echo "dispatching release.yml for ${branch} at ${tag} (${cause})"
             dispatched=0
             # A tag pushed with GITHUB_TOKEN does not trigger workflows, so
-            # the release has to be dispatched explicitly. The push already
-            # happened, so a failed dispatch would otherwise be a silent,
-            # permanent missed release — except that it is not permanent
-            # here: the next hourly run sees the tag unpublished and decides
-            # `publish` again. Retried anyway, then reported.
+            # the release has to be dispatched explicitly. Each tag is
+            # dispatched on its own and a failure is recorded rather than
+            # raised: one branch whose dispatch will not take must not stop
+            # the others from being released. The job still fails at the
+            # end, and the next hourly run decides `publish` again for
+            # whatever did not make it.
             for attempt in 1 2 3 4 5; do
               if gh workflow run release.yml --ref "${tag}" \
                    -f tag="${tag}" -f trigger_cause="${cause}"; then

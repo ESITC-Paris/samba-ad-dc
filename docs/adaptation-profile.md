@@ -865,7 +865,11 @@ trusted-forever pin; it is never minted from an unverified download.
 `.build-state.json` is the watcher's memory: per branch the three digests,
 the package-closure hash, the tag last dispatched and any version still
 soaking; at the top level, the conditional-request cache per source. It is
-machine-owned and rewritten whole.
+machine-owned and rewritten whole, and every value in it is a fact about
+the outside world — the cache holds the validators and the parsed version
+list and nothing else, deliberately not a "last checked" timestamp. A
+field that moves because time passed would make this file differ on every
+run, which is a commit and a push to `main` every hour saying nothing.
 
 `versions.yaml` is the pin contract, and the watcher edits it through
 `catalog.py` — the same entry point a human uses — so the file's comments
@@ -883,7 +887,22 @@ and a CVE-ledger sync all change tracked files without owing a release. The
 watcher commits them as `chore(watch): state update [skip ci]` and pushes
 `main` with no tag and no dispatch — without which `first_seen` would be
 lost and the soak would restart on every hourly run. An unchanged tree
-yields no commit, which is what makes the hourly run idempotent (§9bis.3).
+yields no commit, which is what makes the hourly run idempotent (§9bis.3)
+and is asserted by a unit test: two `observe` runs against identical
+answers leave the state file byte-identical.
+
+**A tag that already exists is never re-created.** The `publish` decision
+is replayed every hour until the image is on the registry, so the tag it
+names may already be there from a run whose dispatch was lost. `apply`
+splits the decided tags into the ones the remote carries and the ones it
+does not (`git ls-remote --tags`); only the new ones are created and
+pushed, and all of them are dispatched — "the tag exists" and "the image
+is published" are different facts, and only the second one was checked.
+Without that split the self-heal would work exactly once: the second
+attempt would push a tag name the remote already has, `--atomic` would
+reject `main` along with it, and every later run would fail, for every
+branch. Each tag is also dispatched on its own, so one branch whose
+dispatch will not take cannot hold back another branch's release.
 
 ### What needs a human
 

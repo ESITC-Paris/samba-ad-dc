@@ -15,6 +15,7 @@ Run:  python3 -m unittest scripts/watch_test.py -v
 """
 
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -403,6 +404,73 @@ class Plan(unittest.TestCase):
             ["none", "none", "none"])
 
 
+class ObserveIdempotency(unittest.TestCase):
+    """Two runs against an unchanged world must leave an unchanged file.
+
+    `observe` persists the source cache into .build-state.json and the
+    workflow commits whatever changed there, so any field that moves on its
+    own — a timestamp, most obviously — is a commit and a push to `main`
+    every hour carrying no information. That is the opposite of §9bis.3,
+    and it is invisible in every other test because they all look at the
+    decisions rather than at the bytes.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="watch-observe-")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        shutil.copy(os.path.join(REPO, "versions.yaml"),
+                    os.path.join(self.root, "versions.yaml"))
+        shutil.copy(os.path.join(REPO, ".build-state.json"),
+                    os.path.join(self.root, ".build-state.json"))
+
+    @staticmethod
+    def fetch(url, headers=None, **_):
+        body = RC_LISTING if url.endswith("/rc/") else STABLE_LISTING
+        return watch.Response(200, body, {})
+
+    @staticmethod
+    def command(argv, **_):
+        # Not named `run`: TestCase.run(result) is the test runner's own
+        # entry point, and shadowing it makes every test in the class fail
+        # inside unittest rather than in the code under test.
+        joined = " ".join(argv)
+        if "imagetools" in joined:
+            return DIGEST_GO + "\n" if "golang" in joined else DIGEST_A + "\n"
+        if "pkg-closure-hash.sh" in joined:
+            return HASH_A + "\n"
+        if argv[0] == "gh":
+            return "4.24.7-r1\n"
+        raise AssertionError("unexpected command: " + joined)
+
+    def state_bytes(self):
+        with open(os.path.join(self.root, ".build-state.json"),
+                  encoding="utf-8") as handle:
+            return handle.read()
+
+    def observe(self, now):
+        return watch.observe(self.root, fetch=self.fetch, run=self.command,
+                             sleep=lambda _: None, now=now)
+
+    def test_an_unchanged_world_leaves_the_state_file_byte_identical(self):
+        self.observe(NOW)
+        first = self.state_bytes()
+        # An hour later, same answers from every source.
+        self.observe(NOW + datetime.timedelta(hours=1))
+        self.assertEqual(self.state_bytes(), first)
+
+    def test_the_cache_holds_only_what_the_server_served(self):
+        self.observe(NOW)
+        state = json.loads(self.state_bytes())
+        self.assertEqual(sorted(state["sources"]["stable"]),
+                         ["etag", "last_modified", "versions"])
+
+    def test_a_dry_run_observe_writes_no_state_at_all(self):
+        before = self.state_bytes()
+        watch.observe(self.root, fetch=self.fetch, run=self.command,
+                      sleep=lambda _: None, now=NOW, write_state=False)
+        self.assertEqual(self.state_bytes(), before)
+
+
 class Probes(unittest.TestCase):
     def test_a_digest_probe_retries_and_then_gives_up_loudly(self):
         attempts = []
@@ -654,6 +722,41 @@ class Apply(unittest.TestCase):
         self.assertEqual(outputs["tags"], "")
         self.assertIn("deprecation pending (4.25 rc published)",
                       self.read("README.md"))
+
+    def test_a_tag_the_remote_already_carries_is_not_recreated(self):
+        # The lost-dispatch replay: run N pushed the tag and its dispatch
+        # never landed, so run N+1 decides `publish` for the same tag. It
+        # must be dispatched again and NOT re-created — re-pushing an
+        # existing tag name is rejected, and `--atomic` takes main down
+        # with it, on that run and on every run after it.
+        outputs = watch.apply(self.root, [self.publish_decision()],
+                              run=self.fake_run,
+                              existing_tags=["v4.24.7-r1", "v4.20.0-r1"])
+        self.assertEqual(outputs["tags"], "v4.24.7-r1")
+        self.assertEqual(outputs["new_tags"], "")
+        self.assertEqual(outputs["existing_tags"], "v4.24.7-r1")
+        # Still dispatched: "the tag exists" and "the image is published"
+        # are different facts, and only the second one was checked.
+        self.assertEqual(outputs["dispatch"],
+                         "4.24:v4.24.7-r1:first-publication")
+
+    def test_an_unknown_remote_tag_list_makes_every_tag_new(self):
+        outputs = watch.apply(self.root, [self.publish_decision()],
+                              run=self.fake_run, existing_tags=[])
+        self.assertEqual(outputs["new_tags"], "v4.24.7-r1")
+        self.assertEqual(outputs["existing_tags"], "")
+
+    def test_one_stuck_tag_does_not_hold_back_another_branch(self):
+        outputs = watch.apply(
+            self.root,
+            [self.publish_decision("4.23", "4.23.12-r1"),
+             self.publish_decision("4.24", "4.24.7-r1")],
+            run=self.fake_run, existing_tags=["v4.23.12-r1"])
+        self.assertEqual(outputs["new_tags"], "v4.24.7-r1")
+        self.assertEqual(outputs["existing_tags"], "v4.23.12-r1")
+        self.assertEqual(outputs["dispatch"],
+                         "4.23:v4.23.12-r1:first-publication "
+                         "4.24:v4.24.7-r1:first-publication")
 
     def test_two_branches_release_together(self):
         decisions = [self.publish_decision("4.23", "4.23.12-r1"),

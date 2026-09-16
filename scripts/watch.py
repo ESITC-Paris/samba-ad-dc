@@ -440,7 +440,7 @@ def fetch_url(url, headers=None, timeout=30):
 
 
 def fetch_listing(url, cache, parser, fetch=fetch_url, sleep=time.sleep,
-                  attempts=3, now=None):
+                  attempts=3):
     """Read one directory listing, conditionally, and update its cache.
 
     Returns (versions, cache). §9bis.2 wants conditional requests; measured
@@ -450,6 +450,13 @@ def fetch_listing(url, cache, parser, fetch=fetch_url, sleep=time.sleep,
     whenever one is offered — the polite behaviour costs nothing and starts
     working by itself the day the server grows it — while the cached
     version list is only ever used on an actual 304.
+
+    The cache holds ONLY what the server served: the validators and the
+    parsed version list. Nothing that changes just because time passed —
+    no "checked_at" — because this dict is written to `.build-state.json`,
+    and a state file that differs on every run is a commit and a push to
+    `main` every hour carrying no information. Idempotency (§9bis.3) is
+    the property that an unchanged world produces an unchanged file.
     """
     cache = dict(cache or {})
     headers = {}
@@ -469,7 +476,6 @@ def fetch_listing(url, cache, parser, fetch=fetch_url, sleep=time.sleep,
                 sleep(5 * attempt)
             continue
 
-        stamp = (now or datetime.datetime.now(UTC)).isoformat()
         if response.status == 304:
             versions = list(cache.get("versions") or [])
             if not versions:
@@ -481,7 +487,8 @@ def fetch_listing(url, cache, parser, fetch=fetch_url, sleep=time.sleep,
                 if attempt < attempts:
                     sleep(5 * attempt)
                 continue
-            cache["checked_at"] = stamp
+            # Returned unchanged: a 304 says the listing is what the
+            # cache already describes, so there is nothing to write.
             return versions, cache
 
         versions = parser(response.body)
@@ -494,8 +501,7 @@ def fetch_listing(url, cache, parser, fetch=fetch_url, sleep=time.sleep,
 
         cache = {"etag": response.header("ETag"),
                  "last_modified": response.header("Last-Modified"),
-                 "versions": versions,
-                 "checked_at": stamp}
+                 "versions": versions}
         return versions, cache
 
     raise Refusal("could not read %s after %d attempts: %s"
@@ -589,10 +595,9 @@ def observe(root, image=DEFAULT_IMAGE, org=DEFAULT_ORG, fetch=fetch_url,
 
     stable_versions, sources["stable"] = fetch_listing(
         STABLE_URL, sources.get("stable"), parse_stable_listing,
-        fetch=fetch, sleep=sleep, now=now)
+        fetch=fetch, sleep=sleep)
     rc_versions, sources["rc"] = fetch_listing(
-        RC_URL, sources.get("rc"), parse_rc_listing, fetch=fetch, sleep=sleep,
-        now=now)
+        RC_URL, sources.get("rc"), parse_rc_listing, fetch=fetch, sleep=sleep)
 
     # Three branches share one base image today, so the probes are memoised
     # per reference: one registry read and one apt dry-run instead of three
@@ -732,7 +737,8 @@ def verify_tarball(root, version, run=run_command):
     raise Refusal("verification of %s printed no sha256= line" % version)
 
 
-def apply(root, decisions, dry_run=False, run=run_command):
+def apply(root, decisions, dry_run=False, run=run_command,
+          existing_tags=None):
     """Carry the decisions out. Returns the workflow outputs.
 
     Every branch is edited first and the README matrix is rendered last,
@@ -744,6 +750,15 @@ def apply(root, decisions, dry_run=False, run=run_command):
     commit step never runs (a failed step fails the job), and the next
     hourly run starts from a fresh checkout and reaches the same decisions.
     Idempotency is what replaces a rollback here (§9bis.3).
+
+    `existing_tags` is the tag list the remote already carries. It splits
+    the decided tags into `new_tags` (create and push) and `existing_tags`
+    (leave alone, dispatch against). Without that split the `publish`
+    self-heal works exactly once and then wedges the watcher: run N pushes
+    v4.24.7-r1 and loses its dispatch, run N+1 decides `publish` again for
+    the same unpublished tag, re-creating a tag name the remote already
+    has — which `git push --atomic` rejects, taking `main` down with it,
+    on that run and on every run after it, for every branch.
     """
     catalogue = catalog.load_catalog(root)
     known = set(catalog.sorted_branches(catalogue))
@@ -851,7 +866,17 @@ def apply(root, decisions, dry_run=False, run=run_command):
             matrix += ["--rc-series", rc["series"]]
         catalog_call(root, matrix)
 
+    # A tag already on the remote is never re-created and never re-pushed;
+    # it is still dispatched, because "the tag exists" and "the image is
+    # published" are different facts and only the second one was checked.
+    remote = set(existing_tags or [])
+    already = [tag for tag in tags if tag in remote]
+    for tag in already:
+        note("%s already exists on the remote: not re-created, dispatched "
+             "as it stands" % tag)
     return {"tags": " ".join(tags),
+            "new_tags": " ".join(tag for tag in tags if tag not in remote),
+            "existing_tags": " ".join(already),
             "dispatch": " ".join(dispatch),
             "causes": " ".join(causes)}
 
@@ -926,6 +951,10 @@ def build_parser():
     apply_cmd.add_argument("--decisions", required=True)
     apply_cmd.add_argument("--dry-run", action="store_true",
                            help="print what would be done, change nothing")
+    apply_cmd.add_argument("--existing-tags-file",
+                           help="tags the remote already carries, one per "
+                                "line (git ls-remote --tags); they are "
+                                "reported separately and never re-created")
 
     published_cmd = sub.add_parser(
         "published", help="branches whose catalog tag is on the registry")
@@ -964,9 +993,15 @@ def main(argv=None):
             return 0
 
         if args.command == "apply":
+            existing = []
+            if args.existing_tags_file:
+                with open(args.existing_tags_file, encoding="utf-8") as handle:
+                    existing = [line.strip() for line in handle
+                                if line.strip()]
             outputs = apply(root, load_json(args.decisions),
-                            dry_run=args.dry_run)
-            for key in ("tags", "dispatch", "causes"):
+                            dry_run=args.dry_run, existing_tags=existing)
+            for key in ("tags", "new_tags", "existing_tags", "dispatch",
+                        "causes"):
                 print("%s=%s" % (key, outputs[key]))
             return 0
 
