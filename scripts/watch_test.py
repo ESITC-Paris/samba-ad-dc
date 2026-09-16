@@ -135,7 +135,10 @@ def observation(**overrides):
 
 def decide(obs=None, st=None, ent=None, now=NOW, soak_hours=24,
            security=False):
-    return watch.decide("4.24", ent or entry(), st or state(),
+    # `st` is compared against None, not truth-tested: `{}` is a state the
+    # table has a dedicated rule for (a branch nobody has observed yet).
+    return watch.decide("4.24", ent or entry(),
+                        state() if st is None else st,
                         obs or observation(), now, soak_hours, security)
 
 
@@ -313,6 +316,38 @@ class DecisionTable(unittest.TestCase):
         self.assertEqual(decision["state"]["runtime_digest"], DIGEST_B)
         self.assertEqual(decision["state"]["pkg_index_hash"], HASH_B)
         self.assertTrue(decision["clear_pending"])
+
+
+    def test_a_branch_with_no_state_entry_is_not_a_change(self):
+        # A freshly added series has no state entry, so every digest and
+        # the closure hash would compare unequal to nothing and read as a
+        # base-digest bump — a revision for a branch that never published
+        # an r1. The observation is recorded, no change is claimed, and the
+        # run reaches the self-heal that owes the branch its first tag.
+        decision = decide(observation(published_tags=[]), st={})
+        self.assertEqual(decision["action"], "publish")
+        self.assertEqual(decision["cause"], "first-publication")
+        self.assertEqual(decision["tag"], "4.24.7-r1")
+        self.assertEqual(decision["state"]["runtime_digest"], DIGEST_A)
+        self.assertEqual(decision["state"]["pkg_index_hash"], HASH_A)
+        self.assertIn("no prior observation", " ".join(decision["notes"]))
+
+    def test_a_first_observation_of_a_published_branch_stays_quiet(self):
+        # The seeding case: the operator added the branch and the tag is
+        # already on the registry. Recording what was seen must not, by
+        # itself, produce a rebuild.
+        decision = decide(observation(), st={})
+        self.assertEqual(decision["action"], "none")
+        self.assertEqual(decision["state"]["pkg_index_hash"], HASH_A)
+
+    def test_a_first_observation_still_takes_an_upstream_release(self):
+        # No prior observation is not an excuse to sit on a new upstream
+        # patch: step 1/2 runs before it, soak included.
+        decision = decide(observation(latest_patch="4.24.8"), st={},
+                          soak_hours=0)
+        self.assertEqual(decision["action"], "version")
+        self.assertEqual(decision["cause"], "samba-release")
+        self.assertEqual(decision["tag"], "4.24.8-r1")
 
 
 class SeriesDetection(unittest.TestCase):
@@ -739,6 +774,48 @@ class Apply(unittest.TestCase):
         # are different facts, and only the second one was checked.
         self.assertEqual(outputs["dispatch"],
                          "4.24:v4.24.7-r1:first-publication")
+
+    def test_a_version_bump_onto_an_existing_tag_is_refused(self):
+        # The catalog is behind the remote (a hand-made tag, a reverted
+        # bump, a restored backup). Only `publish` may name a tag that
+        # already exists; a bump claims to produce a NEW release, and the
+        # published contents of that tag are immutable (SPEC §3.2).
+        before = self.snapshot()
+        decision = {
+            "branch": "4.24", "action": "version", "cause": "samba-release",
+            "tag": "4.24.7-r1", "version": "4.24.8", "state": {},
+            "pending": None, "clear_pending": True, "notes": [],
+        }
+        with self.assertRaises(watch.Refusal) as caught:
+            watch.apply(self.root, [decision], run=self.fake_run,
+                        existing_tags=["v4.24.8-r1"])
+        message = str(caught.exception)
+        self.assertIn("v4.24.8-r1", message)
+        self.assertIn("push origin :refs/tags/v4.24.8-r1", message)
+        self.assertIn("bump-revision 4.24", message)
+        # Refused before anything was written, so a re-run after the
+        # operator clears the tag starts from the same state.
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_revision_bump_onto_an_existing_tag_is_refused(self):
+        decision = {
+            "branch": "4.23", "action": "revision", "cause": "pkg-update",
+            "tag": "4.23.12-r1", "version": "4.23.12",
+            "state": {"pkg_index_hash": HASH_B}, "pending": None,
+            "clear_pending": False, "notes": [],
+        }
+        with self.assertRaises(watch.Refusal) as caught:
+            watch.apply(self.root, [decision], run=self.fake_run,
+                        existing_tags=["v4.23.12-r2"])
+        self.assertIn("v4.23.12-r2", str(caught.exception))
+
+    def test_a_publish_of_an_existing_tag_is_still_allowed(self):
+        # The counterpart of the two refusals above: `publish` exists
+        # precisely to re-dispatch a tag the remote already carries.
+        outputs = watch.apply(self.root, [self.publish_decision()],
+                              run=self.fake_run,
+                              existing_tags=["v4.24.7-r1"])
+        self.assertEqual(outputs["existing_tags"], "v4.24.7-r1")
 
     def test_an_unknown_remote_tag_list_makes_every_tag_new(self):
         outputs = watch.apply(self.root, [self.publish_decision()],

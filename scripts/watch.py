@@ -87,6 +87,12 @@ BASE_DIGEST_KEYS = (("runtime", "runtime_digest"),
                     ("builder", "builder_digest"),
                     ("gobuild", "gobuild_digest"))
 
+# Everything an observation remembers about a branch. A state entry that
+# holds none of them has never been observed, which `decide()` treats as
+# "nothing to compare against" rather than as an all-round change.
+OBSERVED_KEYS = tuple(name for _, name in BASE_DIGEST_KEYS) \
+    + ("pkg_index_hash",)
+
 # ARG defaults the Dockerfile mirrors from the catalog's DEFAULT branch.
 # `scripts/check-pins-consistency.sh` asserts every one of these pairs, so
 # a catalog edit that leaves the Dockerfile behind turns CI red on the very
@@ -284,6 +290,20 @@ def decide(branch, entry, state, obs, now, soak_hours, security=False):
                      % (pending.get("version"), latest, current_version))
         decision["clear_pending"] = True
 
+    # 2bis — a branch nobody has observed yet (§9bis.1.c has nothing to
+    # compare against). A freshly added series has no state entry, so every
+    # digest and the closure hash below would read as "moved" and bump a
+    # revision for a branch that never published an r1. The observation is
+    # recorded and the run falls through to the self-heal, whose first
+    # publication IS the build that these values describe.
+    if not any(state.get(name) for name in OBSERVED_KEYS):
+        notes.append("no prior observation for %s: recording the observed "
+                     "digests and closure hash without calling them a change"
+                     % branch)
+        decision["state"] = {key: value for key, value in observed.items()
+                             if value}
+        return self_heal(decision, obs, current_tag, notes)
+
     # 3 — a moved base-image digest (§9bis.1.c). An empty observed digest is
     # NOT a change: it is the absence of an answer, and writing it into the
     # state would make every later run bump again.
@@ -307,10 +327,20 @@ def decide(branch, entry, state, obs, now, soak_hours, security=False):
                              if value}
         return decision
 
-    # 5 — the self-heal. Everything agrees, but the tag the catalog names is
-    # not on the registry: either nothing was ever published for this branch,
-    # or a dispatch was lost. Nothing is edited; the tag is created if it is
-    # missing and the release is dispatched against it.
+    # 5 — the self-heal.
+    return self_heal(decision, obs, current_tag, notes)
+
+
+def self_heal(decision, obs, current_tag, notes):
+    """Step 5 of the table: publish the catalog's tag if it is not there.
+
+    Everything agrees, but the tag the catalog names is not on the
+    registry: either nothing was ever published for this branch, or a
+    dispatch was lost. Nothing is edited; the tag is created if it is
+    missing and the release is dispatched against it. Reached from the end
+    of the table and from the no-prior-observation case, which has no
+    change to report and still owes the branch its first publication.
+    """
     published = obs.get("published_tags") or []
     if current_tag not in published:
         notes.append("%s is not published" % current_tag)
@@ -737,6 +767,28 @@ def verify_tarball(root, version, run=run_command):
     raise Refusal("verification of %s printed no sha256= line" % version)
 
 
+def refuse_tag_reuse(branch, action, tag, remote):
+    """Refuse a bump whose tag the remote already carries.
+
+    `publish` is the one action allowed to name an existing tag — that is
+    its whole job, re-dispatching a tag whose image never appeared. A
+    `version` or `revision` bump is different: it claims to be producing a
+    NEW release, so an existing tag means the catalog is behind the remote
+    (a hand-made tag, a reverted bump, a restored backup). Pushing it would
+    be rejected anyway; building under it would be worse, because the tag's
+    published contents are immutable and the build would never match them.
+    """
+    if "v" + tag not in remote:
+        return
+    raise Refusal(
+        "%s: the %s bump lands on v%s, which the remote already has. A "
+        "released tag is immutable (SPEC §3.2), so either delete the stale "
+        "tag (git push origin :refs/tags/v%s) if nothing was published "
+        "under it, or bump the revision past it "
+        "(python3 scripts/catalog.py bump-revision %s)."
+        % (branch, action, tag, tag, branch))
+
+
 def apply(root, decisions, dry_run=False, run=run_command,
           existing_tags=None):
     """Carry the decisions out. Returns the workflow outputs.
@@ -759,10 +811,17 @@ def apply(root, decisions, dry_run=False, run=run_command,
     the same unpublished tag, re-creating a tag name the remote already
     has — which `git push --atomic` rejects, taking `main` down with it,
     on that run and on every run after it, for every branch.
+
+    Only `publish` may name a tag the remote already has. A `version` or
+    `revision` bump that lands on an existing tag means the catalog and the
+    remote disagree about what was already released, so it refuses rather
+    than silently dispatching a build under a tag whose contents are
+    already fixed (SPEC §3.2: a published tag is never re-pushed).
     """
     catalogue = catalog.load_catalog(root)
     known = set(catalog.sorted_branches(catalogue))
     default_branch = catalogue["default_branch"]
+    remote = set(existing_tags or [])
 
     for decision in decisions:
         branch = decision.get("branch")
@@ -788,6 +847,7 @@ def apply(root, decisions, dry_run=False, run=run_command,
         if action == "version":
             version = decision["version"]
             tag = "%s-r1" % version
+            refuse_tag_reuse(branch, action, tag, remote)
             note("%s: upstream %s -> %s" % (branch, entry["samba_version"],
                                             version))
             if not dry_run:
@@ -796,6 +856,7 @@ def apply(root, decisions, dry_run=False, run=run_command,
         elif action == "revision":
             tag = "%s-r%d" % (entry["samba_version"],
                               int(entry["revision"]) + 1)
+            refuse_tag_reuse(branch, action, tag, remote)
             note("%s: rebuild owed (%s) -> %s" % (branch, decision["cause"],
                                                   tag))
             if not dry_run:
@@ -869,7 +930,6 @@ def apply(root, decisions, dry_run=False, run=run_command,
     # A tag already on the remote is never re-created and never re-pushed;
     # it is still dispatched, because "the tag exists" and "the image is
     # published" are different facts and only the second one was checked.
-    remote = set(existing_tags or [])
     already = [tag for tag in tags if tag in remote]
     for tag in already:
         note("%s already exists on the remote: not re-created, dispatched "

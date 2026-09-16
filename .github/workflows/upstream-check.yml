@@ -179,10 +179,18 @@ jobs:
           # re-creating it would be rejected on push, and `--atomic` would
           # take `main` down with it on that run and on every run after.
           # `^{}` lines are the peeled annotated-tag refs, not tag names.
-          : > existing-tags.txt
-          git ls-remote --tags origin \
-            | sed -n 's#.*refs/tags/##p' \
-            | grep -v '\^{}$' >> existing-tags.txt || true
+          #
+          # ls-remote runs on its own line, not inside the filter pipeline:
+          # a network or auth failure there must not be read as "the remote
+          # has no tags", which would make every decided tag look new and
+          # put the atomic push back on the rake it was built to avoid.
+          if ! git ls-remote --tags origin > ls-remote.txt; then
+            echo "::error::git ls-remote --tags origin failed; refusing to" \
+              "treat that as an empty tag list"
+            exit 1
+          fi
+          sed -n 's#.*refs/tags/##p' ls-remote.txt \
+            | grep -v '\^{}$' > existing-tags.txt || true
           python3 scripts/watch.py apply --decisions plan.json \
             --existing-tags-file existing-tags.txt >> "${GITHUB_OUTPUT}"
 

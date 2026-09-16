@@ -904,6 +904,13 @@ reject `main` along with it, and every later run would fail, for every
 branch. Each tag is also dispatched on its own, so one branch whose
 dispatch will not take cannot hold back another branch's release.
 
+That tolerance is `publish`-only. A `version` or `revision` bump that
+lands on a tag the remote already carries is refused by name: a bump
+claims to be producing a new release, so an existing tag means the catalog
+is behind the remote, and a published tag's contents are immutable (§3.2).
+The refusal states the two ways out — delete the stale tag if nothing was
+published under it, or bump the revision past it.
+
 ### What needs a human
 
 - **A new upstream series.** When the highest series in the stable listing
