@@ -1295,9 +1295,10 @@ func TestChronyConfigFollowsTheDCsSigndSocketDirectory(t *testing.T) {
 	}
 
 	// The value came from samba's own parser, over the documented flags.
-	// `-l` is pinned here because dropping it costs a restored DC its
-	// answer: the global logic checks fail on directories samba has not
-	// populated yet and testparm then exits non-zero (see testparmArgs).
+	// `-l` is pinned in this expectation because it is a deliberate choice
+	// rather than a default — a defensive one, for the reason testparmArgs
+	// gives — and a silent drop would leave the answer at the mercy of
+	// checks that have nothing to do with reading one parameter.
 	if got := r.argsOf(t, "output", "testparm"); !equalStrings(got,
 		[]string{"-s", "-l", "--parameter-name=ntp signd socket directory", e.SMBConfPath}) {
 		t.Errorf("testparm args = %v", got)

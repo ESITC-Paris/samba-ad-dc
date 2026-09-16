@@ -869,15 +869,17 @@ func chronyArgs(conf string) []string {
 //
 //   - `-s` suppresses the "Press enter" prompt, which is what makes a bare
 //     testparm hang in a container.
-//   - `-l` skips the GLOBAL LOGIC CHECKS, and it is not optional here.
-//     Those checks verify that the directories smb.conf names already
-//     exist, and this command runs before the daemons do: on a DC restored
-//     from an offline backup, `state directory` and `cache directory` point
-//     into a tree samba has not populated yet, so testparm prints the
-//     requested value on stdout and then exits 1 ("ERROR: cache directory
-//     /var/lib/samba/cache does not exist" — observed). Reading one
-//     parameter is not validating a configuration; the checks are somebody
-//     else's job and their failure must not cost this one its answer.
+//   - `-l` skips the GLOBAL LOGIC CHECKS. This is DEFENSIVE, not a fix for
+//     a failure anybody here has seen: no boot has been observed where
+//     those checks cost this command its answer. The reason to pass it
+//     anyway is that the checks verify that the directories smb.conf names
+//     already exist, and this command runs before the daemons do — so a
+//     directory samba creates at startup is a plausible way for testparm to
+//     print the requested value on stdout and still exit non-zero, which
+//     Output reports as an error and ntpSigndDir then treats as no answer.
+//     Reading one parameter is not validating a configuration: those checks
+//     are somebody else's job, and whether they pass must not decide
+//     whether this one gets its value.
 //   - the configuration file is named explicitly rather than left to the
 //     compiled-in default, so the entrypoint and samba can never read two
 //     different files.
