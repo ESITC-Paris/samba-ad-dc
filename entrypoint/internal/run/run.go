@@ -204,6 +204,22 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.P
 		}
 	}
 
+	// The declared [global] settings are checked BEFORE a provision or a
+	// join, because both of those create something: a provision claims the
+	// state volume, a join creates a domain controller account on a remote
+	// DC. See checkDeclaredOptions for what samba-tool does with an option
+	// it cannot parse, and why that cannot be recognised after the fact.
+	if plan.Kind == modes.ActProvision || plan.Kind == modes.ActJoin {
+		if ref := e.checkDeclaredOptions(ctx, cfg); ref != nil {
+			return ref
+		}
+	}
+
+	// Set on the paths where samba-tool itself has just written smb.conf, so
+	// the reconcile below runs its gate over that file even when it has
+	// nothing of its own to change (see ensureGlobalOptions).
+	generatedBy := ""
+
 	switch plan.Kind {
 	case modes.ActProvision:
 		if ref := e.provision(ctx, cfg); ref != nil {
@@ -212,6 +228,7 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.P
 		if ref := e.writeMarker(stateDir, imageVersion, string(config.ModeProvision)); ref != nil {
 			return ref
 		}
+		generatedBy = "samba-tool domain provision"
 
 	case modes.ActJoin:
 		if ref := e.join(ctx, cfg); ref != nil {
@@ -223,6 +240,7 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.P
 		if ref := e.writeMarker(stateDir, imageVersion, string(config.ModeJoin)); ref != nil {
 			return ref
 		}
+		generatedBy = "samba-tool domain join"
 
 	case modes.ActStart:
 		// A restart touches nothing: the volume and its marker already
@@ -270,8 +288,10 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.P
 	// Provision has already passed them to samba-tool with --option, so on
 	// that path the reconcile normally finds them in place and does
 	// nothing. It runs there anyway: nothing should depend on samba-tool
-	// having written every one of them into the file it generated.
-	if ref := e.ensureGlobalOptions(ctx, cfg); ref != nil {
+	// having written every one of them into the file it generated — and on
+	// that path it also runs the testparm gate over the file samba-tool
+	// wrote, which is what generatedBy says.
+	if ref := e.ensureGlobalOptions(ctx, cfg, generatedBy); ref != nil {
 		return ref
 	}
 
@@ -504,7 +524,7 @@ func (e *Executor) ensureJoinedConf(cfg *config.Config) *config.Refusal {
 // operator reaching for it is diagnosing a DC that will not run, and a mode
 // that edited the configuration on the way past would change the very thing
 // they are looking at.
-func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) *config.Refusal {
+func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config, generatedBy string) *config.Refusal {
 	options := cfg.EffectiveGlobalOptions()
 
 	// The three `tls *` keys are the IMAGE's, not the operator's, and that
@@ -577,8 +597,17 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 	// Nothing to do is the steady state, and it says nothing: an operator
 	// who changed nothing must see no configuration noise at all, and the
 	// file samba reads must not be rewritten on every single boot.
+	//
+	// A start that has just PROVISIONED or JOINED is the exception: this
+	// reconcile changing nothing there means samba-tool already wrote every
+	// declared setting into the file it generated, which is precisely the
+	// case that used to reach the daemons with no verdict from samba's own
+	// parser at all. The gate runs over that file, with no rewrite to undo.
 	if len(announcements) == 0 {
-		return nil
+		if generatedBy == "" {
+			return nil
+		}
+		return e.checkSMBConf(ctx, nil, generatedBy)
 	}
 
 	if err := writeFileAtomic(e.SMBConfPath, []byte(conf), 0o644); err != nil {
@@ -602,6 +631,12 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 // checkSMBConf asks testparm whether the file that was just rewritten is a
 // configuration samba can load, and puts the previous one back when it is
 // not.
+//
+// original is the bytes to restore, and nil means THIS START WROTE NOTHING —
+// the provision and join paths, where the file being judged is the one
+// samba-tool generated moments ago and there is no earlier version to go back
+// to. The refusal then says so instead of promising a rollback that did not
+// happen.
 //
 // The restore is the point. smb.conf lives on a volume, so a rewrite that
 // samba cannot parse would outlive the container that made it and break every
@@ -638,14 +673,8 @@ func (e *Executor) checkSMBConf(ctx context.Context, original []byte, sources st
 	out, err := e.Runner.Output(ctx, e.Bin.Testparm, testparmCheckArgs(e.SMBConfPath)...)
 	diagnostics := testparmDiagnostics(out)
 
-	problem := ""
-	for _, d := range diagnostics {
-		if testparmRejects(d) {
-			problem = d
-			break
-		}
-	}
-	if err == nil && problem == "" {
+	problem := testparmVerdict(diagnostics, err)
+	if problem == "" {
 		// Accepted. Whatever testparm still had to say — a deprecation
 		// warning, most often — is the operator's business and reaches
 		// their log, but it is not a reason to refuse their DC.
@@ -654,8 +683,11 @@ func (e *Executor) checkSMBConf(ctx context.Context, original []byte, sources st
 		}
 		return nil
 	}
-	if problem == "" {
-		problem = testparmCause(diagnostics, err)
+
+	if original == nil {
+		return config.Refuse(config.CodeConfigError,
+			"testparm rejects the [global] section %s wrote into %q (%s); this start changed nothing in that file, so there is nothing to put back: fix or remove the offending entry in %s (or in %s on the configuration volume) and start the container again",
+			sources, e.SMBConfPath, problem, config.EnvGlobalOptions, e.SMBConfPath)
 	}
 
 	if rerr := writeFileAtomic(e.SMBConfPath, original, 0o644); rerr != nil {
@@ -666,6 +698,104 @@ func (e *Executor) checkSMBConf(ctx context.Context, original []byte, sources st
 	return config.Refuse(config.CodeConfigError,
 		"testparm rejects the [global] section this start wrote from %s (%s); %s has been put back to what it held before this start, so fix or remove the offending entry in %s and start the container again",
 		sources, problem, e.SMBConfPath, sources)
+}
+
+// checkDeclaredOptions runs the declared [global] settings through samba's
+// own parser BEFORE a provision or a join creates anything.
+//
+// It exists because of what samba-tool does with an option it cannot parse.
+// Measured in this image (samba 4.24.7):
+//
+//	samba-tool domain provision ... --option="nosuchparam = 1"
+//	  Unknown parameter encountered: "nosuchparam "
+//	  samba-tool domain provision: error: invalid --option option value 'nosuchparam = 1': Unable to set parameter
+//	  exit 2, and /etc/samba still empty afterwards
+//
+//	samba-tool domain provision ... --option="max log size = notanumber"
+//	  set_variable_helper(notanumber): value is not a valid size specifier!
+//	  exit 2, same
+//
+// samba-tool does refuse, then — but every one of those lines goes to
+// STDERR, which Runner.Run streams straight to the container log and does not
+// return. What the entrypoint gets back is `exit status 2`, which is what a
+// provision that failed on DNS, on the disk or on the password looks like
+// too, and the message it produced was the runtime one: inspect the logs, and
+// if the volume now holds partial state, delete and recreate it. That is both
+// the wrong remedy for a typo in a variable and a frightening one.
+//
+// Checking first turns it into one exit-10 line naming the variable, before
+// anything exists. The scratch file holds `[global]` and the declared
+// settings and nothing else, which is a faithful test of exactly what
+// samba-tool's --option parser does with them: `-l` skips the global logic
+// checks, so the verdict is about PARSING, and parsing one parameter does not
+// depend on the rest of the configuration. Measured on such a scratch file in
+// this image: an unknown parameter prints `Unknown parameter encountered` /
+// `Ignoring unknown parameter` and exits 0, and `max log size = notanumber`
+// exits 1 with `set_variable_helper(notanumber): value is not a valid size
+// specifier!` — the same two shapes checkSMBConf already judges.
+//
+// It is NOT a second gate on restarts: there the reconcile writes the real
+// file and checkSMBConf judges that, with a restore. Here nothing has been
+// written yet, so there is nothing to restore and nothing to undo.
+func (e *Executor) checkDeclaredOptions(ctx context.Context, cfg *config.Config) *config.Refusal {
+	options := cfg.EffectiveGlobalOptions()
+	if len(options) == 0 {
+		return nil
+	}
+
+	var conf strings.Builder
+	conf.WriteString("[global]\n")
+	var sources []string
+	for _, o := range options {
+		conf.WriteString("\t" + o.Key + " = " + o.Value + "\n")
+		if s := config.OptionSource(o.Key); !slices.Contains(sources, s) {
+			sources = append(sources, s)
+		}
+	}
+	declared := strings.Join(sources, " and ")
+
+	// Its own temporary directory, removed on every path out of here. It is
+	// deliberately NOT written next to the real smb.conf: /etc/samba is the
+	// directory samba reads, and a scratch file left behind there by a crash
+	// is a file somebody will one day mistake for configuration.
+	dir, err := os.MkdirTemp("", "smbconf-check")
+	if err != nil {
+		return config.Refuse(config.CodeRuntimeFailure,
+			"the [global] settings %s declares cannot be checked because no temporary file can be created (%s); mount a writable /tmp (the runtime contract asks for a tmpfs there)",
+			declared, oneLine(err.Error()))
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	scratch := filepath.Join(dir, "smb.conf")
+	if err := os.WriteFile(scratch, []byte(conf.String()), 0o600); err != nil {
+		return config.Refuse(config.CodeRuntimeFailure,
+			"the [global] settings %s declares cannot be checked because %q cannot be written (%s); mount a writable /tmp (the runtime contract asks for a tmpfs there)",
+			declared, scratch, oneLine(err.Error()))
+	}
+
+	out, rerr := e.Runner.Output(ctx, e.Bin.Testparm, testparmCheckArgs(scratch)...)
+	problem := testparmVerdict(testparmDiagnostics(out), rerr)
+	if problem == "" {
+		return nil
+	}
+	return config.Refuse(config.CodeConfigError,
+		"testparm rejects the [global] settings %s declares (%s); fix or remove the offending entry in %s and start the container again — nothing has been created yet",
+		declared, problem, declared)
+}
+
+// testparmVerdict turns one testparm run into a verdict: the diagnostic line
+// to quote, or "" when samba accepts the file. Both gates ask the same
+// question, so they must not answer it in two places (see checkSMBConf for
+// what each shape was measured to do).
+func testparmVerdict(diagnostics []string, err error) string {
+	for _, d := range diagnostics {
+		if testparmRejects(d) {
+			return d
+		}
+	}
+	if err == nil {
+		return ""
+	}
+	return testparmCause(diagnostics, err)
 }
 
 // testparmDiagnostics returns everything testparm printed BEFORE the dump of

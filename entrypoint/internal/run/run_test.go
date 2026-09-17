@@ -422,6 +422,10 @@ func TestExecuteProvisionInitializesThenStartsDaemons(t *testing.T) {
 		t.Fatalf("Execute: unexpected refusal %d: %s", ref.Code, ref.Msg)
 	}
 
+	// No smb.conf exists in this test's filesystem, so the post-provision
+	// gate has nothing to read and returns without calling testparm (see
+	// ensureGlobalOptions); the one testparm call here is chrony's
+	// signing-socket read.
 	want := []string{"run:samba-tool", "output:testparm", "start:chronyd", "start:samba"}
 	if got := r.names(); !equalStrings(got, want) {
 		t.Fatalf("call order = %v, want %v", got, want)
@@ -579,7 +583,9 @@ func TestExecuteJoinInitializesThenStartsDaemons(t *testing.T) {
 		t.Fatalf("Execute: unexpected refusal %d: %s", ref.Code, ref.Msg)
 	}
 
-	want := []string{"run:samba-tool", "output:testparm", "start:chronyd", "start:samba"}
+	// Two testparm calls: the gate over the smb.conf the join generated
+	// (see ensureGlobalOptions), then chrony's signing-socket read.
+	want := []string{"run:samba-tool", "output:testparm", "output:testparm", "start:chronyd", "start:samba"}
 	if got := r.names(); !equalStrings(got, want) {
 		t.Fatalf("call order = %v, want %v", got, want)
 	}
@@ -2115,7 +2121,7 @@ func TestEnsureGlobalOptionsAddsThemAndValidatesTheResult(t *testing.T) {
 	e, logBuf := newTestExecutor(t, r)
 	writeSMBConf(t, e.SMBConfPath)
 
-	if ref := e.ensureGlobalOptions(context.Background(), globalOptionsConfig(config.ModeRun)); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), globalOptionsConfig(config.ModeRun), ""); ref != nil {
 		t.Fatalf("unexpected refusal %d: %s", ref.Code, ref.Msg)
 	}
 
@@ -2150,14 +2156,14 @@ func TestEnsureGlobalOptionsIsIdempotent(t *testing.T) {
 	writeSMBConf(t, e.SMBConfPath)
 	cfg := globalOptionsConfig(config.ModeRun)
 
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("first call: unexpected refusal: %s", ref.Msg)
 	}
 	first := readFile(t, e.SMBConfPath)
 	calls := r.countCalls("output", "testparm")
 
 	logBuf.reset()
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("second call: unexpected refusal: %s", ref.Msg)
 	}
 
@@ -2182,7 +2188,7 @@ func TestEnsureGlobalOptionsReplacesAChangedValue(t *testing.T) {
 	}
 
 	cfg := globalOptionsConfig(config.ModeRun, config.GlobalOption{Key: "smb encrypt", Value: "required"})
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 
@@ -2213,7 +2219,7 @@ func TestEnsureGlobalOptionsReplacesALineSpelledWithoutSpaces(t *testing.T) {
 	}
 
 	cfg := globalOptionsConfig(config.ModeRun, config.GlobalOption{Key: "maxlogsize", Value: "4000"})
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 
@@ -2268,7 +2274,7 @@ func TestEnsureGlobalOptionsRestoresTheFileWhenTestparmRefusesIt(t *testing.T) {
 			e, logBuf := newTestExecutor(t, r)
 			original := writeSMBConf(t, e.SMBConfPath)
 
-			ref := e.ensureGlobalOptions(context.Background(), globalOptionsConfig(config.ModeRun))
+			ref := e.ensureGlobalOptions(context.Background(), globalOptionsConfig(config.ModeRun), "")
 			if ref == nil {
 				t.Fatal("expected a refusal when testparm rejects the result")
 			}
@@ -2312,7 +2318,7 @@ func TestEnsureGlobalOptionsDoesNotRefuseADeprecationWarning(t *testing.T) {
 	writeSMBConf(t, e.SMBConfPath)
 
 	cfg := globalOptionsConfig(config.ModeRun, config.GlobalOption{Key: "syslog only", Value: "no"})
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("a deprecation warning refused the boot: %d: %s", ref.Code, ref.Msg)
 	}
 	if !strings.Contains(readFile(t, e.SMBConfPath), "syslog only = no") {
@@ -2333,7 +2339,7 @@ func TestEnsureGlobalOptionsSaysNothingExtraWhenTestparmIsSilent(t *testing.T) {
 	e, logBuf := newTestExecutor(t, newFakeRunner())
 	writeSMBConf(t, e.SMBConfPath)
 
-	if ref := e.ensureGlobalOptions(context.Background(), globalOptionsConfig(config.ModeRun)); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), globalOptionsConfig(config.ModeRun), ""); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 	if strings.Contains(logBuf.String(), "testparm says") {
@@ -2347,7 +2353,7 @@ func TestEnsureGlobalOptionsAnnouncesAShadowedKey(t *testing.T) {
 
 	cfg := globalOptionsConfig(config.ModeRun, config.GlobalOption{Key: "smb encrypt", Value: "required"})
 	cfg.GlobalOptionsShadowed = []string{"smb encrypt"}
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 	if !strings.Contains(logBuf.String(), "smb encrypt") || !strings.Contains(logBuf.String(), "more than once") {
@@ -2362,7 +2368,7 @@ func TestEnsureGlobalOptionsWithNothingDeclaredTouchesNothing(t *testing.T) {
 	// even read the file, let alone refuse over it.
 	e.SMBConfPath = filepath.Join(t.TempDir(), "absent", "smb.conf")
 
-	if ref := e.ensureGlobalOptions(context.Background(), runConfig(config.ModeRun)); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), runConfig(config.ModeRun), ""); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 	if n := r.countCalls("output", "testparm"); n != 0 {
@@ -2430,6 +2436,116 @@ func TestExecuteStartRefusesWhenTestparmRejectsTheOptions(t *testing.T) {
 // configuration either. An operator reaching for maintenance mode is
 // debugging a DC that will not run, and a mode that edited smb.conf on the
 // way past would change the thing they are trying to diagnose.
+// TestExecuteProvisionRefusesADeclaredOptionSambaToolWouldReject covers the
+// provision half of the gate, which the declared options otherwise slipped
+// past entirely: they reach `samba-tool domain provision` as `--option`, so
+// the post-provision reconcile finds them already in the generated file,
+// changes nothing, and never asks testparm anything.
+//
+// Measured in this image (samba 4.24.7), `samba-tool domain provision
+// --option="nosuchparam = 1"` exits 2 with
+//
+//	Unknown parameter encountered: "nosuchparam "
+//	samba-tool domain provision: error: invalid --option option value 'nosuchparam = 1': Unable to set parameter
+//
+// and creates NOTHING (/etc/samba was still empty afterwards). All of that
+// goes to stderr, which Runner.Run streams to the container log and does not
+// return, so the entrypoint only ever sees `exit status 2` — which it used to
+// report as a runtime failure telling the operator to delete their volume,
+// for a typo in a variable they can simply edit.
+//
+// So the declared settings are checked FIRST, through samba's own parser, and
+// the refusal names the variable. Nothing has been created when it fires.
+func TestExecuteProvisionRefusesADeclaredOptionSambaToolWouldReject(t *testing.T) {
+	r := newFakeRunner()
+	r.output["testparm check"] = "Unknown parameter encountered: \"nosuchparam\"\n"
+	e, _ := newTestExecutor(t, r)
+	cfg := provisionConfig(t)
+	cfg.GlobalOptions = []config.GlobalOption{{Key: "nosuchparam", Value: "1"}}
+	dir := t.TempDir()
+
+	ref := e.Execute(context.Background(), cfg, modes.Plan{Kind: modes.ActProvision}, dir, testImageVersion)
+	if ref == nil {
+		t.Fatal("a declared option samba cannot parse was accepted on the provision path")
+	}
+	if ref.Code != config.CodeConfigError {
+		t.Errorf("refusal code = %d, want %d", ref.Code, config.CodeConfigError)
+	}
+	for _, want := range []string{"SAMBA_GLOBAL_OPTIONS", `Unknown parameter encountered: "nosuchparam"`} {
+		if !strings.Contains(ref.Msg, want) {
+			t.Errorf("refusal %q does not contain %q", ref.Msg, want)
+		}
+	}
+	if n := r.countCalls("run", "samba-tool"); n != 0 {
+		t.Errorf("samba-tool ran %d times; the refusal must come before anything is created", n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, state.MarkerName)); err == nil {
+		t.Error("a marker was written for a provision that never ran")
+	}
+	if n := r.countCalls("start", "samba"); n != 0 {
+		t.Error("the daemons were started after the refusal")
+	}
+}
+
+// TestExecuteJoinRefusesADeclaredOptionBeforeTouchingTheDomain is the same
+// gate on the join path. A join does not merely write a volume: it creates a
+// domain controller account on a REMOTE DC, so a refusal that arrives after
+// the join leaves the domain carrying a DC this container then refuses to
+// start.
+func TestExecuteJoinRefusesADeclaredOptionBeforeTouchingTheDomain(t *testing.T) {
+	r := newFakeRunner()
+	r.output["testparm check"] = "Unknown parameter encountered: \"nosuchparam\"\n"
+	e, _ := newTestExecutor(t, r)
+	cfg := joinConfig(t)
+	cfg.GlobalOptions = []config.GlobalOption{{Key: "nosuchparam", Value: "1"}}
+
+	ref := e.Execute(context.Background(), cfg, modes.Plan{Kind: modes.ActJoin}, t.TempDir(), testImageVersion)
+	if ref == nil || ref.Code != config.CodeConfigError {
+		t.Fatalf("join accepted an unparseable declared option: %+v", ref)
+	}
+	if n := r.countCalls("run", "samba-tool"); n != 0 {
+		t.Errorf("samba-tool ran %d times; the refusal must come before the domain is touched", n)
+	}
+}
+
+// TestExecuteProvisionChecksTheConfSambaToolGenerated closes the other half
+// of the same hole. Nothing here changed smb.conf — the declared options went
+// in through --option and the reconcile finds them in place — and the gate
+// must run anyway, on the file samba is about to read. The refusal names the
+// file and does NOT claim to have put anything back: this start wrote
+// nothing, so there is nothing to restore, and saying otherwise would send an
+// operator looking for a rollback that never happened.
+func TestExecuteProvisionChecksTheConfSambaToolGenerated(t *testing.T) {
+	r := newFakeRunner()
+	r.output["testparm check"] = "Unknown parameter encountered: \"nosuchparam\"\n"
+	e, _ := newTestExecutor(t, r)
+	original := writeSMBConf(t, e.SMBConfPath)
+	dir := t.TempDir()
+
+	ref := e.Execute(context.Background(), provisionConfig(t), modes.Plan{Kind: modes.ActProvision}, dir, testImageVersion)
+	if ref == nil {
+		t.Fatal("the configuration samba-tool generated was never checked")
+	}
+	if ref.Code != config.CodeConfigError {
+		t.Errorf("refusal code = %d, want %d", ref.Code, config.CodeConfigError)
+	}
+	if !strings.Contains(ref.Msg, e.SMBConfPath) {
+		t.Errorf("refusal %q does not name the file", ref.Msg)
+	}
+	if strings.Contains(ref.Msg, "has been put back") {
+		t.Errorf("refusal %q claims a rollback this start could not have made", ref.Msg)
+	}
+	if !strings.Contains(ref.Msg, "nothing to put back") {
+		t.Errorf("refusal %q does not say that nothing was restored", ref.Msg)
+	}
+	if got := readFile(t, e.SMBConfPath); got != string(original) {
+		t.Errorf("the generated file was rewritten:\n%s", got)
+	}
+	if n := r.countCalls("start", "samba"); n != 0 {
+		t.Error("the daemons were started on a configuration testparm rejects")
+	}
+}
+
 func TestExecuteMaintenanceAppliesNoGlobalOptions(t *testing.T) {
 	r := newFakeRunner()
 	e, _ := newTestExecutor(t, r)
@@ -2531,7 +2647,7 @@ func TestEnsureGlobalOptionsAppliesTheTLSMaterial(t *testing.T) {
 	cfg := runConfig(config.ModeRun)
 	cert, key, ca := withTLSMaterial(t, cfg)
 
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("unexpected refusal %d: %s", ref.Code, ref.Msg)
 	}
 	conf := readFile(t, e.SMBConfPath)
@@ -2558,7 +2674,7 @@ func TestEnsureGlobalOptionsAppliesTheTLSMaterial(t *testing.T) {
 	// rewrote its own configuration on every boot would make the log useless
 	// exactly when it matters.
 	logBuf.reset()
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("second pass: unexpected refusal: %s", ref.Msg)
 	}
 	if logBuf.String() != "" {
@@ -2652,7 +2768,7 @@ func TestEnsureGlobalOptionsRemovesTheTLSMaterialWhenUnset(t *testing.T) {
 
 	// A run-mode config with no SAMBA_TLS_* and no SAMBA_GLOBAL_OPTIONS:
 	// the operator took the variables out and recreated the container.
-	if ref := e.ensureGlobalOptions(context.Background(), runConfig(config.ModeRun)); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), runConfig(config.ModeRun), ""); ref != nil {
 		t.Fatalf("unexpected refusal %d: %s", ref.Code, ref.Msg)
 	}
 
@@ -2689,7 +2805,7 @@ func TestEnsureGlobalOptionsRemovesNothingWhenThereIsNoTLSMaterial(t *testing.T)
 	e, logBuf := newTestExecutor(t, r)
 	original := writeSMBConf(t, e.SMBConfPath)
 
-	if ref := e.ensureGlobalOptions(context.Background(), runConfig(config.ModeRun)); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), runConfig(config.ModeRun), ""); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 	if got := readFile(t, e.SMBConfPath); got != string(original) {
@@ -2713,7 +2829,7 @@ func TestEnsureGlobalOptionsKeepsTheTLSMaterialWhileItIsSet(t *testing.T) {
 	cfg.TLSKeyFile = "/run/secrets/tls/key.pem"
 	cfg.TLSCAFile = "/run/secrets/tls/ca.pem"
 
-	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+	if ref := e.ensureGlobalOptions(context.Background(), cfg, ""); ref != nil {
 		t.Fatalf("unexpected refusal: %s", ref.Msg)
 	}
 	for _, kept := range []string{"tls certfile", "tls keyfile", "tls cafile"} {

@@ -22,6 +22,7 @@ const (
 	globalOptsFirst  = "globalopt-dc1"
 	globalOptsSecond = "globalopt-dc2"
 	globalOptsBad    = "globalopt-bad"
+	globalOptsProv   = "globalopt-prov"
 )
 
 // smbConfPath is the configuration file the DC reads, on the configuration
@@ -75,7 +76,7 @@ const (
 // against the deadline before anything is started, for the reason
 // requireDeadline documents: being killed by `go test` skips every teardown.
 const globalOptionsWorstCase = harness.HealthTimeout + harness.HealthTransitionTimeout +
-	harness.ExitTimeout + 2*stopTimeout + time.Minute
+	2*harness.ExitTimeout + 2*stopTimeout + time.Minute
 
 // globalSetting reads one [global] parameter back through samba's own
 // parser, inside the container.
@@ -111,7 +112,13 @@ func globalSetting(t *testing.T, container, key string) string {
 //     configuration file byte-for-byte as it was. The last half is the one
 //     that matters most: smb.conf lives on a volume, so an image that wrote
 //     the rejected settings and then refused would break every later start,
-//     including the one made right after removing the offending line.
+//     including the one made right after removing the offending line;
+//   - the same entry on a PROVISION, with empty volumes, refuses the same
+//     way and creates nothing. That path is not the one above: the declared
+//     settings reach `samba-tool domain provision` as `--option`, which
+//     refuses the whole provision on stderr with exit 2, so without a gate
+//     of its own the operator would be told their volume may hold partial
+//     state and should be deleted — for a typo in a variable.
 func TestGlobalOptionsApplied(t *testing.T) {
 	requireDeadline(t, globalOptionsWorstCase)
 	// The provision half below asserts that samba reads the declared values
@@ -211,5 +218,37 @@ func TestGlobalOptionsApplied(t *testing.T) {
 	if !bytes.Equal(before, after) {
 		t.Fatalf("the refused boot left %s modified on the volume:\n--- before ---\n%s\n--- after ---\n%s",
 			smbConfPath, before, after)
+	}
+
+	// --- the same entry, on a provision ----------------------------------
+	//
+	// Fresh volumes (no WithVolumes), so this is the very first boot of a
+	// domain that does not exist yet. The refusal must arrive BEFORE
+	// samba-tool is asked to create it: measured in this image, `samba-tool
+	// domain provision --option="nosuchparam = 1"` exits 2 with its
+	// complaint on stderr only, which the entrypoint cannot tell from a
+	// provision that failed on DNS or on the disk.
+	provCode, provLogs := harness.RunDCExpectExit(t, net, globalOptsProv, "provision", map[string]string{
+		"SAMBA_REALM":          harness.Realm,
+		"SAMBA_DOMAIN":         harness.Domain,
+		"SAMBA_GLOBAL_OPTIONS": "this is not a parameter = 1",
+	}, harness.AdminSecret(t))
+	if provCode != exitConfigError {
+		t.Fatalf("a [global] entry samba cannot parse exited %d on a provision, want %d (configuration error)\n--- logs ---\n%s",
+			provCode, exitConfigError, provLogs)
+	}
+	mustContain(t, "refusal of "+globalOptsProv, provLogs,
+		"SAMBA_GLOBAL_OPTIONS",
+		"testparm",
+		"this is not a parameter",
+		"nothing has been created yet")
+	// Nothing was created: the domain was never provisioned, so the message
+	// must not be the runtime one that sends an operator to delete a volume
+	// which holds nothing at all.
+	for _, forbidden := range []string{"domain provision failed", "delete/recreate"} {
+		if strings.Contains(provLogs, forbidden) {
+			t.Fatalf("the refusal reported %q for an option that was refused before anything ran\n--- logs ---\n%s",
+				forbidden, provLogs)
+		}
 	}
 }
