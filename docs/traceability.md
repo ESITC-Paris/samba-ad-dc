@@ -16,7 +16,8 @@ are tied together:
   does not. The **doc section** column below is the reverse index: for
   each row, the guide section that documents that use case.
   The row set and the test IDs did not change when the column was
-  filled in; they are the same 17 Phase 3 froze.
+  filled in; they were the same 17 Phase 3 froze. **N9** is the first
+  row added since, in Phase 6, together with the test that covers it.
 
 The rows come from **B.5 “Documented use cases → E2E matrix”** in
 `docs/adaptation-profile.md`. The mapping is **one row ↔ one test ID**,
@@ -62,6 +63,7 @@ reviewer's job.
 | **N6** — LDAPS with certificate | `TestLDAPSCertificate` | `test/e2e/nominal_test.go` | [deployment §4.5 LDAPS with the DC's own certificate](deployment-guide.md#45-ldaps-with-the-dcs-own-certificate) |
 | **N7** — signed-NTP wiring (MS-SNTP, `SAMBA_CHRONY`) | `TestSignedNTPWiring` | `test/e2e/nominal_test.go` | [deployment §4.6 Time](deployment-guide.md#46-time) |
 | **N8** — database consistency (`dbcheck`, maintenance mode) | `TestDBConsistency` | `test/e2e/nominal_test.go` | [deployment §6.4 Database consistency](deployment-guide.md#64-database-consistency) |
+| **N9** — declarative `[global]` options (`SAMBA_GLOBAL_OPTIONS`): applied, reconciled on restart, refused when samba's parser rejects them | `TestGlobalOptionsApplied` | `test/e2e/config_test.go` | [deployment §3.5 Declarative `[global]` settings](deployment-guide.md#35-declarative-global-settings) |
 | **R1** — additional-DC join with bidirectional directory replication, verified by object propagation both ways | `TestJoinReplicationBothWays` | `test/e2e/replication_test.go` | [deployment §5 Scale-out: an additional DC](deployment-guide.md#5-scale-out-an-additional-domain-controller) |
 | **O1** — idempotent restart without state loss | `TestIdempotentRestart` | `test/e2e/operational_test.go` | [deployment §3.4 Switch to `SAMBA_MODE=run`](deployment-guide.md#34-switch-to-samba_moderun-and-why) |
 | **O2** — offline backup **and** restore into a fresh instance, with object-level verification | `TestOfflineBackupRestore` | `test/e2e/operational_test.go` | [deployment §7 Backup and restore runbook](deployment-guide.md#7-backup-and-restore-runbook) |
@@ -72,7 +74,7 @@ reviewer's job.
 | **X3** — provision over existing state refused | `TestProvisionOverStateRefused` | `test/e2e/negative_test.go` | [deployment §3.4 Switch to `SAMBA_MODE=run`](deployment-guide.md#34-switch-to-samba_moderun-and-why) |
 | **X4** — run mode without state refused | `TestRunModeWithoutStateRefused` | `test/e2e/negative_test.go` | [deployment §3.4 Switch to `SAMBA_MODE=run`](deployment-guide.md#34-switch-to-samba_moderun-and-why) |
 
-17 B.5 rows ↔ 17 tests.
+18 B.5 rows ↔ 18 tests.
 
 The **doc section** links are relative to this file's directory, and each
 names the *primary* section — the one whose subject is that use case.

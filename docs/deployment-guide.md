@@ -476,6 +476,65 @@ different name — the DC's identity lives in `netbios name` in `smb.conf`,
 not in the container's host name.
 (*Covered by:* `TestIdempotentRestart`.)
 
+### 3.5 Declarative `[global]` settings
+
+The variables in §3.1 each own one setting. Anything else you want in the
+DC's `[global]` section goes into **`SAMBA_GLOBAL_OPTIONS`**, one
+`key = value` per line — a compose block scalar is the intended form:
+
+```yaml
+      SAMBA_GLOBAL_OPTIONS: |
+        # a bigger log file, and a second log class for authentication
+        max log size = 10000
+        log level = 1 auth:3
+```
+
+Blank lines and lines starting with `#` are ignored; spacing and case in
+the key do not matter; a key set twice keeps its last value and says so in
+the log. A line that is not a `key = value` pair is refused with exit 10
+rather than skipped, because an option that silently never reaches
+`smb.conf` is invisible until the day it was supposed to matter.
+
+**It is reconciled on every start, not only at provision time.** Edit the
+variable and recreate the container; the entrypoint rewrites `[global]`
+atomically before any daemon reads the file, and announces each change:
+
+```
+entrypoint: SAMBA_GLOBAL_OPTIONS: replaced "max log size" = "20000" in /etc/samba/smb.conf
+```
+
+A start that changes nothing writes nothing and says nothing. Maintenance
+mode applies none of it.
+
+**What you put here reaches the running DC.** The image health-checks
+itself by probing DNS, LDAP and SMB on the loopback address (§6.1), and the
+SMB probe connects *anonymously*; a `[global]` setting that changes how the
+DC answers there can leave the container reported unhealthy while it is
+still serving members. Change one setting at a time and watch
+`docker inspect --format '{{.State.Health.Status}}' dc1` after the restart.
+
+**Settings another variable owns are refused**, with a message naming what
+to set instead: `realm`, `workgroup`, `netbios name`, `ad dc functional
+level`, `dns forwarder`, the `tls *` files (reserved for the `SAMBA_TLS_*`
+variables), and `server role`, `dns update command`, `ntp signd socket
+directory` and `include`, which the image manages itself.
+
+**Every rewrite is checked by samba's own parser.** The entrypoint runs
+`testparm` over the result; if it complains, your previous `smb.conf` is
+written back and the container refuses to start with exit 10, quoting
+testparm:
+
+> `testparm rejects the [global] settings SAMBA_GLOBAL_OPTIONS declares
+> (Unknown parameter encountered: "this is not a parameter");
+> /etc/samba/smb.conf has been put back to what it held before this start,
+> so fix or remove the offending entry in SAMBA_GLOBAL_OPTIONS and start
+> the container again`
+
+Putting the file back is what makes the failure recoverable: `smb.conf`
+lives on a volume, so a rejected rewrite left in place would break every
+later start — including the one you make right after fixing the variable.
+(*Covered by:* `TestGlobalOptionsApplied`.)
+
 ---
 
 ## 4. Protocol check from a member
@@ -1337,7 +1396,7 @@ to, is the profile's
 |---|---|
 | §1 Constraints first | `TestProvision` (the constrained profile is what every DC in the suite runs under); `TestPlainEnvSecretRejected`, `TestMissingSecretFailsFast` for §1.5 |
 | §2 Verify before the first run | *(none — a property of the published image; `post-push-verify.yml`, SPEC §8.5)* |
-| §3 The first domain controller | `TestProvision`, `TestIdempotentRestart`; `TestRunModeWithoutStateRefused`, `TestProvisionOverStateRefused` for §3.4 |
+| §3 The first domain controller | `TestProvision`, `TestIdempotentRestart`; `TestRunModeWithoutStateRefused`, `TestProvisionOverStateRefused` for §3.4; `TestGlobalOptionsApplied` for §3.5 |
 | §4 Protocol check from a member | `TestDNSSRVRecords`, `TestKerberosKinit`, `TestKerberizedSMB`, `TestNTLMAuth`, `TestLDAPSCertificate`, `TestSignedNTPWiring` |
 | §5 Scale-out: an additional DC | `TestJoinReplicationBothWays` |
 | §6 Day-2 basics | `TestDBConsistency`; `TestDowngradeRefused` for the maintenance-mode guards; `TestUpgradeFromLastPublished` for §6.5 |

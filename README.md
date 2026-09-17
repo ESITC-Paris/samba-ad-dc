@@ -174,6 +174,7 @@ authoritative; the tables below are a copy of it. Exit codes are
 | `SAMBA_FUNCTION_LEVEL` | provision, join | `2016` | AD functional level; also mirrored onto the `ad dc functional level` smb.conf parameter for `2012`, `2012_R2` and `2016` — by provision through `--option`, by join through the post-join edit |
 | `SAMBA_LOG_LEVEL` | all | `1` | samba debug level |
 | `SAMBA_CHRONY` | auto/provision/join/run | `on` | serve MS-SNTP signed time (`on\|off`) |
+| `SAMBA_GLOBAL_OPTIONS` | auto/provision/join/run (not maintenance) | none | newline-separated `key = value` smb.conf `[global]` settings, reconciled on every start and validated by `testparm`; see the deployment guide §3.5 |
 | `SAMBA_MAINTENANCE_OP` | maintenance | `check` | `check` (dbcheck) or `repair` (dbcheck --fix --yes) |
 
 Secrets are accepted **only** through the `*_FILE` variables. Setting a

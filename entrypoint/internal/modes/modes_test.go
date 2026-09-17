@@ -1,6 +1,7 @@
 package modes
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -469,7 +470,11 @@ func TestDecideIsPure(t *testing.T) {
 			case ref1 != nil && *ref1 != *ref2:
 				t.Errorf("refusal differs between runs: %+v then %+v", *ref1, *ref2)
 			}
-			if *c.cfg != before {
+			// DeepEqual rather than ==: Config carries the declarative
+			// [global] options as a slice, so it is no longer a
+			// comparable type. What is asserted is unchanged — Decide
+			// must leave the whole value it was handed untouched.
+			if !reflect.DeepEqual(*c.cfg, before) {
 				t.Errorf("Decide mutated the config: %+v, want %+v", *c.cfg, before)
 			}
 			if c.obs.Marker != nil && *c.obs.Marker != markerBefore {

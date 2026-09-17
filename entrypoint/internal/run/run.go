@@ -241,6 +241,19 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.P
 			plan.Kind)
 	}
 
+	// Every path that is about to start the daemons passes here, and only
+	// those: the declared [global] settings are CONFIGURATION, not state
+	// (§6.2). State is the directory database, which a restart never
+	// touches; configuration is reconciled on every start, so changing the
+	// variable and recreating the container is all an operator has to do.
+	// Provision has already passed them to samba-tool with --option, so on
+	// that path the reconcile normally finds them in place and does
+	// nothing. It runs there anyway: nothing should depend on samba-tool
+	// having written every one of them into the file it generated.
+	if ref := e.ensureGlobalOptions(ctx, cfg); ref != nil {
+		return ref
+	}
+
 	return e.Supervise(ctx, cfg)
 }
 
@@ -445,6 +458,139 @@ func (e *Executor) ensureJoinedConf(cfg *config.Config) *config.Refusal {
 		e.logf("%s", a)
 	}
 	return nil
+}
+
+// ensureGlobalOptions reconciles the [global] settings declared through
+// SAMBA_GLOBAL_OPTIONS into the smb.conf on the configuration volume, and
+// refuses the boot when samba's own parser rejects the result.
+//
+// It runs on every start rather than only on the boot that initialized the
+// volume, because the variable is what an operator edits: a setting that only
+// took effect on a freshly provisioned domain would be a setting nobody can
+// change on a DC that already exists — which is every DC past its first day.
+//
+// Maintenance mode is deliberately not among its callers (see Execute): an
+// operator reaching for it is diagnosing a DC that will not run, and a mode
+// that edited the configuration on the way past would change the very thing
+// they are looking at.
+func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) *config.Refusal {
+	if len(cfg.GlobalOptions) == 0 {
+		return nil
+	}
+	for _, key := range cfg.GlobalOptionsShadowed {
+		e.logf("SAMBA_GLOBAL_OPTIONS: %q is set more than once; the last occurrence wins", key)
+	}
+
+	original, err := os.ReadFile(e.SMBConfPath)
+	if err != nil {
+		return config.Refuse(config.CodeRuntimeFailure,
+			"the configuration file %q that SAMBA_GLOBAL_OPTIONS must be applied to cannot be read (%s); mount /etc/samba read-write, or unset SAMBA_GLOBAL_OPTIONS",
+			e.SMBConfPath, oneLine(err.Error()))
+	}
+
+	conf := string(original)
+	var announcements []string
+	for _, o := range cfg.GlobalOptions {
+		updated, edit := withGlobalSetting(conf, o.Key, o.Value)
+		if edit == confUnchanged {
+			continue
+		}
+		conf = updated
+		verb := "added"
+		if edit == confReplaced {
+			verb = "replaced"
+		}
+		announcements = append(announcements,
+			fmt.Sprintf("SAMBA_GLOBAL_OPTIONS: %s %q = %q in %s", verb, o.Key, o.Value, e.SMBConfPath))
+	}
+	// Nothing to do is the steady state, and it says nothing: an operator
+	// who changed nothing must see no configuration noise at all, and the
+	// file samba reads must not be rewritten on every single boot.
+	if len(announcements) == 0 {
+		return nil
+	}
+
+	if err := writeFileAtomic(e.SMBConfPath, []byte(conf), 0o644); err != nil {
+		return config.Refuse(config.CodeRuntimeFailure,
+			"the [global] settings SAMBA_GLOBAL_OPTIONS declares cannot be written into %q (%s); mount /etc/samba read-write",
+			e.SMBConfPath, oneLine(err.Error()))
+	}
+	for _, a := range announcements {
+		e.logf("%s", a)
+	}
+	return e.checkSMBConf(ctx, original)
+}
+
+// checkSMBConf asks testparm whether the file that was just rewritten is a
+// configuration samba can load, and puts the previous one back when it is
+// not.
+//
+// The restore is the point. smb.conf lives on a volume, so a rewrite that
+// samba cannot parse would outlive the container that made it and break every
+// later start — including the one an operator makes right after removing the
+// offending variable. Refusing with the file already back to what it held
+// means the remedy is exactly "fix the variable and start again".
+//
+// Two failure shapes have to be caught, and only one of them shows up in an
+// exit code (both measured against samba 4.24.7 in this image):
+//
+//   - an unknown parameter prints `Unknown parameter encountered: "..."` and
+//     testparm still exits 0. The exit code alone would let a typo through,
+//     and a [global] setting that silently does nothing is precisely what
+//     this variable exists to prevent.
+//   - an invalid value for a real parameter prints `WARNING: Ignoring invalid
+//     value ...` and exits 1.
+//
+// Both diagnostics are DEBUG output, which samba writes to stderr by default
+// — where Output deliberately does not capture it (see Runner.Output) — so
+// `--debug-stdout` moves them onto the stream this can read. testparm's own
+// banner stays on stderr and still reaches the container log.
+func (e *Executor) checkSMBConf(ctx context.Context, original []byte) *config.Refusal {
+	out, err := e.Runner.Output(ctx, e.Bin.Testparm, testparmCheckArgs(e.SMBConfPath)...)
+	problem := testparmProblem(out)
+	if err == nil && problem == "" {
+		return nil
+	}
+	if problem == "" {
+		problem = oneLine(err.Error())
+	}
+
+	if rerr := writeFileAtomic(e.SMBConfPath, original, 0o644); rerr != nil {
+		return config.Refuse(config.CodeConfigError,
+			"testparm rejects the [global] settings SAMBA_GLOBAL_OPTIONS declares (%s) and %q could not be put back (%s); fix or remove the offending entry in SAMBA_GLOBAL_OPTIONS — the configuration volume still holds the rejected settings",
+			problem, e.SMBConfPath, oneLine(rerr.Error()))
+	}
+	return config.Refuse(config.CodeConfigError,
+		"testparm rejects the [global] settings SAMBA_GLOBAL_OPTIONS declares (%s); %s has been put back to what it held before this start, so fix or remove the offending entry in SAMBA_GLOBAL_OPTIONS and start the container again",
+		problem, e.SMBConfPath)
+}
+
+// testparmProblem returns the first line of a testparm run that reports a
+// problem with the configuration, or "" when there is none.
+//
+// Only the lines BEFORE the dump are considered: with `-s` everything from
+// `# Global parameters` on is the configuration being echoed back, and a
+// parameter whose VALUE happens to contain one of these words must not be
+// read as an error. Within those lines a keyword is still required rather
+// than treating any output as a problem: this decides whether a container
+// boots, and a future samba printing one extra informational line to stdout
+// must not turn into a domain controller that refuses to start.
+func testparmProblem(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" {
+			continue
+		}
+		if strings.HasPrefix(t, "#") || strings.HasPrefix(t, "[") {
+			return ""
+		}
+		for _, marker := range []string{"Unknown parameter", "Ignoring", "ERROR", "Error", "WARNING"} {
+			if strings.Contains(t, marker) {
+				return oneLine(t)
+			}
+		}
+	}
+	return ""
 }
 
 // chronyConfig generates the configuration chronyd will actually read and
@@ -804,6 +950,13 @@ func provisionArgs(cfg *config.Config, secret string) []string {
 		args = append(args, "--option="+dnsForwarderKey+"="+cfg.DNSForwarder)
 	}
 	args = append(args, "--option="+dnsUpdateCommand)
+	// The operator's declarative block, in declaration order and last, so
+	// that it is applied over the image's own options rather than under
+	// them. Nothing here can collide with those: config.Load refuses every
+	// key this image owns before the value ever reaches provision.
+	for _, o := range cfg.GlobalOptions {
+		args = append(args, "--option="+o.Key+" = "+o.Value)
+	}
 	return append(args, "--adminpass="+secret)
 }
 
@@ -885,6 +1038,19 @@ func chronyArgs(conf string) []string {
 //     different files.
 func testparmArgs(smbConf, parameter string) []string {
 	return []string{"-s", "-l", "--parameter-name=" + parameter, smbConf}
+}
+
+// testparmCheckArgs builds the command line that validates the WHOLE file
+// instead of reading one parameter out of it: same `-s -l` and the same
+// explicit file, no `--parameter-name`, because what is wanted here is not a
+// value but samba's verdict on the configuration it is about to be given.
+//
+// `--debug-stdout` is added for this call only, and it is load-bearing rather
+// than cosmetic: it is what puts the diagnostics where checkSMBConf can read
+// them. The parameter-reading call above must NOT have it — there the same
+// redirection would mix debug lines into the value being read.
+func testparmCheckArgs(smbConf string) []string {
+	return []string{"-s", "-l", "--debug-stdout", smbConf}
 }
 
 // withNTPSigndSocket returns conf with the ntpsigndsocket directive naming

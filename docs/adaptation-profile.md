@@ -228,7 +228,9 @@ against, and B.4 above is its summary.
 
 Nominal: provision; Kerberos authentication (kinit) and Kerberized SMB;
 NTLM authentication path; DNS SRV records served; LDAPS with certificate;
-signed-NTP wiring; database consistency. Additional-DC join with
+signed-NTP wiring; database consistency; declarative `[global]` options
+applied, reconciled on a restart and refused when samba's own parser rejects
+them (`TestGlobalOptionsApplied`). Additional-DC join with
 bidirectional directory replication verified by object propagation both
 ways. Operational: idempotent restart without state loss; offline backup
 AND restore into a fresh instance with object-level verification; upgrade
@@ -573,6 +575,7 @@ against a running container. Exit codes are **immutable once released**.
 | `SAMBA_FUNCTION_LEVEL` | provision, join | `2016` | AD functional level; also mirrored onto the `ad dc functional level` smb.conf parameter for `2012`, `2012_R2` and `2016` — by provision through `--option`, by join through the post-join edit (see below) |
 | `SAMBA_LOG_LEVEL` | all | `1` | samba debug level |
 | `SAMBA_CHRONY` | auto/provision/join/run | `on` | serve MS-SNTP signed time (`on|off`) |
+| `SAMBA_GLOBAL_OPTIONS` | auto/provision/join/run (not maintenance) | none | newline-separated `key = value` smb.conf `[global]` settings, reconciled on every start and validated by `testparm` (see below) |
 | `SAMBA_MAINTENANCE_OP` | maintenance | `check` | `check` (dbcheck) or `repair` (dbcheck --fix --yes) |
 
 Secrets are accepted **only** through the `*_FILE` variables (§6.1).
@@ -616,6 +619,61 @@ CNAME only the directory's own DNS can answer — then pays that stall on
 every Kerberos bind, and the sealed DRSUAPI bind that carries replication
 times out before it completes. Set it to a resolver that is **not** this
 DC, or the domain replicates erratically or not at all.
+
+**Declarative configuration: `SAMBA_GLOBAL_OPTIONS`.** The variables above
+each own one setting. Everything else an operator may legitimately want in
+`[global]` — `log level`, `max log size`, an `idmap config` line — goes into
+this one variable, as newline-separated `key = value` entries (a compose `|`
+block scalar is the intended form). Blank lines and lines starting with `#`
+or `;` are ignored; keys are normalized to lower case and single spaces; a
+key set twice keeps its last value and the repetition is logged. A line that
+is not a `key = value` pair is refused with exit 10 rather than skipped — an
+option that silently never reaches `smb.conf` is invisible until the day it
+was supposed to matter.
+
+*Owned keys are refused, naming their owner.* `realm` (`SAMBA_REALM`),
+`workgroup` (`SAMBA_DOMAIN`), `netbios name` (the container hostname),
+`ad dc functional level` (`SAMBA_FUNCTION_LEVEL`), `dns forwarder`
+(`SAMBA_DNS_FORWARDER`), and `server role`, `dns update command`, `ntp
+signd socket directory` and `include`, which the image manages itself.
+`tls certfile` / `tls keyfile` / `tls cafile` are refused too, reserved for
+the `SAMBA_TLS_CERT_FILE` / `SAMBA_TLS_KEY_FILE` / `SAMBA_TLS_CA_FILE`
+variables that own them — refused from the moment this variable exists, so
+that no deployment can come to depend on setting them by hand first. Each is exit 10 with a message
+naming what to set instead: an entry quietly overriding one of them would
+either contradict the variable that owns it or break the DC outright.
+
+*Applied to `[global]`, before any daemon starts.* Provision passes every
+entry to `samba-tool` as `--option=key = value`, so the file it generates
+already carries them; and every start — the one that just provisioned or
+joined included — reconciles them into the `smb.conf` on the configuration
+volume in one atomic rewrite, before any daemon reads it. Each add or replace is one log
+line — `entrypoint: SAMBA_GLOBAL_OPTIONS: added "max log size" = "10000"
+in /etc/samba/smb.conf` — and a start that changes nothing writes nothing
+and says nothing. Maintenance mode applies none of it: an operator reaching
+for it is diagnosing a DC that will not run, and a mode that edited the
+configuration on the way past would change what they are looking at.
+
+*This is configuration, not state (§6.2).* The state a restart never
+modifies is the directory database on the state volume; the `[global]`
+settings are configuration, reconciled on every start, which is what makes
+`SAMBA_GLOBAL_OPTIONS` editable on a DC that already exists. Changing the
+variable and recreating the container is the whole procedure, and the log
+says what changed.
+
+*Every rewrite is gated by samba's own parser.* After a rewrite the
+entrypoint runs `testparm -s -l --debug-stdout <smb.conf>`; if it reports a
+problem, the **previous bytes are written back** and the boot refuses with
+exit 10, quoting testparm's own first line. The restore is the point:
+`smb.conf` lives on a volume, so a rejected rewrite left in place would
+break every later start, including the one made right after removing the
+offending entry. Both failure shapes are caught, and only one of them shows
+up in an exit code (measured against Samba 4.24.7 in this image): an unknown
+parameter prints `Unknown parameter encountered: "…"` and **exits 0**, while
+an invalid value for a real parameter prints `WARNING: Ignoring invalid
+value …` and exits 1. Both are DEBUG output, which samba writes to stderr —
+hence `--debug-stdout`, which is what makes the diagnostic readable by the
+entrypoint. *Covered by:* `TestGlobalOptionsApplied`.
 
 **`KRB5_CONFIG` is set in the image** to
 `/var/lib/samba/private/krb5.conf`, the Kerberos configuration both
@@ -1354,3 +1412,17 @@ gates.
   signs and re-verifies with v2.6.5, a v3 CLI is *expected* to verify
   those signatures and this project has not exercised it — the deployment
   guide previously asserted that v3 would fail, which nothing had tested.
+
+- 2026-09-17: Phase 6 — **`SAMBA_GLOBAL_OPTIONS`**, a declarative
+  `[global]` block. The Runtime contract gains the variable and the
+  *Declarative configuration* section above: what it accepts, the keys it
+  refuses (each naming the variable or the mechanism that owns them), the
+  three points it is applied at, and the `testparm` gate that restores the
+  previous `smb.conf` before refusing with exit 10. Two facts about
+  `testparm` are recorded there because they decide the shape of the gate
+  and neither is documented by samba: an **unknown parameter exits 0**, so
+  the exit code alone cannot be the verdict, and both diagnostics are DEBUG
+  output on stderr, so the check passes `--debug-stdout` to read them —
+  measured against Samba 4.24.7 in this image. B.5 gains the clause and
+  `docs/traceability.md` row **N9** (`TestGlobalOptionsApplied`), the first
+  row added since Phase 3 froze the set at 17.

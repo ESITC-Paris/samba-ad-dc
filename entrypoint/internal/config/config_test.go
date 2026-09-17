@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -294,7 +295,12 @@ func TestLoadValid(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if *cfg != tc.want {
+			// DeepEqual rather than ==: Config carries the declarative
+			// [global] options as a slice, so it is no longer a
+			// comparable type. The assertion is unchanged — the WHOLE
+			// value, field for field, so a new field with a wrong
+			// default cannot slip past.
+			if !reflect.DeepEqual(*cfg, tc.want) {
 				t.Errorf("Load() = %+v\nwant %+v", *cfg, tc.want)
 			}
 		})
@@ -456,5 +462,185 @@ func TestRefusalIsAnError(t *testing.T) {
 	var r *Refusal
 	if !errors.As(err, &r) || r.Code != 10 {
 		t.Errorf("errors.As did not recover the refusal")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SAMBA_GLOBAL_OPTIONS
+// ---------------------------------------------------------------------------
+
+// TestLoadGlobalOptions pins the parsing of the declarative [global] block.
+// The variable is written as a compose `|` block scalar, so the value really
+// does arrive with blank lines, comments and whatever indentation the author
+// left behind: each of those is a case here rather than an assumption.
+func TestLoadGlobalOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		value        string
+		want         []GlobalOption
+		wantShadowed []string
+	}{
+		{
+			name:  "two entries, in declaration order",
+			value: "smb encrypt = required\nlog level = 1 auth:3\n",
+			want: []GlobalOption{
+				{Key: "smb encrypt", Value: "required"},
+				{Key: "log level", Value: "1 auth:3"},
+			},
+		},
+		{
+			name:  "blank lines and comments are ignored",
+			value: "\n# what this DC encrypts\n\n  smb encrypt = required  \n\t# and nothing else\n\n",
+			want:  []GlobalOption{{Key: "smb encrypt", Value: "required"}},
+		},
+		{
+			name:  "keys are normalised to lower case and single spaces",
+			value: "Smb   Encrypt = required",
+			want:  []GlobalOption{{Key: "smb encrypt", Value: "required"}},
+		},
+		{
+			name:  "a value keeps its words, not its spacing",
+			value: "log level =  1   auth:3 ",
+			want:  []GlobalOption{{Key: "log level", Value: "1 auth:3"}},
+		},
+		{
+			name:  "a value may contain an equals sign",
+			value: "idmap config * : backend = tdb",
+			want:  []GlobalOption{{Key: "idmap config * : backend", Value: "tdb"}},
+		},
+		{
+			name:  "a repeated key keeps the last value, and says so",
+			value: "smb encrypt = desired\nlog level = 2\nsmb encrypt = required\n",
+			want: []GlobalOption{
+				{Key: "log level", Value: "2"},
+				{Key: "smb encrypt", Value: "required"},
+			},
+			wantShadowed: []string{"smb encrypt"},
+		},
+		{
+			name:  "an empty variable declares nothing",
+			value: "\n  \n# only a comment\n",
+			want:  nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(envMap(map[string]string{"SAMBA_GLOBAL_OPTIONS": tc.value}))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(cfg.GlobalOptions, tc.want) {
+				t.Errorf("GlobalOptions = %+v, want %+v", cfg.GlobalOptions, tc.want)
+			}
+			if !reflect.DeepEqual(cfg.GlobalOptionsShadowed, tc.wantShadowed) {
+				t.Errorf("GlobalOptionsShadowed = %+v, want %+v", cfg.GlobalOptionsShadowed, tc.wantShadowed)
+			}
+		})
+	}
+}
+
+// TestLoadGlobalOptionsRefusals covers the two ways the variable is refused:
+// a line that is not a setting at all, and a setting this image owns.
+//
+// The owned keys are the point of the exercise. Every one of them is already
+// derived from something else — another variable, the container's host name,
+// or a decision of the image — and a [global] entry quietly overriding it
+// would either contradict what the operator asked for elsewhere or break the
+// DC outright. The message must therefore name the OWNER, not merely say no:
+// an operator who set `realm` in SAMBA_GLOBAL_OPTIONS needs to be told to set
+// SAMBA_REALM instead.
+func TestLoadGlobalOptionsRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		value           string
+		wantMsgContains []string
+	}{
+		{
+			name:            "a line that is not a setting",
+			value:           "smb encrypt = required\nthis line has no equals sign\n",
+			wantMsgContains: []string{"SAMBA_GLOBAL_OPTIONS", "this line has no equals sign"},
+		},
+		{
+			name:            "an empty key",
+			value:           " = required",
+			wantMsgContains: []string{"SAMBA_GLOBAL_OPTIONS"},
+		},
+		{
+			name:            "realm is owned by SAMBA_REALM",
+			value:           "realm = OTHER.EXAMPLE.COM",
+			wantMsgContains: []string{"SAMBA_GLOBAL_OPTIONS", "realm", "SAMBA_REALM"},
+		},
+		{
+			name:            "workgroup is owned by SAMBA_DOMAIN",
+			value:           "workgroup = OTHER",
+			wantMsgContains: []string{"workgroup", "SAMBA_DOMAIN"},
+		},
+		{
+			name:            "netbios name is owned by the container host name",
+			value:           "netbios name = dc99",
+			wantMsgContains: []string{"netbios name", "container"},
+		},
+		{
+			name:            "ad dc functional level is owned by SAMBA_FUNCTION_LEVEL",
+			value:           "ad dc functional level = 2012",
+			wantMsgContains: []string{"ad dc functional level", "SAMBA_FUNCTION_LEVEL"},
+		},
+		{
+			name:            "dns forwarder is owned by SAMBA_DNS_FORWARDER",
+			value:           "dns forwarder = 10.0.0.53",
+			wantMsgContains: []string{"dns forwarder", "SAMBA_DNS_FORWARDER"},
+		},
+		{
+			name:            "tls certfile is owned by SAMBA_TLS_CERT_FILE",
+			value:           "tls certfile = /tls/cert.pem",
+			wantMsgContains: []string{"tls certfile", "SAMBA_TLS_CERT_FILE"},
+		},
+		{
+			name:            "tls keyfile is owned by SAMBA_TLS_KEY_FILE",
+			value:           "tls keyfile = /tls/key.pem",
+			wantMsgContains: []string{"tls keyfile", "SAMBA_TLS_KEY_FILE"},
+		},
+		{
+			name:            "tls cafile is owned by SAMBA_TLS_CA_FILE",
+			value:           "tls cafile = /tls/ca.pem",
+			wantMsgContains: []string{"tls cafile", "SAMBA_TLS_CA_FILE"},
+		},
+		{
+			name:            "server role is managed by the image",
+			value:           "server role = standalone server",
+			wantMsgContains: []string{"server role", "image"},
+		},
+		{
+			name:            "dns update command is managed by the image",
+			value:           "dns update command = /usr/bin/nsupdate",
+			wantMsgContains: []string{"dns update command", "image"},
+		},
+		{
+			name:            "ntp signd socket directory is managed by the image",
+			value:           "ntp signd socket directory = /srv/signd",
+			wantMsgContains: []string{"ntp signd socket directory", "image"},
+		},
+		{
+			name:            "include is managed by the image",
+			value:           "include = /etc/samba/extra.conf",
+			wantMsgContains: []string{"include", "image"},
+		},
+		{
+			name:            "an owned key is recognised whatever its spacing and case",
+			value:           "DNS    Forwarder = 10.0.0.53",
+			wantMsgContains: []string{"dns forwarder", "SAMBA_DNS_FORWARDER"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(envMap(map[string]string{"SAMBA_GLOBAL_OPTIONS": tc.value}))
+			if cfg != nil {
+				t.Errorf("expected nil config on refusal, got %+v", cfg)
+			}
+			r := refusalOf(t, err, CodeConfigError)
+			for _, frag := range tc.wantMsgContains {
+				if !strings.Contains(r.Msg, frag) {
+					t.Errorf("message %q does not contain %q", r.Msg, frag)
+				}
+			}
+		})
 	}
 }
