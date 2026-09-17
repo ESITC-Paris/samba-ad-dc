@@ -302,9 +302,11 @@ B.6 below establishes.
   are roadmap.
 
 - **The image fills the AD DC role and no other.** It is not a file
-  server: the Samba Team does not recommend using a DC as one, and POSIX
-  ACLs on shares of a DC do not work
-  ([wiki.samba.org](https://wiki.samba.org/index.php/Samba_AD_DC_as_a_File_Server)),
+  server: the Samba Team does not recommend using a DC as one, restricts
+  the case where it is tolerable to a domain with a single Samba instance,
+  and states that POSIX ACLs on a DC's shares do not work
+  ([wiki.samba.org, *Setting up Samba as an Active Directory Domain
+  Controller*, "Using the Domain Controller as a File Server"](https://wiki.samba.org/index.php/Setting_up_Samba_as_an_Active_Directory_Domain_Controller#Using_the_Domain_Controller_as_a_File_Server_%28Optional%29)),
   so this image defines no share beyond the `sysvol` and `netlogon` an AD
   DC must serve. It is not a print server: `--disable-cups
   --disable-iprint` are passed at build time, so printing is compiled out
@@ -503,6 +505,32 @@ B.6 below establishes.
   Dynamic DNS updates therefore run through
   `samba_dnsupdate --use-samba-tool`, which the entrypoint pins (Phase 2);
   a configuration that would require the external updater is unsupported.
+
+- **`samba-tool gpo` does not work from inside the DC container the way
+  this image is normally run.** Measured once — 2026-09-17, local arm64,
+  `samba-ad-dc:dev` (Samba 4.24.7), healthy single-DC domain on a docker
+  bridge network. Every `gpo` subcommand first locates a DC over CLDAP by
+  *realm* name, and the container's `/etc/resolv.conf` names docker's
+  embedded resolver (`127.0.0.11`), which does not answer the realm:
+
+  ```text
+  ERROR(runtime): uncaught exception - ('Could not find a DC for domain',
+    NTSTATUSError(3221225524, 'The object name is not found.'))
+  ```
+
+  The user, group, OU and password-policy subcommands are unaffected in
+  the same container: they work on the local `sam.ldb` and need no DC
+  discovery. So this is a property of the *resolver the container was
+  given* rather than of the image — a DC pointed at a DC (B.3) would not
+  hit it — and it is recorded because the deployment this image documents
+  does not guarantee that resolver. The form measured to work regardless
+  is a one-off container of the same image with `--entrypoint samba-tool`,
+  `--dns <a DC's address>` and the DC's `/etc/samba` mounted read-only,
+  plus `-H ldap://<dc fqdn>` for anything that writes to the directory;
+  it is written out in [`docs/reuse-guide.md`](reuse-guide.md#operator-api)
+  §5. **No test covers either form.** The operator API is out of band by
+  construction — a downstream project tests its own automation — so what
+  is stated here is one measurement, not a contract.
 
 ### B.7 Catalog
 
@@ -806,8 +834,9 @@ self-signed material on demand (`Attempting to autogenerate TLS self-signed
 keys … TLS self-signed keys generated OK`), even on a DC that never had any,
 and LDAPS comes back up on it. The material it writes was measured on a
 provisioned DC: `key.pem` at `0600`, `cert.pem` and `ca.pem` at `0644`, all
-owned by root — the key at the only mode samba accepts for it. So it is a full return to the default
-behaviour, not a degraded state, and not a limitation.
+owned by root — the key at the only mode samba accepts for it. So it is a
+full return to the default behaviour, not a degraded state, and not a
+limitation.
 
 *What renewal costs.* Replace the files and recreate the container: the
 reconciliation rewrites the three settings only when they changed, so a

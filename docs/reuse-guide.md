@@ -47,12 +47,14 @@ instead.
 ### It is not a file server
 
 The Samba Team's own guidance is that a DC should not be used as a file
-server. Their wiki page on the subject lists the operational reasons, and
-one of them is decisive for anything a school would actually deploy:
-using POSIX ACLs with shares on a Samba DC, in the wiki's words, "does not
-work". Their recommendation is to set up a Samba **domain member** with
-the file shares
-([wiki.samba.org, *Samba AD DC as File Server*](https://wiki.samba.org/index.php/Samba_AD_DC_as_a_File_Server)).
+server. Their wiki lists the operational reasons, and two of them are
+decisive for anything a school would actually deploy: a DC should only
+serve files if it is the *only* Samba instance in the domain — so the
+moment you add a second DC the option is gone — and using POSIX ACLs with
+shares on a Samba DC, in the wiki's words, "does not work". Their
+recommendation is to set up a Samba **domain member** with the file shares
+([wiki.samba.org, *Setting up Samba as an Active Directory Domain
+Controller*, section "Using the Domain Controller as a File Server"](https://wiki.samba.org/index.php/Setting_up_Samba_as_an_Active_Directory_Domain_Controller#Using_the_Domain_Controller_as_a_File_Server_%28Optional%29)).
 
 This image follows that: it serves `sysvol` and `netlogon` — which an AD
 DC must serve — and defines no other share. Measured on a provisioned DC
@@ -388,7 +390,9 @@ ERROR(runtime): uncaught exception - ('Could not find a DC for domain',
 
 Measured, on a DC that was healthy and serving the domain at that very
 moment. Whether `docker exec … samba-tool gpo` works therefore depends
-entirely on what that container resolves through; form B does not.
+entirely on what that container resolves through; form B does not. The
+measurement and its bounds are recorded in profile
+[B.6](adaptation-profile.md#b6-known-limitations-stated-per-124).
 
 ### Form B — a one-off container of the same image, for automation
 
@@ -556,7 +560,10 @@ services:
     networks: [dc_net]
     dns: [192.0.2.10]                    # resolve the realm through the DC
     read_only: true
-    tmpfs: [/run, /tmp, /run/lock]       # /run/lock: see §5, `gpo` wants it
+    # The same writable set the measured command in §5 carries — including
+    # /run/lock, which is what keeps `samba-tool gpo` quiet on a read-only
+    # rootfs.
+    tmpfs: [/run, /tmp, /var/cache/samba, /run/lock]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     restart: "no"                        # a one-off, not a service

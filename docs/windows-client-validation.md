@@ -87,14 +87,29 @@ encryption types, and whether the logon was Kerberos or fell back to NTLM
 
 ## 4. Group policy
 
-On the DC (from a one-off container that resolves the realm through a DC —
-see [reuse guide §5](reuse-guide.md#operator-api), the `gpo` subcommands
-need that and this is the measured pitfall):
+Create and link a test GPO **from a one-off container**, not with
+`docker exec`: every `gpo` subcommand locates a DC over CLDAP by realm
+name, which the DC container's own resolver does not answer (profile
+[B.6](adaptation-profile.md#b6-known-limitations-stated-per-124), and
+[reuse guide §5](reuse-guide.md#operator-api) for the form that works).
+The command below is that form, as measured:
 
 ```sh
-samba-tool gpo create 'Validation Test Policy' -U Administrator
-samba-tool gpo setlink 'DC=ad,DC=example,DC=com' '{<the GUID it printed>}' -U Administrator
+docker run --rm --network dc_net --dns 192.0.2.10 \
+  -e PASSWD_FILE=/run/secrets/admin_password \
+  -v "$PWD/secrets/admin_password:/run/secrets/admin_password:ro" \
+  -v dc1-conf:/etc/samba:ro \
+  --read-only --tmpfs /run --tmpfs /tmp --tmpfs /var/cache/samba \
+  --tmpfs /run/lock \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --entrypoint samba-tool \
+  ghcr.io/esitc-paris/samba-ad-dc:4.24.7-r1 \
+  gpo create 'Validation Test Policy' -U Administrator
 ```
+
+It prints the new GUID. Run the same container again with
+`gpo setlink 'DC=ad,DC=example,DC=com' '{<that GUID>}' -U Administrator`
+as its trailing arguments to link the policy at the domain root.
 
 On the client:
 
@@ -148,8 +163,12 @@ which are reasons to *record* rather than to expect:
 - **This project has not measured what the DC negotiates.** `testparm`
   reports `server signing = default` on a DC-role configuration, i.e. the
   effective value comes from Samba's role default rather than from
-  anything this image sets. If your deployment needs a stated value, set
-  it explicitly through `SAMBA_GLOBAL_OPTIONS`
+  anything this image sets. The Samba wiki states that mandatory SMB
+  signing is enforced on a DC — listed there among the reasons not to use
+  one as a file server ([same page as the reuse guide
+  §1](reuse-guide.md#what-this-image-is-and-is-not) cites) — which is
+  upstream's statement, not a measurement taken here. If your deployment
+  needs a stated value, set it explicitly through `SAMBA_GLOBAL_OPTIONS`
   ([reuse guide §3](reuse-guide.md#declarative-configuration)) and
   re-validate.
 
