@@ -106,6 +106,23 @@ const (
 	// binary: a pull that runs for its whole budget is time the test then
 	// no longer has for the domain controller it was about to start.
 	PullTimeout = 10 * time.Minute
+	// BuildTimeout is how long Build may spend on a `docker build`. It is
+	// exported for the same reason PullTimeout is: a test that builds an
+	// image has to count that build into the deadline it demands of the
+	// test binary — and that demand is what keeps the suite from being
+	// killed mid-run by `go test`'s own timeout.
+	//
+	// Three minutes is already ~30x what the one thing the suite builds
+	// costs: the derived image of the B.5 reuse row is a single COPY and
+	// a single ENV on top of a base that is already in the local store,
+	// with a build context of two small files. What varies is not the
+	// layers but the daemon — tarring the context up, and on a loaded
+	// runner waiting for a builder at all — so the margin is over that,
+	// not over the work. It is deliberately NOT as generous as
+	// PullTimeout: nothing here goes to a registry, and a budget large
+	// enough to hide a hung daemon would be spent by the test that has to
+	// declare it up front.
+	BuildTimeout = 3 * time.Minute
 	// dockerTimeout bounds the short bookkeeping commands (inspect, rm,
 	// volume create) that should answer immediately or not at all.
 	dockerTimeout = 60 * time.Second
@@ -286,8 +303,9 @@ func Preflight() error {
 	return nil
 }
 
-// Sweep removes every container, volume and network still carrying this
-// harness's ownership label, and returns one line per object it destroyed.
+// Sweep removes every container, volume, network and image still carrying
+// this harness's ownership label, and returns one line per object it
+// destroyed.
 //
 // It exists for the abnormal exit: a `go test` killed with SIGKILL, a CI job
 // cancelled mid-run, a laptop that slept through a provision. None of those
@@ -307,7 +325,10 @@ func Sweep() []string {
 	var swept []string
 	// Containers first: a volume or network still attached to a running
 	// container cannot be removed, and `rm -f` on the container releases both.
-	for _, kind := range []string{"container", "volume", "network"} {
+	// Images last for the same reason one step further out: an image a
+	// container still references cannot be removed either, and by this point
+	// every container the harness owns is gone.
+	for _, kind := range []string{"container", "volume", "network", "image"} {
 		for _, name := range listOwned(kind) {
 			// Re-check ownership rather than trusting the listing: removeOwned
 			// is the single place that decides what may be destroyed.
@@ -331,11 +352,20 @@ func listOwned(kind string) []string {
 	defer cancel()
 
 	args := []string{kind, "ls", "--filter", "label=" + ownerLabelArg, "--format", "{{.Name}}"}
-	if kind == "container" {
+	switch kind {
+	case "container":
 		// Only `container ls` needs -a: a stopped leftover is precisely the
 		// case this exists for. It also reports {{.Names}}, not {{.Name}}.
 		args = []string{"container", "ls", "-a",
 			"--filter", "label=" + ownerLabelArg, "--format", "{{.Names}}"}
+	case "image":
+		// Identified by ID rather than by `repository:tag`, because a
+		// harness-built tag that a later build moved elsewhere leaves the
+		// old image behind as `<none>:<none>` — a name `docker rmi` cannot
+		// act on, so a listing by tag would report leftovers it can never
+		// clear. The ID always names exactly one image.
+		args = []string{"image", "ls",
+			"--filter", "label=" + ownerLabelArg, "--format", "{{.ID}}"}
 	}
 	out, code, err := dockerCmd(ctx, args...)
 	if err != nil || code != 0 {
@@ -440,15 +470,15 @@ func lastLine(s string) string {
 
 // ownership reports whether a docker object of that kind and name exists,
 // and whether it carries this harness's ownership label. kind is one of
-// "container", "volume", "network".
+// "container", "volume", "network", "image".
 func ownership(kind, name string) (exists, owned bool) {
 	if name == "" {
 		return false, false
 	}
-	// Where the label lives differs per object: a container keeps it under
-	// .Config, a volume and a network at the top level.
+	// Where the label lives differs per object: a container and an image
+	// keep it under .Config, a volume and a network at the top level.
 	format := `{{index .Labels "` + OwnerLabel + `"}}`
-	if kind == "container" {
+	if kind == "container" || kind == "image" {
 		format = `{{index .Config.Labels "` + OwnerLabel + `"}}`
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
@@ -487,6 +517,12 @@ func removeOwned(kind, name string) {
 		quietDocker("volume", "rm", "-f", name)
 	case "network":
 		quietDocker("network", "rm", name)
+	case "image":
+		// -f because a harness-built image may carry more than one tag (a
+		// rebuilt tag leaves the previous image behind), and `docker rmi`
+		// refuses an image referenced by several repositories without it.
+		// It cannot reach anything unlabeled: ownership() above is the gate.
+		quietDocker("rmi", "-f", name)
 	}
 }
 
@@ -679,11 +715,15 @@ func WithEntrypoint(entrypoint string, argv ...string) Opt {
 // WithImage runs this container from a DIFFERENT image than the one under
 // test, in the same constrained profile.
 //
-// It exists for exactly one row of the B.5 matrix: the upgrade test has to
-// provision a volume with the LAST PUBLISHED image and then start the
-// candidate on it. Nothing else in the suite may use it — a test that
-// silently ran against another image would report a verdict about
-// something the build never produced.
+// It exists for exactly two rows of the B.5 matrix, and for nothing else —
+// a test that silently ran against another image would report a verdict
+// about something the build never produced:
+//
+//   - the upgrade row, which has to provision a volume with the LAST
+//     PUBLISHED image and then start the candidate on it;
+//   - the reuse row, whose subject is an image built FROM the one under
+//     test, so that "a derived image inherits the runtime contract" is
+//     measured on a real derived image rather than asserted in prose.
 func WithImage(ref string) Opt {
 	return func(s *spec) { s.image = strings.TrimSpace(ref) }
 }
@@ -726,6 +766,60 @@ func EnsureImage(t *testing.T, ref string) {
 		t.Fatalf("image %s is not present locally and cannot be pulled (exit %d): %v\n%s",
 			ref, code, err, strings.TrimSpace(out))
 	}
+}
+
+// Build builds contextDir into a harness-owned image tagged ref, and
+// registers its removal with t.Cleanup.
+//
+// It is the one place the suite is allowed to produce an image, and it is
+// NOT a way to build the subject: Preflight refuses to run at all unless
+// the image under test already exists, because a suite that built its own
+// subject could report green about something the release build never
+// produced. What this is for is an image whose whole point is to be
+// derived from that subject (the B.5 reuse row).
+//
+// The ownership label goes on with `--label`, so the image is subject to
+// the same rule as every container, volume and network here: the harness
+// removes what it created and refuses to touch anything else. That matters
+// more for an image than for the rest, because an image is the one docker
+// object a developer is likely to have under a name of their own — hence
+// the requireOwnedOrAbsent guard before the build, which refuses to
+// overwrite a tag this harness did not make.
+//
+// Removal is unconditional, including when the test fails. An image is not
+// evidence: this one's entire content is the Dockerfile the caller just
+// wrote a few lines above, and the diagnosis lives in the container logs
+// the failing test already dumps.
+func Build(t *testing.T, ref, contextDir string) {
+	t.Helper()
+	requireOwnedOrAbsent(t, "image", ref)
+	// Registered BEFORE the build, so an interrupted or partially
+	// successful build cannot leave a tagged image behind. removeOwned is
+	// a no-op for an image that was never created.
+	t.Cleanup(func() { removeOwned("image", ref) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), BuildTimeout)
+	defer cancel()
+	out, code, err := dockerCmd(ctx, "build", "--label", ownerLabelArg, "-t", ref, contextDir)
+	if err != nil || code != 0 {
+		t.Fatalf("docker build -t %s %s: exit %d: %v\n%s",
+			ref, contextDir, code, err, strings.TrimSpace(out))
+	}
+}
+
+// Inspect renders a docker Go template over an object and returns the
+// result trimmed. kind is one of "container", "volume", "network",
+// "image".
+//
+// It is how a test asserts on what the IMAGE declares — the entrypoint,
+// the healthcheck, the volumes, the environment, the OCI labels — rather
+// than on what happens to work at runtime. Those are the parts of the
+// runtime contract that have no observable behaviour to test: an image
+// that lost its HEALTHCHECK still starts and still serves the domain, and
+// only an inspect notices.
+func Inspect(t *testing.T, kind, name, format string) string {
+	t.Helper()
+	return strings.TrimSpace(mustDocker(t, kind, "inspect", "-f", format, name))
 }
 
 // StartDC starts the image under test in the constrained profile and

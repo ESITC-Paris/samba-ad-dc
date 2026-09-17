@@ -16,9 +16,9 @@ are tied together:
   does not. The **doc section** column below is the reverse index: for
   each row, the guide section that documents that use case.
   The row set and the test IDs did not change when the column was
-  filled in; they were the same 17 Phase 3 froze. **N9** and **N10** are
-  the rows added since, both in Phase 6, each together with the test that
-  covers it.
+  filled in; they were the same 17 Phase 3 froze. **N9**, **N10** and
+  **R2** are the rows added since, all three in Phase 6, each together
+  with the test that covers it.
 
 The rows come from **B.5 “Documented use cases → E2E matrix”** in
 `docs/adaptation-profile.md`. The mapping is **one row ↔ one test ID**,
@@ -67,6 +67,7 @@ reviewer's job.
 | **N9** — declarative `[global]` options (`SAMBA_GLOBAL_OPTIONS`): applied, reconciled on restart, refused when samba's parser rejects them | `TestGlobalOptionsApplied` | `test/e2e/config_test.go` | [deployment §3.5 Declarative `[global]` settings](deployment-guide.md#35-declarative-global-settings) |
 | **N10** — operator-supplied LDAPS material (`SAMBA_TLS_CERT_FILE` / `SAMBA_TLS_KEY_FILE` / `SAMBA_TLS_CA_FILE`): served and verified by a client trusting only that CA; incomplete trio and unusable file refused | `TestCustomTLSMaterial` | `test/e2e/tls_test.go` | [deployment §4.5 Bring your own certificate](deployment-guide.md#bring-your-own-certificate) |
 | **R1** — additional-DC join with bidirectional directory replication, verified by object propagation both ways | `TestJoinReplicationBothWays` | `test/e2e/replication_test.go` | [deployment §5 Scale-out: an additional DC](deployment-guide.md#5-scale-out-an-additional-domain-controller) |
+| **R2** — reuse: an image built `FROM` this one inherits the whole runtime contract — ENTRYPOINT, HEALTHCHECK, VOLUME, ENV and the OCI labels — and inherits the refusals with it | `TestDerivedImageInheritsContract` | `test/e2e/derived_test.go` | [reuse §2 Deriving an image](reuse-guide.md#deriving-an-image) *(written by the next commit of this phase; until it lands the clause lives in [adaptation profile B.5](adaptation-profile.md#b5-documented-use-cases--e2e-matrix-82), which is where the citation sits)* |
 | **O1** — idempotent restart without state loss | `TestIdempotentRestart` | `test/e2e/operational_test.go` | [deployment §3.4 Switch to `SAMBA_MODE=run`](deployment-guide.md#34-switch-to-samba_moderun-and-why) |
 | **O2** — offline backup **and** restore into a fresh instance, with object-level verification | `TestOfflineBackupRestore` | `test/e2e/operational_test.go` | [deployment §7 Backup and restore runbook](deployment-guide.md#7-backup-and-restore-runbook) |
 | **O3** — upgrade from the last published tag of the branch, data intact (§8.3) | `TestUpgradeFromLastPublished` | `test/e2e/operational_test.go` | [update §3 Patch update, step by step](update-guide.md#3-patch-update-step-by-step) |

@@ -236,7 +236,13 @@ by unsetting the three variables, with the incomplete trio, the file that is
 not there and the key at the wrong mode refused (`TestCustomTLSMaterial`).
 Additional-DC join with
 bidirectional directory replication verified by object propagation both
-ways. Operational: idempotent restart without state loss; offline backup
+ways; and a derived image inherits the runtime contract — an image built
+`FROM` this one, adding nothing but a file and an environment variable,
+provisions a domain and reaches this image's own health verdict, reports
+the same `entrypoint --version`, still declares the same ENTRYPOINT,
+HEALTHCHECK, VOLUME set, `KRB5_CONFIG` and OCI labels, and still refuses
+`SAMBA_MODE=run` on a volume holding no domain with exit 21
+(`TestDerivedImageInheritsContract`). Operational: idempotent restart without state loss; offline backup
 AND restore into a fresh instance with object-level verification; upgrade
 from the last published tag of the branch with data intact; explicit
 downgrade refusal. Negative: missing secret file fails fast with an
@@ -1561,3 +1567,37 @@ gates.
   material on demand at start (measured) and LDAPS comes back up on it.
   Without that, a DC that once had the variables would have named a mount
   that is gone for ever, since `SAMBA_GLOBAL_OPTIONS` refuses those keys.
+
+- 2026-09-17: Phase 6 — **the derived-image proof.** B.5 gains the clause
+  "a derived image inherits the runtime contract" and
+  `docs/traceability.md` row **R2**
+  (`TestDerivedImageInheritsContract`). Reuse was the one promise of this
+  phase with no test behind it, and it is the promise most easily broken
+  without noticing, because everything a derived image inherits is
+  inherited SILENTLY: a downstream `Dockerfile` mentions neither the
+  healthcheck, nor the volumes, nor tini, nor `KRB5_CONFIG`, nor the
+  refusals — until the day it adds an `ENTRYPOINT` or a `VOLUME` of its
+  own and the result still starts, still serves the domain, and has
+  quietly stopped being a domain controller docker can supervise. The
+  test builds the smallest possible derived image (one `COPY`, one `ENV`,
+  `FROM` the image the run is testing), provisions a domain on it, and
+  asserts both halves: the declarations, read back with `docker inspect`,
+  and the behaviour — `entrypoint --version` identical to the base's, and
+  `SAMBA_MODE=run` on an empty volume still exit 21. Both halves are
+  needed; an image can declare every line correctly and still ship an
+  entrypoint that behaves differently.
+
+  The E2E harness gains what that required, under the same ownership rule
+  as everything else it creates: it may now BUILD an image, labelled
+  `e2e.harness=1`, removed in `t.Cleanup` whether the test passed or
+  failed, and swept by label on the next run if the process died without
+  teardown. Building is still forbidden for the *subject* — `Preflight`
+  refuses to run unless the image under test already exists, because a
+  suite that built its own subject could report green about something the
+  release build never produced. Its `--label` also means the suite can
+  never `docker rmi` an image a developer tagged themselves.
+
+  The reuse row's **doc section** points at `docs/reuse-guide.md`, which
+  the next commit of this phase writes; until then the clause it links to
+  lives in B.5 above, which is also where the test ID is cited so that
+  `scripts/check-traceability.sh` holds at 20 ↔ 20 in the interim.
