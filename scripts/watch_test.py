@@ -370,11 +370,23 @@ class DecisionTable(unittest.TestCase):
             "empty digest": (observation(runtime_digest=""), None),
             "soaking": (observation(latest_patch="4.24.8"), None),
         }
+        checked = []
         for name, (obs, st) in cases.items():
             decision = decide(obs, st=st)
             if decision["action"] != "none":
                 continue
+            checked.append(name)
             self.assertEqual(decision["state"], {}, name)
+        # That `continue` is deliberate — a row of the table may legitimately
+        # stop deciding `none`, and this test is not the place that pins
+        # which rows do. But it also means the assertion is skipped silently,
+        # so a change that moved EVERY row off `none` would leave the
+        # invariant asserted against nothing and still report a pass. The
+        # test has to have looked at something.
+        self.assertTrue(
+            checked,
+            "no case decided `none`, so the pin invariant was never "
+            "exercised: this test would have passed vacuously")
 
     def test_a_first_observation_still_takes_an_upstream_release(self):
         # No prior observation is not an excuse to sit on a new upstream
