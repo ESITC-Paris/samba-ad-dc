@@ -121,7 +121,10 @@ func newFakeRunner() *fakeRunner {
 		// What testparm answers on a provisioned DC. Scripted by default
 		// so that every supervision test runs the ordinary path; the
 		// chrony-configuration tests override it.
-		output:    map[string]string{"testparm": provisionedSigndDir + "\n"},
+		output: map[string]string{
+			"testparm":       provisionedSigndDir + "\n",
+			"testparm check": validTestparmDump,
+		},
 		outputErr: map[string]error{},
 	}
 }
@@ -142,7 +145,32 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) error
 
 func (f *fakeRunner) Output(ctx context.Context, name string, args ...string) (string, error) {
 	f.record(call{kind: "output", name: name, args: args, ctx: ctx})
+	if k := outputKey(name, args); f.hasOutput(k) {
+		return f.output[k], f.outputErr[k]
+	}
 	return f.output[name], f.outputErr[name]
+}
+
+// hasOutput reports whether a call-specific answer is scripted for k.
+func (f *fakeRunner) hasOutput(k string) bool {
+	_, out := f.output[k]
+	_, err := f.outputErr[k]
+	return out || err
+}
+
+// outputKey distinguishes the two testparm invocations, which ask samba two
+// different questions and must be allowed two different answers: reading ONE
+// parameter back (chrony's signing socket) and checking the WHOLE file (the
+// SAMBA_GLOBAL_OPTIONS gate). Scripts keyed by the bare binary name still
+// answer both, so the tests written before the second call existed are
+// unaffected.
+func outputKey(name string, args []string) string {
+	for _, a := range args {
+		if strings.HasPrefix(a, "--parameter-name=") {
+			return name + " parameter"
+		}
+	}
+	return name + " check"
 }
 
 func (f *fakeRunner) Start(ctx context.Context, name string, args ...string) (Proc, error) {
@@ -222,6 +250,22 @@ driftfile /var/lib/samba/chrony/drift
 pidfile /run/chrony/chronyd.pid
 local stratum 10
 `
+
+// validTestparmDump is what `testparm -s -l --debug-stdout` prints for a file
+// samba accepts: the configuration echoed back, and nothing before it. The
+// gate reads the lines BEFORE the dump, so "nothing before it" is the part
+// that matters — see testparmDiagnostics.
+const validTestparmDump = "# Global parameters\n[global]\n\trealm = AD.EXAMPLE.COM\n"
+
+// deprecatedParameterWarning is what samba prints for a parameter it still
+// accepts but no longer likes — measured in the image under test:
+//
+//	lpcfg_do_global_parameter: WARNING: The "syslog only" option is deprecated
+//
+// testparm exits 0 and loads the file. A gate that read "WARNING" as a
+// verdict would refuse to boot a domain controller whose configuration samba
+// is perfectly happy with.
+const deprecatedParameterWarning = `lpcfg_do_global_parameter: WARNING: The "syslog only" option is deprecated`
 
 // testSecret is the sentinel that must never reach a log or an error.
 const testSecret = "hunter2"
@@ -2192,9 +2236,9 @@ func TestEnsureGlobalOptionsRestoresTheFileWhenTestparmRefusesIt(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newFakeRunner()
-			r.output["testparm"] = tc.output
-			r.outputErr["testparm"] = tc.outputErr
-			e, _ := newTestExecutor(t, r)
+			r.output["testparm check"] = tc.output
+			r.outputErr["testparm check"] = tc.outputErr
+			e, logBuf := newTestExecutor(t, r)
 			original := writeSMBConf(t, e.SMBConfPath)
 
 			ref := e.ensureGlobalOptions(context.Background(), globalOptionsConfig(config.ModeRun))
@@ -2219,7 +2263,54 @@ func TestEnsureGlobalOptionsRestoresTheFileWhenTestparmRefusesIt(t *testing.T) {
 			if got := readFile(t, e.SMBConfPath); got != string(original) {
 				t.Errorf("smb.conf was not restored:\nwant\n%s\ngot\n%s", original, got)
 			}
+			// And the log must not claim a change that was rolled back: an
+			// operator reading it for what is in force would be misled by an
+			// "added" line describing bytes no longer on the volume.
+			if strings.Contains(logBuf.String(), "added") || strings.Contains(logBuf.String(), "replaced") {
+				t.Errorf("the refused boot announced an edit it rolled back:\n%s", logBuf.String())
+			}
 		})
+	}
+}
+
+// TestEnsureGlobalOptionsDoesNotRefuseADeprecationWarning is the other half of
+// the gate, and the more dangerous one to get wrong: samba prints a WARNING
+// for a parameter it still accepts, and treating that as a verdict would
+// refuse to boot a domain controller over a configuration samba loads without
+// complaint. The warning belongs in the log, not in an exit code.
+func TestEnsureGlobalOptionsDoesNotRefuseADeprecationWarning(t *testing.T) {
+	r := newFakeRunner()
+	r.output["testparm check"] = deprecatedParameterWarning + "\n" + validTestparmDump
+	e, logBuf := newTestExecutor(t, r)
+	writeSMBConf(t, e.SMBConfPath)
+
+	cfg := globalOptionsConfig(config.ModeRun, config.GlobalOption{Key: "syslog only", Value: "no"})
+	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+		t.Fatalf("a deprecation warning refused the boot: %d: %s", ref.Code, ref.Msg)
+	}
+	if !strings.Contains(readFile(t, e.SMBConfPath), "syslog only = no") {
+		t.Errorf("the setting was rolled back:\n%s", readFile(t, e.SMBConfPath))
+	}
+	// Logged, both of them: what samba said, and what was written.
+	if !strings.Contains(logBuf.String(), "is deprecated") {
+		t.Errorf("testparm's warning never reached the log:\n%s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), `added "syslog only" = "no"`) {
+		t.Errorf("the edit was not announced:\n%s", logBuf.String())
+	}
+}
+
+// A file samba accepts produces no diagnostics at all, so the gate must add
+// nothing to the log beyond the edit itself.
+func TestEnsureGlobalOptionsSaysNothingExtraWhenTestparmIsSilent(t *testing.T) {
+	e, logBuf := newTestExecutor(t, newFakeRunner())
+	writeSMBConf(t, e.SMBConfPath)
+
+	if ref := e.ensureGlobalOptions(context.Background(), globalOptionsConfig(config.ModeRun)); ref != nil {
+		t.Fatalf("unexpected refusal: %s", ref.Msg)
+	}
+	if strings.Contains(logBuf.String(), "testparm says") {
+		t.Errorf("the gate invented a warning out of a clean run:\n%s", logBuf.String())
 	}
 }
 
@@ -2286,7 +2377,7 @@ func TestExecuteStartAppliesGlobalOptionsBeforeTheDaemons(t *testing.T) {
 
 func TestExecuteStartRefusesWhenTestparmRejectsTheOptions(t *testing.T) {
 	r := newFakeRunner()
-	r.output["testparm"] = "Unknown parameter encountered: \"this is not a parameter\"\n"
+	r.output["testparm check"] = "Unknown parameter encountered: \"this is not a parameter\"\n"
 	e, _ := newTestExecutor(t, r)
 	original := writeSMBConf(t, e.SMBConfPath)
 

@@ -469,6 +469,15 @@ func (e *Executor) ensureJoinedConf(cfg *config.Config) *config.Refusal {
 // took effect on a freshly provisioned domain would be a setting nobody can
 // change on a DC that already exists — which is every DC past its first day.
 //
+// It ADDS and REPLACES; it does not remove. Dropping an entry from the
+// variable leaves the line it wrote in smb.conf, because nothing here can
+// tell a line this code wrote last boot from one the operator wrote by hand,
+// and deleting somebody else's configuration on a guess is worse than leaving
+// a stale setting behind. The documented remedy is to give the setting the
+// value you want — samba's default, spelled out — or to edit the file on the
+// volume. (Runtime contract, Declarative configuration; deployment guide
+// §3.5.)
+//
 // Maintenance mode is deliberately not among its callers (see Execute): an
 // operator reaching for it is diagnosing a DC that will not run, and a mode
 // that edited the configuration on the way past would change the very thing
@@ -515,10 +524,17 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 			"the [global] settings SAMBA_GLOBAL_OPTIONS declares cannot be written into %q (%s); mount /etc/samba read-write",
 			e.SMBConfPath, oneLine(err.Error()))
 	}
+	// The gate first, the announcements after it: the log must record what
+	// the domain controller is actually running with. A boot that announced
+	// "replaced max log size" and then put the previous file back would leave
+	// an operator reading their log for a setting that is not in force.
+	if ref := e.checkSMBConf(ctx, original); ref != nil {
+		return ref
+	}
 	for _, a := range announcements {
 		e.logf("%s", a)
 	}
-	return e.checkSMBConf(ctx, original)
+	return nil
 }
 
 // checkSMBConf asks testparm whether the file that was just rewritten is a
@@ -531,28 +547,53 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 // offending variable. Refusing with the file already back to what it held
 // means the remedy is exactly "fix the variable and start again".
 //
-// Two failure shapes have to be caught, and only one of them shows up in an
-// exit code (both measured against samba 4.24.7 in this image):
+// What counts as a rejection is MEASURED, not guessed, because both mistakes
+// are expensive: missing a real error lets a silently-ignored setting through,
+// and reading a harmless remark as an error refuses to boot a domain
+// controller whose configuration is fine. Every line below was produced by
+// `testparm -s -l --debug-stdout` against samba 4.24.7 in this image:
 //
-//   - an unknown parameter prints `Unknown parameter encountered: "..."` and
-//     testparm still exits 0. The exit code alone would let a typo through,
-//     and a [global] setting that silently does nothing is precisely what
-//     this variable exists to prevent.
-//   - an invalid value for a real parameter prints `WARNING: Ignoring invalid
-//     value ...` and exits 1.
+//	Unknown parameter encountered: "this is not a parameter"      exit 0
+//	Ignoring unknown parameter "this is not a parameter"          exit 0
+//	WARNING: Ignoring invalid value 'bogus' for parameter 'smb encrypt'   exit 1
+//	set_variable_helper(notanumber): value is not a valid size specifier! exit 1
+//	lpcfg_do_global_parameter: WARNING: The "syslog only" option is deprecated   exit 0
 //
-// Both diagnostics are DEBUG output, which samba writes to stderr by default
-// — where Output deliberately does not capture it (see Runner.Output) — so
+// The last one is why a keyword like "WARNING" cannot be the test: a
+// deprecated-but-accepted parameter — `syslog only`, `lanman auth`, `domain
+// logons` and a dozen others in 4.24 — prints it, exits 0, and is a
+// configuration samba loads happily. It is logged and the boot continues.
+//
+// So the verdict is: a non-zero exit, or the unknown-parameter shape, which
+// is the one real error that exits 0 (and the exact case an operator's typo
+// produces). Everything else testparm says is passed on to the log.
+//
+// The diagnostics are DEBUG output, which samba writes to stderr by default —
+// where Output deliberately does not capture it (see Runner.Output) — so
 // `--debug-stdout` moves them onto the stream this can read. testparm's own
 // banner stays on stderr and still reaches the container log.
 func (e *Executor) checkSMBConf(ctx context.Context, original []byte) *config.Refusal {
 	out, err := e.Runner.Output(ctx, e.Bin.Testparm, testparmCheckArgs(e.SMBConfPath)...)
-	problem := testparmProblem(out)
+	diagnostics := testparmDiagnostics(out)
+
+	problem := ""
+	for _, d := range diagnostics {
+		if testparmRejects(d) {
+			problem = d
+			break
+		}
+	}
 	if err == nil && problem == "" {
+		// Accepted. Whatever testparm still had to say — a deprecation
+		// warning, most often — is the operator's business and reaches
+		// their log, but it is not a reason to refuse their DC.
+		for _, d := range diagnostics {
+			e.logf("SAMBA_GLOBAL_OPTIONS: testparm says: %s", d)
+		}
 		return nil
 	}
 	if problem == "" {
-		problem = oneLine(err.Error())
+		problem = testparmCause(diagnostics, err)
 	}
 
 	if rerr := writeFileAtomic(e.SMBConfPath, original, 0o644); rerr != nil {
@@ -565,32 +606,58 @@ func (e *Executor) checkSMBConf(ctx context.Context, original []byte) *config.Re
 		problem, e.SMBConfPath)
 }
 
-// testparmProblem returns the first line of a testparm run that reports a
-// problem with the configuration, or "" when there is none.
+// testparmDiagnostics returns everything testparm printed BEFORE the dump of
+// the configuration, one line each, whitespace collapsed.
 //
-// Only the lines BEFORE the dump are considered: with `-s` everything from
-// `# Global parameters` on is the configuration being echoed back, and a
-// parameter whose VALUE happens to contain one of these words must not be
-// read as an error. Within those lines a keyword is still required rather
-// than treating any output as a problem: this decides whether a container
-// boots, and a future samba printing one extra informational line to stdout
-// must not turn into a domain controller that refuses to start.
-func testparmProblem(out string) string {
+// The cut at the dump is what makes this safe to read: with `-s` everything
+// from `# Global parameters` on is the configuration being echoed back, so a
+// parameter whose VALUE happens to read like an error message cannot be
+// mistaken for one.
+func testparmDiagnostics(out string) []string {
+	var diagnostics []string
 	for _, line := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(line)
 		if t == "" {
 			continue
 		}
 		if strings.HasPrefix(t, "#") || strings.HasPrefix(t, "[") {
-			return ""
+			break
 		}
-		for _, marker := range []string{"Unknown parameter", "Ignoring", "ERROR", "Error", "WARNING"} {
-			if strings.Contains(t, marker) {
-				return oneLine(t)
-			}
+		diagnostics = append(diagnostics, oneLine(t))
+	}
+	return diagnostics
+}
+
+// testparmRejects reports whether one diagnostic line means the configuration
+// is unusable EVEN THOUGH testparm exited 0. There is exactly one such shape
+// (see checkSMBConf for the measurements): a parameter samba does not know,
+// which it announces and then ignores — leaving the operator with a setting
+// that silently does nothing, the failure this whole variable exists to
+// prevent.
+func testparmRejects(line string) bool {
+	return strings.Contains(line, "Unknown parameter encountered") ||
+		strings.Contains(line, "Ignoring unknown parameter")
+}
+
+// testparmCause picks the line to quote when testparm exited non-zero.
+//
+// Deprecation warnings are skipped rather than quoted: they are printed
+// first, before the line that actually failed the run (measured on a file
+// carrying both), so quoting the first diagnostic would name the wrong
+// parameter in the refusal an operator has to act on.
+func testparmCause(diagnostics []string, err error) string {
+	for _, d := range diagnostics {
+		if !strings.Contains(d, "is deprecated") {
+			return d
 		}
 	}
-	return ""
+	if err != nil {
+		return oneLine(err.Error())
+	}
+	if len(diagnostics) > 0 {
+		return diagnostics[0]
+	}
+	return "no diagnostic"
 }
 
 // chronyConfig generates the configuration chronyd will actually read and
@@ -1040,10 +1107,16 @@ func testparmArgs(smbConf, parameter string) []string {
 	return []string{"-s", "-l", "--parameter-name=" + parameter, smbConf}
 }
 
-// testparmCheckArgs builds the command line that validates the WHOLE file
-// instead of reading one parameter out of it: same `-s -l` and the same
-// explicit file, no `--parameter-name`, because what is wanted here is not a
-// value but samba's verdict on the configuration it is about to be given.
+// testparmCheckArgs builds the command line that asks samba to PARSE the
+// whole file instead of reading one parameter out of it: same `-s -l` and the
+// same explicit file, no `--parameter-name`.
+//
+// A parse verdict is all it is, and deliberately so: `-l` skips the global
+// logic checks — which verify that the directories smb.conf names already
+// exist, and this runs before the daemons create them — so a green answer
+// means "samba can load this file", not "this configuration is correct".
+// Validating the deployment is somebody else's job; what this gate owes the
+// operator is that the file their variable produced is one samba can read.
 //
 // `--debug-stdout` is added for this call only, and it is load-bearing rather
 // than cosmetic: it is what puts the diagnostics where checkSMBConf can read

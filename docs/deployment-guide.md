@@ -489,11 +489,12 @@ DC's `[global]` section goes into **`SAMBA_GLOBAL_OPTIONS`**, one
         log level = 1 auth:3
 ```
 
-Blank lines and lines starting with `#` are ignored; spacing and case in
-the key do not matter; a key set twice keeps its last value and says so in
-the log. A line that is not a `key = value` pair is refused with exit 10
-rather than skipped, because an option that silently never reaches
-`smb.conf` is invisible until the day it was supposed to matter.
+Blank lines and comment lines — starting with `#` or `;`, smb.conf's own two
+comment characters — are ignored; spacing and case in the key do not matter;
+a key set twice keeps its last value and says so in the log. A line that is
+not a `key = value` pair is refused with exit 10 rather than skipped,
+because an option that silently never reaches `smb.conf` is invisible until
+the day it was supposed to matter.
 
 **It is reconciled on every start, not only at provision time.** Edit the
 variable and recreate the container; the entrypoint rewrites `[global]`
@@ -505,6 +506,13 @@ entrypoint: SAMBA_GLOBAL_OPTIONS: replaced "max log size" = "20000" in /etc/samb
 
 A start that changes nothing writes nothing and says nothing. Maintenance
 mode applies none of it.
+
+**Removing an entry does not remove the setting.** The reconciliation adds
+and replaces; it never deletes, because it cannot tell a line it wrote last
+boot from one you put in `smb.conf` yourself. To undo a setting, give it the
+value you want — samba's default, written out explicitly, e.g.
+`max log size = 5000` — or edit `/etc/samba/smb.conf` on the configuration
+volume.
 
 **What you put here reaches the running DC.** The image health-checks
 itself by probing DNS, LDAP and SMB on the loopback address (§6.1), and the
@@ -520,8 +528,8 @@ variables), and `server role`, `dns update command`, `ntp signd socket
 directory` and `include`, which the image manages itself.
 
 **Every rewrite is checked by samba's own parser.** The entrypoint runs
-`testparm` over the result; if it complains, your previous `smb.conf` is
-written back and the container refuses to start with exit 10, quoting
+`testparm` over the result; if it rejects the file, your previous `smb.conf`
+is written back and the container refuses to start with exit 10, quoting
 testparm:
 
 > `testparm rejects the [global] settings SAMBA_GLOBAL_OPTIONS declares
@@ -533,6 +541,15 @@ testparm:
 Putting the file back is what makes the failure recoverable: `smb.conf`
 lives on a volume, so a rejected rewrite left in place would break every
 later start — including the one you make right after fixing the variable.
+The edit is announced in the log only once the check has passed, so what you
+read there is what the DC is running with.
+
+A *warning* is not a rejection. A parameter samba still accepts but has
+deprecated — `syslog only`, `lanman auth` and friends — makes testparm
+print `WARNING: The "…" option is deprecated` and load the file anyway; the
+entrypoint copies that line to the container log and carries on. What stops
+a boot is a parameter samba does not know at all, or a value it cannot
+parse.
 (*Covered by:* `TestGlobalOptionsApplied`.)
 
 ---

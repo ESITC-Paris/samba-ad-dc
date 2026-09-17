@@ -625,8 +625,9 @@ each own one setting. Everything else an operator may legitimately want in
 `[global]` — `log level`, `max log size`, an `idmap config` line — goes into
 this one variable, as newline-separated `key = value` entries (a compose `|`
 block scalar is the intended form). Blank lines and lines starting with `#`
-or `;` are ignored; keys are normalized to lower case and single spaces; a
-key set twice keeps its last value and the repetition is logged. A line that
+or `;` — smb.conf's own two comment characters — are ignored; keys are
+normalized to lower case and single spaces; a key set twice keeps its last
+value and the repetition is logged. A line that
 is not a `key = value` pair is refused with exit 10 rather than skipped — an
 option that silently never reaches `smb.conf` is invisible until the day it
 was supposed to matter.
@@ -661,19 +662,37 @@ settings are configuration, reconciled on every start, which is what makes
 variable and recreating the container is the whole procedure, and the log
 says what changed.
 
+*Reconciliation adds and replaces; it does not remove.* Deleting an entry
+from the variable leaves the line it wrote in `smb.conf`, because the
+entrypoint has no way to tell a setting it wrote last boot from one the
+operator put there by hand, and guessing wrong would silently drop somebody
+else's configuration. To undo a setting, give it the value you want —
+samba's default, written out explicitly — or edit `/etc/samba/smb.conf` on
+the configuration volume.
+
 *Every rewrite is gated by samba's own parser.* After a rewrite the
 entrypoint runs `testparm -s -l --debug-stdout <smb.conf>`; if it reports a
 problem, the **previous bytes are written back** and the boot refuses with
-exit 10, quoting testparm's own first line. The restore is the point:
-`smb.conf` lives on a volume, so a rejected rewrite left in place would
-break every later start, including the one made right after removing the
-offending entry. Both failure shapes are caught, and only one of them shows
-up in an exit code (measured against Samba 4.24.7 in this image): an unknown
-parameter prints `Unknown parameter encountered: "…"` and **exits 0**, while
-an invalid value for a real parameter prints `WARNING: Ignoring invalid
-value …` and exits 1. Both are DEBUG output, which samba writes to stderr —
-hence `--debug-stdout`, which is what makes the diagnostic readable by the
-entrypoint. *Covered by:* `TestGlobalOptionsApplied`.
+exit 10, quoting testparm's own words. The edit is announced only after the
+gate passes, so the log records what is in force and never a change that was
+rolled back. The restore is the point: `smb.conf` lives on a volume, so a
+rejected rewrite left in place would break every later start, including the
+one made right after removing the offending entry.
+
+What counts as a rejection is measured against Samba 4.24.7 in this image,
+because the obvious reading of testparm's output is wrong in both
+directions. An unknown parameter prints `Unknown parameter encountered: "…"`
+and **exits 0**, so the exit code alone would let a typo through; an invalid
+value prints `WARNING: Ignoring invalid value …` and exits 1. But a
+*deprecated yet perfectly valid* parameter — `syslog only`, `lanman auth`,
+`domain logons` and others — prints `WARNING: The "…" option is
+deprecated` and also exits 0, so treating `WARNING` as a verdict would
+refuse to boot a DC whose configuration samba loads without complaint. The rule is therefore:
+a non-zero exit, or the unknown-parameter line. Everything else testparm
+says is copied to the container log and the boot continues. All of it is
+DEBUG output, which samba writes to stderr — hence `--debug-stdout`, which
+is what makes the diagnostics readable by the entrypoint.
+*Covered by:* `TestGlobalOptionsApplied`.
 
 **`KRB5_CONFIG` is set in the image** to
 `/var/lib/samba/private/krb5.conf`, the Kerberos configuration both

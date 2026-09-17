@@ -43,6 +43,13 @@ const smbConfPath = "/etc/samba/smb.conf"
 // alone, so the same run proves both halves — a change applied and an
 // unchanged setting left untouched.
 //
+// Every value here is deliberately NOT samba's default, and that is the whole
+// discriminating power of the provision half of this test. The defaults in
+// this image, measured with `testparm --parameter-name` on a configuration
+// that sets neither, are `max log size = 5000` and `deadtime = 10080`; a test
+// that declared those would read them back from a DC that ignored the
+// variable entirely and still pass.
+//
 // Both are also read back FAITHFULLY by testparm, which not every parameter
 // is: `log level` would have been the obvious second setting, but testparm
 // sets its own debug level on its own command line, so it reports `1`
@@ -50,11 +57,16 @@ const smbConfPath = "/etc/samba/smb.conf"
 // testparm, not on the DC.
 const (
 	maxLogSizeKey    = "max log size"
-	maxLogSizeFirst  = "5000"
-	maxLogSizeSecond = "10000"
+	maxLogSizeFirst  = "4000"
+	maxLogSizeSecond = "8000"
 
 	deadtimeKey   = "deadtime"
-	deadtimeValue = "10080"
+	deadtimeValue = "20160"
+
+	// The samba defaults the values above must differ from, named here so
+	// that a future edit which happens to pick one is obvious.
+	maxLogSizeDefault = "5000"
+	deadtimeDefault   = "10080"
 )
 
 // globalOptionsWorstCase is what this test can consume if every budget is
@@ -102,6 +114,15 @@ func globalSetting(t *testing.T, container, key string) string {
 //     including the one made right after removing the offending line.
 func TestGlobalOptionsApplied(t *testing.T) {
 	requireDeadline(t, globalOptionsWorstCase)
+	// The provision half below asserts that samba reads the declared values
+	// back. That assertion is only worth anything while the values differ
+	// from what a DC would report having never seen the variable, so the
+	// premise is checked rather than trusted to a comment.
+	if maxLogSizeFirst == maxLogSizeDefault || maxLogSizeSecond == maxLogSizeDefault || deadtimeValue == deadtimeDefault {
+		t.Fatalf("this test declares a samba default (%s=%s/%s, %s=%s): it would pass against an "+
+			"image that ignored SAMBA_GLOBAL_OPTIONS entirely",
+			maxLogSizeKey, maxLogSizeFirst, maxLogSizeSecond, deadtimeKey, deadtimeValue)
+	}
 	net := harness.Network(t)
 
 	// A comment and a blank line are part of the input on purpose: the
