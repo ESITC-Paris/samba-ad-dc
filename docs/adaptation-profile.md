@@ -697,11 +697,44 @@ each own one setting. Everything else an operator may legitimately want in
 this one variable, as newline-separated `key = value` entries (a compose `|`
 block scalar is the intended form). Blank lines and lines starting with `#`
 or `;` — smb.conf's own two comment characters — are ignored; keys are
-normalized to lower case and single spaces; a key set twice keeps its last
-value and the repetition is logged. A line that
+normalized to lower case and single spaces for what is written. A line that
 is not a `key = value` pair is refused with exit 10 rather than skipped — an
 option that silently never reaches `smb.conf` is invisible until the day it
 was supposed to matter.
+
+*Parameter names are matched the way samba matches them.* Samba compares them
+ignoring case **and all whitespace** (`strwicmp`), measured against Samba
+4.24.7 in this image: a `[global]` holding `maxlogsize = 4000`, the same name
+in mixed case with doubled spaces, `TLSCertFile = /x/cert.pem` and `ServerRole
+= standalone server` is echoed back by `testparm -s` as `max log size`, `tls
+certfile` and `server role`, exit 0. Every comparison the entrypoint makes
+therefore uses that form: the owned-key table below, the last-occurrence-wins
+rule (a key set twice — under any spelling — keeps its last value and the
+repetition is logged), and recognising the line already in `smb.conf`, so a
+declared `maxlogsize` replaces an existing `max log size` line instead of
+adding a second one. What is written, and what a message quotes, stays the
+spelling the operator used.
+
+*A parameter name may only use the charset a parameter name uses:* letters,
+digits, spaces and `: * . _ -` after lower-casing — enough for `idmap config
+* : backend`, which is a real parameter name. Anything else is refused with
+exit 10 naming the line, and the reason is an escape rather than tidiness:
+samba's ini parser treats any line whose first non-blank character is `[` as
+the start of a new **section** and discards what follows the `]`, so a key
+of `[myshare] path` would have ended `[global]` and opened a share on the
+configuration volume. Measured in this image: with a tab-indented `[myshare]
+path = /tmp` after `[global]`, `testparm -s -l --debug-stdout` printed
+`WARNING: No path in service myshare - making it unavailable!`, dumped a
+`[myshare]` section, and **exited 0** with no unknown-parameter line — i.e.
+the gate below would have accepted it and the share would have persisted.
+Values carry no such restriction: a value is written after its key and
+cannot be the first non-blank character of a line (measured: `log file =
+/var/log/[x]/l#z;q` round-trips through `testparm -s` unchanged).
+
+*Values are echoed into the container log, so no secret belongs here.* Every
+applied setting is announced with its value — that is how an operator learns
+which line changed their DC — and the log outlives the container. Secrets
+reach this image as files (`*_FILE`), never as environment values.
 
 *Owned keys are refused, naming their owner.* `realm` (`SAMBA_REALM`),
 `workgroup` (`SAMBA_DOMAIN`), `netbios name` (the container hostname),
@@ -719,12 +752,13 @@ either contradict the variable that owns it or break the DC outright.
 entry to `samba-tool` as `--option=key = value`, so the file it generates
 already carries them; and every start — the one that just provisioned or
 joined included — reconciles them into the `smb.conf` on the configuration
-volume in one atomic rewrite, before any daemon reads it. Each add or replace is one log
-line — `entrypoint: SAMBA_GLOBAL_OPTIONS: added "max log size" = "10000"
-in /etc/samba/smb.conf` — and a start that changes nothing writes nothing
-and says nothing. Maintenance mode applies none of it: an operator reaching
-for it is diagnosing a DC that will not run, and a mode that edited the
-configuration on the way past would change what they are looking at.
+volume in one atomic rewrite, before any daemon reads it. Each add or
+replace is one log line — `entrypoint: SAMBA_GLOBAL_OPTIONS: added "max log
+size" = "10000" in /etc/samba/smb.conf` — and a start that changes nothing
+writes nothing and says nothing. Maintenance mode applies none of it: an
+operator reaching for it is diagnosing a DC that will not run, and a mode
+that edited the configuration on the way past would change what they are
+looking at.
 
 *This is configuration, not state (§6.2).* The state a restart never
 modifies is the directory database on the state volume; the `[global]`
@@ -749,6 +783,28 @@ gate passes, so the log records what is in force and never a change that was
 rolled back. The restore is the point: `smb.conf` lives on a volume, so a
 rejected rewrite left in place would break every later start, including the
 one made right after removing the offending entry.
+
+*The gate covers the first boot too, and there it runs first.* On a
+`provision` or a `join` the settings do not reach an existing file: they are
+handed to `samba-tool` as `--option`, which refuses the whole operation for
+a parameter it cannot parse — measured in this image, `samba-tool domain
+provision --option="nosuchparam = 1"` exits **2** with `Unknown parameter
+encountered: "nosuchparam "` and `error: invalid --option option value
+'nosuchparam = 1': Unable to set parameter`, and creates nothing at all
+(`/etc/samba` was still empty afterwards); `--option="max log size =
+notanumber"` fails the same way with `set_variable_helper(notanumber):
+value is not a valid size specifier!`. All of that goes to **stderr**, which
+the entrypoint streams to the container log and cannot read back, so the
+failure it sees is `exit status 2` — indistinguishable from a provision that
+failed on DNS or on the disk, and reported as the runtime refusal that tells
+an operator their volume may hold partial state. So the declared settings
+are checked **before** samba-tool is called, on a scratch `[global]` holding
+nothing else, and refused with exit 10 while the volume is still empty
+("nothing has been created yet"). After the provision or join succeeds, the
+`smb.conf` samba-tool generated is put through the same `testparm` gate even
+though this start rewrote nothing — that refusal says there is nothing to
+put back, because there is not. No path reaches a running daemon without a
+verdict from samba's own parser.
 
 What counts as a rejection is measured against Samba 4.24.7 in this image,
 because the obvious reading of testparm's output is wrong in both
@@ -1662,3 +1718,27 @@ gates.
   the next commit of this phase writes; until then the clause it links to
   lives in B.5 above, which is also where the test ID is cited so that
   `scripts/check-traceability.sh` holds at 20 ↔ 20 in the interim.
+
+- 2026-09-17: Phase 6 — **`SAMBA_GLOBAL_OPTIONS` key handling, and the gate
+  on the first boot.** Three measured facts, none of them assumed, changed
+  the *Declarative configuration* section above. (1) Samba compares
+  parameter names ignoring case AND all whitespace, so `tlscertfile`,
+  `TLSCertFile` and `tls  cert  file` were all the owned `tls certfile` and
+  all three used to walk straight past the owned-key table, the all-or-none
+  TLS rule and the removal path; every comparison now uses that canonical
+  form, including the one that recognises a line already in `smb.conf`.
+  (2) A parameter name carrying a `[` was not a parameter at all: samba's
+  ini parser reads such a line as a new SECTION and discards the rest, so
+  `[myshare] path = /tmp` in the variable opened a share on the
+  configuration volume — and `testparm` exited 0 with no unknown-parameter
+  line, so the gate accepted it and nothing was rolled back. Parameter
+  names are now restricted to the charset a real one uses, refused at load
+  time with exit 10. (3) On a provision the settings never reached the
+  gate, because they go to `samba-tool` as `--option`: samba-tool refuses
+  them itself (exit 2) but only on stderr, which the entrypoint cannot read
+  back, so a typo in the variable was reported as a runtime failure telling
+  the operator to delete their volume. The declared settings are now
+  checked through `testparm` before samba-tool is called at all, and the
+  file samba-tool generates is checked afterwards even when this start
+  rewrote nothing. `TestGlobalOptionsApplied` gains the provision-time
+  refusal on empty volumes; row **N9** is unchanged.

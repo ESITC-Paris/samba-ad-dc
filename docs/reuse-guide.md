@@ -1,5 +1,12 @@
 # Reuse guide — building a project on this image
 
+<!-- GO-LIVE: delete this comment and the blockquote below at the same time as README's Status block, once the first release is published (docs/operations.md, "Going live: the first publication", step 7). -->
+> **Status: pre-release.** No image has been published yet. The contract
+> below is the contract the code is tested against, but no tag exists on
+> the registry until the watcher's first publication, so every `FROM` and
+> every `image:` naming a published tag in this guide will fail until
+> then.
+
 This image is a **domain controller and nothing else**. It is built to be
 the base another project stands on: a school domain replacing a Windows
 server, a lab, an appliance. This guide is the contract that project
@@ -61,12 +68,22 @@ DC must serve — and defines no other share. Measured on a provisioned DC
 (2026-09-17, `samba-ad-dc:dev`), `smbclient -L` lists exactly `sysvol`,
 `netlogon` and `IPC$`.
 
-`SAMBA_GLOBAL_OPTIONS` cannot add one: it writes `[global]` and nothing
-else, by construction (§3). Adding a share to a DC therefore means
-hand-editing `smb.conf` on the configuration volume — against the advice
-of the people who wrote Samba, on the one host in the domain whose failure
-takes authentication down with it. **Run a domain-member file server
-instead**, as its own container or host, joined to this domain.
+`SAMBA_GLOBAL_OPTIONS` cannot add one, and the construction that stops it
+is a refusal rather than an accident of formatting: the variable writes
+each setting as an indented `key = value` line inside `[global]`, and it
+refuses at load time (exit 10) any parameter name outside the charset a
+real smb.conf parameter uses — letters, digits, spaces and `: * . _ -`, as
+in `idmap config * : backend`. A name carrying a bracket is what would
+otherwise escape: samba's ini parser reads any line whose first non-blank
+character is `[` as a new **section** and discards the rest of the line, so
+`[myshare] path = /tmp` would have opened a share (measured, 2026-09-17:
+`testparm -s` reported `myshare` as a service with no path, and exited 0 —
+so nothing downstream would have refused it either). Adding a share to a DC
+therefore means hand-editing `smb.conf` on the configuration volume —
+against the advice of the people who wrote Samba, on the one host in the
+domain whose failure takes authentication down with it. **Run a
+domain-member file server instead**, as its own container or host, joined
+to this domain.
 
 ### It is not a print server
 
@@ -147,6 +164,12 @@ Pin an immutable `X.Y.Z-rN` tag or a digest, not a branch tag and never
 `latest` — a derived image inherits the base's *content*, so an unpinned
 base makes your build unreproducible
 ([update guide §1](update-guide.md#1-pinning)).
+
+The tag above is an example of the *shape*, not a tag you can pull today:
+no image has been published yet (see the Status block at the top), the
+first one will carry whatever Samba version the watcher publishes, and its
+revision may well be `-r2` rather than `-r1` — a rebuild of the same Samba
+version bumps `rN` without changing `X.Y.Z`.
 
 ### What you inherit, without writing a line of it
 
@@ -281,11 +304,17 @@ to write it, and the only one.
    update command`, `ntp signd socket directory` and `include`, which the
    image manages itself. Design your configuration around the variables,
    not around the file.
-2. **Samba's own parser is the gate.** Every rewrite is checked with
-   `testparm`; a rejected one is rolled back to the previous bytes and the
-   boot refuses with exit 10, quoting testparm. A configuration generator
-   in a downstream project therefore fails *loudly and recoverably*,
-   which is what makes generating this variable safe.
+2. **Samba's own parser is the gate, on every path.** On a restart the
+   rewrite is checked with `testparm`, and a rejected one is rolled back to
+   the previous bytes before the boot refuses with exit 10, quoting
+   testparm. On the **first** boot — a `provision` or a `join` — the same
+   settings are checked *before* samba-tool is asked to create anything, so
+   a bad entry refuses with exit 10 and an empty volume rather than with a
+   half-created domain; the configuration samba-tool then generates is put
+   through the same gate before any daemon starts. A configuration
+   generator in a downstream project therefore fails *loudly and
+   recoverably* at every point, which is what makes generating this
+   variable safe.
 3. **A deprecation warning is not a rejection.** A parameter Samba still
    accepts but has deprecated makes testparm print a `WARNING` and load
    the file anyway; the entrypoint copies that line to the container log
@@ -296,6 +325,17 @@ to write it, and the only one.
    you put in `smb.conf` yourself. To undo a setting, write the value you
    want explicitly. The only exception is the three `tls *` keys of §4,
    which the image owns and therefore removes.
+5. **Never put a secret in it.** Every setting this variable applies is
+   echoed into the container log with its value — that is how an operator
+   finds out which line changed their DC — and the log outlives the
+   container. Secrets reach this image as **files** (§6.1), never as
+   environment values, and a `[global]` parameter whose value is a
+   password does not belong here.
+
+A parameter name is matched the way samba matches it, ignoring case **and**
+all whitespace: `maxlogsize`, `Max Log Size` and `max  log  size` are one
+setting, both for the owned-key refusals of rule 1 and for recognising the
+line already in `smb.conf`.
 
 (*Covered by:* `TestGlobalOptionsApplied`.)
 
@@ -517,9 +557,13 @@ services:
     container_name: dc1
     hostname: dc1
     environment:
-      # `provision` on the very first boot, to create the domain; `run`
-      # for every boot after that (deployment guide §3.4).
-      SAMBA_MODE: run
+      # FIRST BOOT ONLY. `provision` creates the domain; once it exists,
+      # change this to `run` and recreate the container. The two failures
+      # this avoids are both loud and both one-line: `run` on empty
+      # volumes exits 21 (no state to start), and `provision` left here
+      # exits 20 on every later start (the volume is already
+      # initialized) — deployment guide §3.4.
+      SAMBA_MODE: provision
       SAMBA_REALM: AD.EXAMPLE.COM
       SAMBA_DOMAIN: AD
       SAMBA_DNS_FORWARDER: 192.0.2.53
@@ -585,6 +629,11 @@ networks:
         - subnet: 192.0.2.0/24
           gateway: 192.0.2.1
 ```
+
+The `init` service waits on `service_healthy`, so on that first
+`docker compose up` it runs against the domain `dc1` has just provisioned.
+Switch `SAMBA_MODE` to `run` before the next one: nothing re-runs the
+provision, but leaving it there costs every later start an exit 20.
 
 `seed.sh` is the project's, not this image's:
 

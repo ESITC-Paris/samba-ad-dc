@@ -490,11 +490,32 @@ DC's `[global]` section goes into **`SAMBA_GLOBAL_OPTIONS`**, one
 ```
 
 Blank lines and comment lines — starting with `#` or `;`, smb.conf's own two
-comment characters — are ignored; spacing and case in the key do not matter;
-a key set twice keeps its last value and says so in the log. A line that is
-not a `key = value` pair is refused with exit 10 rather than skipped,
-because an option that silently never reaches `smb.conf` is invisible until
-the day it was supposed to matter.
+comment characters — are ignored. A line that is not a `key = value` pair is
+refused with exit 10 rather than skipped, because an option that silently
+never reaches `smb.conf` is invisible until the day it was supposed to
+matter.
+
+Parameter names are matched the way samba matches them: ignoring case **and
+all whitespace**, so `maxlogsize`, `Max Log Size` and `max  log  size` are
+one and the same setting. A key set twice — under any of those spellings —
+keeps its last value and says so in the log, and a key whose spelling
+differs from the line already in `smb.conf` replaces that line instead of
+adding a second one.
+
+A parameter **name** may only use what a real smb.conf parameter uses:
+letters, digits, spaces and `: * . _ -` (as in `idmap config * : backend`).
+Anything else is refused with exit 10, naming the line. The refusal is not
+tidiness: samba's ini parser reads any line whose first non-blank character
+is `[` as the start of a new **section**, discarding the rest of the line,
+so a key like `[myshare] path` would have closed `[global]` and opened a
+share on the configuration volume — and testparm would have accepted the
+result, so nothing later would have caught it. Values are not restricted
+this way: a value is written after its key, where it cannot start a line.
+
+**Never put a secret in this variable.** Each applied setting is echoed
+into the container log with its value (that is the announcement below), and
+the log outlives the container. Secrets are files in this image (§3.2), and
+this variable is not one.
 
 **It is reconciled on every start, not only at provision time.** Edit the
 variable and recreate the container; the entrypoint rewrites `[global]`
@@ -539,17 +560,39 @@ directory` and `include`, which the image manages itself.
 is written back and the container refuses to start with exit 10, quoting
 testparm:
 
-> `testparm rejects the [global] settings SAMBA_GLOBAL_OPTIONS declares
-> (Unknown parameter encountered: "this is not a parameter");
-> /etc/samba/smb.conf has been put back to what it held before this start,
-> so fix or remove the offending entry in SAMBA_GLOBAL_OPTIONS and start
-> the container again`
+> `testparm rejects the [global] section this start wrote from
+> SAMBA_GLOBAL_OPTIONS (Unknown parameter encountered: "this is not a
+> parameter"); /etc/samba/smb.conf has been put back to what it held before
+> this start, so fix or remove the offending entry in SAMBA_GLOBAL_OPTIONS
+> and start the container again`
 
 Putting the file back is what makes the failure recoverable: `smb.conf`
 lives on a volume, so a rejected rewrite left in place would break every
 later start — including the one you make right after fixing the variable.
 The edit is announced in the log only once the check has passed, so what you
 read there is what the DC is running with.
+
+**On the first boot the check comes before anything is created.** A
+`provision` hands the declared settings to `samba-tool` as `--option`, and
+samba-tool refuses the whole operation for a parameter it cannot parse —
+with exit 2, and on stderr, which the container log shows you but the
+entrypoint cannot read back. So the entrypoint checks the declared settings
+through `testparm` *first*, on their own, and refuses with exit 10 before
+the domain exists:
+
+> `testparm rejects the [global] settings SAMBA_GLOBAL_OPTIONS declares
+> (Unknown parameter encountered: "nosuchparam"); fix or remove the
+> offending entry in SAMBA_GLOBAL_OPTIONS and start the container again —
+> nothing has been created yet`
+
+The volume is still empty when that fires: fix the variable and start
+again, with nothing to delete and nothing to recreate. A `join` is checked
+the same way and for a sharper reason — a join creates a domain controller
+account on a *remote* DC, so a refusal afterwards would leave your domain
+carrying a DC this container then declines to start. Either way, the
+`smb.conf` samba-tool generates then goes through the same gate before any
+daemon starts, so no path reaches a running DC without a verdict from
+samba's own parser.
 
 A *warning* is not a rejection. A parameter samba still accepts but has
 deprecated — `syslog only`, `lanman auth` and friends — makes testparm

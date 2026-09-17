@@ -26,7 +26,7 @@ repository is licensed Apache-2.0 (see `LICENSE`).
 
 ## Status
 
-<!-- GO-LIVE: delete this comment and the blockquote below once the first release is published (docs/operations.md, "Going live: the first publication", step 7). -->
+<!-- GO-LIVE: delete this comment and the blockquote below once the first release is published (docs/operations.md, "Going live: the first publication", step 7). The same blockquote and marker are at the top of docs/reuse-guide.md and docs/windows-client-validation.md: remove all three in the same commit, or a published image will still be documented as unavailable. -->
 > **Status: pre-release.** No image has been published yet. The contract
 > documented below is the contract the code is tested against, but no tag
 > exists on the registry until the watcher's first publication, so every

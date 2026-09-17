@@ -1,5 +1,11 @@
 # Windows-client validation (out of band)
 
+<!-- GO-LIVE: delete this comment and the blockquote below at the same time as README's Status block, once the first release is published (docs/operations.md, "Going live: the first publication", step 7). -->
+> **Status: pre-release.** No image has been published yet, so the
+> procedure below has to be run against an image you built yourself (or
+> against the first published tag, once it exists); every command here
+> naming a published tag will fail until then.
+
 > **Not executed by this project's CI.** A real Windows-client domain join
 > is a stated limitation — profile
 > [B.6](adaptation-profile.md#b6-known-limitations-stated-per-124), SPEC
