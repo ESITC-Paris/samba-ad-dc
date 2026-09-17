@@ -2199,6 +2199,33 @@ func TestEnsureGlobalOptionsReplacesAChangedValue(t *testing.T) {
 	}
 }
 
+// TestEnsureGlobalOptionsReplacesALineSpelledWithoutSpaces is C1 on the
+// reconcile side. Samba matches parameter names ignoring whitespace as well
+// as case (measured — see config.CanonicalKey), so `max log size = 5000`
+// already in smb.conf and a declared `maxlogsize = 4000` are ONE setting.
+// Matching on the spaced form alone would append the second and leave two
+// lines for one parameter, with the file's own order — not the operator's
+// variable — deciding which one samba keeps.
+func TestEnsureGlobalOptionsReplacesALineSpelledWithoutSpaces(t *testing.T) {
+	e, _ := newTestExecutor(t, newFakeRunner())
+	if err := os.WriteFile(e.SMBConfPath, []byte("[global]\n\tmax log size = 5000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := globalOptionsConfig(config.ModeRun, config.GlobalOption{Key: "maxlogsize", Value: "4000"})
+	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+		t.Fatalf("unexpected refusal: %s", ref.Msg)
+	}
+
+	conf := readFile(t, e.SMBConfPath)
+	if strings.Count(conf, "4000") != 1 || strings.Contains(conf, "5000") {
+		t.Errorf("the existing line was not replaced:\n%s", conf)
+	}
+	if strings.Count(conf, "=") != 1 {
+		t.Errorf("one parameter ended up on two lines:\n%s", conf)
+	}
+}
+
 // TestEnsureGlobalOptionsRestoresTheFileWhenTestparmRefusesIt is the reason
 // the gate exists at all. An option samba cannot parse is not a degraded DC,
 // it is a DC that will not start — and the configuration file lives on a
@@ -2714,6 +2741,17 @@ func TestWithoutGlobalSetting(t *testing.T) {
 		{
 			name:        "whatever its spacing and case",
 			conf:        "[global]\n\tTLS   KeyFile   =   /k.pem\n\trealm = A\n",
+			key:         "tls keyfile",
+			want:        "[global]\n\trealm = A\n",
+			wantRemoved: true,
+		},
+		{
+			// Samba ignores whitespace INSIDE a parameter name, so a
+			// hand-written `tlskeyfile` is the very same setting and has to
+			// go with the rest when the SAMBA_TLS_* variables are unset —
+			// otherwise the DC keeps pointing at a mount that is gone.
+			name:        "whatever whitespace it does without",
+			conf:        "[global]\n\ttlskeyfile = /k.pem\n\trealm = A\n",
 			key:         "tls keyfile",
 			want:        "[global]\n\trealm = A\n",
 			wantRemoved: true,

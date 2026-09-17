@@ -525,6 +525,35 @@ func TestLoadGlobalOptions(t *testing.T) {
 			value: "\n  \n# only a comment\n",
 			want:  nil,
 		},
+		{
+			// Samba compares parameter names ignoring ALL whitespace, so
+			// `maxlogsize` and `max log size` are ONE setting and the second
+			// must shadow the first rather than produce two lines that
+			// contradict each other (measured: see CanonicalKey).
+			name:  "a repeated key is recognised whatever its spacing",
+			value: "maxlogsize = 4000\nlog level = 2\nmax log size = 5000\n",
+			want: []GlobalOption{
+				{Key: "log level", Value: "2"},
+				{Key: "max log size", Value: "5000"},
+			},
+			// The announcement quotes the spelling of the line that
+			// displaced the earlier one; samba sees one name either way.
+			wantShadowed: []string{"max log size"},
+		},
+		{
+			// The charset refusal below must not cost the one real parameter
+			// name that carries punctuation.
+			name:  "a key may carry the punctuation samba parameter names use",
+			value: "idmap config * : backend = tdb",
+			want:  []GlobalOption{{Key: "idmap config * : backend", Value: "tdb"}},
+		},
+		{
+			// A value is written after the key on the line, so nothing in it
+			// can open a section; samba echoes it back unchanged (measured).
+			name:  "a value keeps punctuation samba has no opinion about",
+			value: "log file = /var/log/[x]/l#z;q",
+			want:  []GlobalOption{{Key: "log file", Value: "/var/log/[x]/l#z;q"}},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := Load(envMap(map[string]string{"SAMBA_GLOBAL_OPTIONS": tc.value}))
@@ -631,6 +660,56 @@ func TestLoadGlobalOptionsRefusals(t *testing.T) {
 			name:            "an owned key is recognised whatever its spacing and case",
 			value:           "DNS    Forwarder = 10.0.0.53",
 			wantMsgContains: []string{"dns forwarder", "SAMBA_DNS_FORWARDER"},
+		},
+		{
+			name:            "an owned key written without any spaces at all",
+			value:           "tlscertfile = /tls/cert.pem",
+			wantMsgContains: []string{"tlscertfile", "SAMBA_TLS_CERT_FILE"},
+		},
+		{
+			name:            "an owned key in camel case",
+			value:           "TLSCertFile = /tls/cert.pem",
+			wantMsgContains: []string{"tlscertfile", "SAMBA_TLS_CERT_FILE"},
+		},
+		{
+			name:            "an owned key with spaces samba ignores",
+			value:           "tls  cert  file = /tls/cert.pem",
+			wantMsgContains: []string{"tls cert file", "SAMBA_TLS_CERT_FILE"},
+		},
+		{
+			name:            "include in upper case",
+			value:           "INCLUDE = /etc/samba/extra.conf",
+			wantMsgContains: []string{"include", "image"},
+		},
+		{
+			name:            "server role written as one word",
+			value:           "serverrole = standalone server",
+			wantMsgContains: []string{"serverrole", "image"},
+		},
+		{
+			name:            "dns update command with doubled spaces",
+			value:           "dns  update  command = /usr/bin/nsupdate",
+			wantMsgContains: []string{"dns update command", "image"},
+		},
+		{
+			name:            "a key opening a section",
+			value:           "[myshare] path = /tmp",
+			wantMsgContains: []string{"SAMBA_GLOBAL_OPTIONS", "[myshare] path"},
+		},
+		{
+			name:            "a key closing a section",
+			value:           "x] path = /tmp",
+			wantMsgContains: []string{"SAMBA_GLOBAL_OPTIONS", "x] path"},
+		},
+		{
+			name:            "a key carrying a comment character",
+			value:           "foo#bar = 1",
+			wantMsgContains: []string{"SAMBA_GLOBAL_OPTIONS", "foo#bar"},
+		},
+		{
+			name:            "a key carrying the other comment character",
+			value:           "a;b = 1",
+			wantMsgContains: []string{"SAMBA_GLOBAL_OPTIONS", "a;b"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

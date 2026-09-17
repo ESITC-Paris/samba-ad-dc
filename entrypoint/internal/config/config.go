@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -229,7 +230,7 @@ func Load(getenv func(string) string) (*Config, error) {
 		cfg.MaintenanceOp = op
 	}
 
-	opts, shadowed, err := parseGlobalOptions(get(envGlobalOptions))
+	opts, shadowed, err := parseGlobalOptions(get(EnvGlobalOptions))
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +284,7 @@ func Load(getenv func(string) string) (*Config, error) {
 // SAMBA_GLOBAL_OPTIONS) and by the loader below, so the two can never drift
 // apart and name different things to the same operator.
 const (
-	envGlobalOptions = "SAMBA_GLOBAL_OPTIONS"
+	EnvGlobalOptions = "SAMBA_GLOBAL_OPTIONS"
 
 	EnvTLSCertFile = "SAMBA_TLS_CERT_FILE"
 	EnvTLSKeyFile  = "SAMBA_TLS_KEY_FILE"
@@ -349,6 +350,84 @@ var globalOptionOwners = map[string]string{
 	"include":                    ownerImage,
 }
 
+// canonicalGlobalOptionOwners is globalOptionOwners keyed the way samba
+// compares parameter names, so that a lookup cannot be evaded by spelling.
+// It is derived from the table above rather than written out a second time:
+// two hand-maintained lists of owned keys would eventually disagree, and the
+// one that disagreed would be the one that lets a key through.
+var canonicalGlobalOptionOwners = func() map[string]string {
+	owners := make(map[string]string, len(globalOptionOwners))
+	for key, owner := range globalOptionOwners {
+		owners[CanonicalKey(key)] = owner
+	}
+	return owners
+}()
+
+// ownerOfGlobalOption reports what owns key, if anything, comparing it the
+// way samba's own parser does.
+func ownerOfGlobalOption(key string) (string, bool) {
+	owner, owned := canonicalGlobalOptionOwners[CanonicalKey(key)]
+	return owner, owned
+}
+
+// globalOptionKeyPattern is the charset one declared parameter name may use,
+// applied to the lower-cased, space-collapsed form.
+//
+// It exists for one specific escape, and it is a CRITICAL boundary rather
+// than tidiness. The settings are written into smb.conf as `\tkey = value`
+// lines under [global], and samba's ini parser treats any line whose first
+// non-blank character is `[` as the start of a new SECTION, discarding
+// whatever follows the closing `]`. So a key of `[myshare] path` does not
+// declare a parameter at all: it ends [global] and opens a share.
+//
+// Measured in this image (samba 4.24.7), with a file holding `[global]`,
+// `workgroup = EXAMPLE` and a tab-indented `[myshare] path = /tmp`,
+// `testparm -s -l --debug-stdout` printed
+//
+//	WARNING: No path in service myshare - making it unavailable!
+//	NOTE: Service myshare is flagged unavailable.
+//
+// and exited 0, with a `[myshare]` section in its dump and the `path = /tmp`
+// gone. Exit 0 and no unknown-parameter line is exactly what checkSMBConf
+// treats as ACCEPTED — so the boot would have continued, and the share would
+// have persisted on the configuration volume. The only place to stop it is
+// here, before anything is written.
+//
+// The charset is what real smb.conf parameter names use: letters, digits,
+// spaces, and the punctuation of `idmap config * : backend`, which is a
+// genuine parameter name and must keep working. `#` and `;` are excluded
+// with the brackets — they start a comment when they open a line, and
+// nothing legitimate needs them in a name.
+//
+// VALUES are deliberately not restricted this way. A value is written after
+// the key, so it cannot be the first non-blank character of its line and
+// cannot open a section; measured in the same image, `log file =
+// /var/log/[x]/l#z;q` round-tripped through `testparm -s` unchanged.
+var globalOptionKeyPattern = regexp.MustCompile(`^[a-z0-9 :*._-]+$`)
+
+// CanonicalKey renders one smb.conf parameter name the way samba COMPARES
+// them: case-folded with every space removed.
+//
+// Samba matches parameter names with strwicmp, which ignores whitespace as
+// well as case, and this was measured rather than taken on faith. In this
+// image (samba 4.24.7), a `[global]` holding `maxlogsize = 4000`, `MAX  LOG
+// size = 4000`, `TLSCertFile = /x/cert.pem` and `ServerRole = standalone
+// server` was echoed back by `testparm -s -l --debug-stdout` as `max log size
+// = 4000`, `tls certfile = /x/cert.pem` and `server role = standalone
+// server`, exit 0.
+//
+// Everything that decides whether two names are THE SAME setting therefore
+// has to compare this form: the owned-key table above (or `tlscertfile` would
+// bypass SAMBA_TLS_CERT_FILE and the all-or-none TLS rule), the
+// last-occurrence-wins rule below, and run.withGlobalSetting /
+// run.withoutGlobalSetting when they recognise a line already in smb.conf.
+// What is WRITTEN and what is printed to the operator stays the spelling they
+// used: samba understands it, and a message quoting something they never
+// typed is a message they cannot search their configuration for.
+func CanonicalKey(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), ""))
+}
+
 // parseGlobalOptions turns the SAMBA_GLOBAL_OPTIONS block into the settings
 // the entrypoint will reconcile into smb.conf, and refuses everything it
 // cannot make sense of.
@@ -387,14 +466,32 @@ func parseGlobalOptions(value string) ([]GlobalOption, []string, error) {
 				"SAMBA_GLOBAL_OPTIONS contains the line %q, which sets no parameter name; write one `key = value` smb.conf setting per line, for example `max log size = 10000`",
 				entry)
 		}
-		if owner, owned := globalOptionOwners[key]; owned {
+		if !globalOptionKeyPattern.MatchString(key) {
+			return nil, nil, Refuse(CodeConfigError,
+				"SAMBA_GLOBAL_OPTIONS contains the line %q, whose parameter name %q is not one samba could read as a [global] setting; an smb.conf parameter name is made of letters, digits, spaces and the characters : * . _ - (as in `idmap config * : backend`), and a name carrying a bracket would open a new section instead of setting a parameter; write one `key = value` setting per line, for example `max log size = 10000`",
+				entry, key)
+		}
+		if owner, owned := ownerOfGlobalOption(key); owned {
 			return nil, nil, globalOptionRefusal(key, owner)
 		}
+		value := normalizeSpace(rawValue)
+		// Defensive: the block was split on "\n" and normalizeSpace drops
+		// every other whitespace character, so no value can carry a line
+		// break by the time it gets here. A second line in a value would be a
+		// second smb.conf directive nobody declared, which is the same escape
+		// the key charset above exists to close, so it is asserted rather
+		// than assumed.
+		if strings.ContainsAny(value, "\n\r") {
+			return nil, nil, Refuse(CodeConfigError,
+				"SAMBA_GLOBAL_OPTIONS contains the line %q, whose value carries a line break; write one `key = value` setting per line",
+				entry)
+		}
 
-		opt := GlobalOption{Key: key, Value: normalizeSpace(rawValue)}
-		if i := indexGlobalOption(opts, key); i >= 0 {
+		opt := GlobalOption{Key: key, Value: value}
+		canonical := CanonicalKey(key)
+		if i := indexGlobalOption(opts, canonical); i >= 0 {
 			opts = append(opts[:i], opts[i+1:]...)
-			if !containsString(shadowed, key) {
+			if !containsKey(shadowed, canonical) {
 				shadowed = append(shadowed, key)
 			}
 		}
@@ -530,7 +627,7 @@ func OptionSource(key string) string {
 	case tlsCAFileKey:
 		return EnvTLSCAFile
 	default:
-		return envGlobalOptions
+		return EnvGlobalOptions
 	}
 }
 
@@ -697,30 +794,34 @@ func isAre(names []string) string {
 }
 
 // indexGlobalOption returns the position of key in opts, or -1.
-func indexGlobalOption(opts []GlobalOption, key string) int {
+func indexGlobalOption(opts []GlobalOption, canonical string) int {
 	for i, o := range opts {
-		if o.Key == key {
+		if CanonicalKey(o.Key) == canonical {
 			return i
 		}
 	}
 	return -1
 }
 
-// containsString reports whether values holds want.
-func containsString(values []string, want string) bool {
-	for _, v := range values {
-		if v == want {
+// containsKey reports whether keys already holds a name samba would consider
+// the same one as canonical.
+func containsKey(keys []string, canonical string) bool {
+	for _, k := range keys {
+		if CanonicalKey(k) == canonical {
 			return true
 		}
 	}
 	return false
 }
 
-// normalizeSpace collapses the whitespace of one smb.conf key or value, so
-// that spacing never decides whether two settings are the same one. It is the
-// same normalization run.withGlobalSetting applies when it reads an existing
-// smb.conf back, and the two must stay identical or an option would be
-// rewritten on every single start.
+// normalizeSpace collapses the whitespace of one smb.conf key or value so
+// that what is WRITTEN is one tidy line whatever the block scalar carried. It
+// is the same normalization run.normalize applies to a value read back out of
+// smb.conf, and the two must stay identical or an option would be rewritten
+// on every single start.
+//
+// It is not what decides whether two parameter NAMES are the same one: samba
+// ignores whitespace entirely there, which is CanonicalKey's job.
 func normalizeSpace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }

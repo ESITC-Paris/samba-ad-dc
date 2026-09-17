@@ -1247,6 +1247,12 @@ const (
 func withGlobalSetting(conf, key, value string) (string, confEdit) {
 	lines := strings.Split(conf, "\n")
 	entry := "\t" + key + " = " + value
+	// Samba ignores whitespace as well as case inside a parameter name
+	// (measured — see config.CanonicalKey), so an existing `tlskeyfile` line
+	// IS the `tls keyfile` being set. Matching on the spaced form alone would
+	// append a second line for one parameter and leave the file's own order
+	// deciding which of the two samba keeps.
+	canonical := config.CanonicalKey(key)
 
 	section := ""
 	globalAt := -1
@@ -1266,7 +1272,7 @@ func withGlobalSetting(conf, key, value string) (string, confEdit) {
 			continue
 		}
 		k, v, ok := strings.Cut(t, "=")
-		if !ok || !strings.EqualFold(normalize(k), key) {
+		if !ok || config.CanonicalKey(k) != canonical {
 			continue
 		}
 		if normalize(v) == value {
@@ -1314,6 +1320,9 @@ func withGlobalSetting(conf, key, value string) (string, confEdit) {
 func withoutGlobalSetting(conf, key string) (string, bool) {
 	lines := strings.Split(conf, "\n")
 	out := make([]string, 0, len(lines))
+	// Same whitespace-insensitive match as withGlobalSetting, and for the
+	// same reason: a hand-written `tlskeyfile` is the setting being removed.
+	canonical := config.CanonicalKey(key)
 
 	section := ""
 	removed := false
@@ -1324,7 +1333,7 @@ func withoutGlobalSetting(conf, key string) (string, bool) {
 		case strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]"):
 			section = strings.ToLower(strings.TrimSpace(t[1 : len(t)-1]))
 		case section == "global":
-			if k, _, ok := strings.Cut(t, "="); ok && strings.EqualFold(normalize(k), key) {
+			if k, _, ok := strings.Cut(t, "="); ok && config.CanonicalKey(k) == canonical {
 				removed = true
 				continue
 			}
@@ -1337,8 +1346,12 @@ func withoutGlobalSetting(conf, key string) (string, bool) {
 	return strings.Join(out, "\n"), true
 }
 
-// normalize collapses the whitespace of one smb.conf key or value so that
-// spacing never decides whether a setting is recognized.
+// normalize collapses the whitespace of one smb.conf VALUE, so that spacing
+// never decides whether the value already in the file is the declared one. It
+// is the same normalization config.normalizeSpace applies to what is written.
+//
+// Parameter NAMES are not compared this way: samba ignores whitespace inside
+// them entirely, which is config.CanonicalKey.
 func normalize(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
