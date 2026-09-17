@@ -185,7 +185,7 @@ func tlsEnv(cert, key, ca string) map[string]string {
 // LDAPS with the operator's certificate, and a trio that is incomplete or
 // points at a file that is not there refuses the boot.
 //
-// Four things are asserted, and none of them alone would be enough:
+// Five things are asserted, and none of them alone would be enough:
 //
 //   - samba's own parser reads the three paths back out of the smb.conf on
 //     the configuration volume — the image applied them;
@@ -197,7 +197,12 @@ func tlsEnv(cert, key, ca string) map[string]string {
 //     answer, and the same client verifying against a CA that did not sign
 //     it does not — the chain is genuinely being checked;
 //   - a path that is not mounted exits 11 naming the variable, and a trio
-//     missing one variable exits 10 naming the one to set.
+//     missing one variable exits 10 naming the one to set;
+//   - a private key at any mode but 0600 exits 11 before any daemon starts.
+//     That last one is not this image's rule but samba's, it is exact (0400
+//     is refused as surely as 0644) and it is fatal — samba refuses to start
+//     its LDAP server and terminates the DC, citing CVE-2013-4476. Measured;
+//     see the profile's *Bring your own TLS material*.
 func TestCustomTLSMaterial(t *testing.T) {
 	requireDeadline(t, customTLSWorstCase)
 	net := harness.Network(t)

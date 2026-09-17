@@ -185,11 +185,13 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.P
 
 	// The operator's own LDAPS material is checked before anything shells
 	// out, because provision names those paths on samba-tool's command line
-	// and every start writes them into smb.conf. A path that is not there has
-	// to stop the boot with one clear line here; left to samba it would not
-	// stop anything, since a file it cannot use sends it back to its own
-	// self-signed material — a container that comes up healthy serving a
-	// certificate nobody vouched for.
+	// and every start writes them into smb.conf — so by the time samba has an
+	// opinion, the volume has been claimed. Leaving it to samba is no good in
+	// either direction: a key at the wrong permissions makes it terminate the
+	// whole server twenty lines into its own output (measured — see
+	// config.tlsKeyMode), and what it does with a path that is simply not
+	// there has not been measured at all. One line naming the variable and
+	// the path, before anything is created, beats both.
 	//
 	// Maintenance is excluded for the same reason it applies no [global]
 	// settings at all (see ensureGlobalOptions): it starts no listener, and
