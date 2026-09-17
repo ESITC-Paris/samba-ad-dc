@@ -1,7 +1,7 @@
 #!/bin/sh
 # Prove SPEC §8.2 / §10.6 traceability structurally: the E2E test
-# functions, the rows of docs/traceability.md and the test IDs the three
-# guides cite are the same set.
+# functions, the rows of docs/traceability.md and the test IDs the prose
+# documents cite are the same set.
 #
 #   sh scripts/check-traceability.sh [traceability.md] [e2e-dir] [guides-root]
 #
@@ -26,23 +26,22 @@
 #       two — both of which keep the name sets identical while breaking
 #       the "one row <-> one test" mapping §8.2 requires.
 #
-# And the §10.6 side — the guides:
+# And the §10.6 side — the prose:
 #
-#   (f) every mapped ID is CITED by at least one of the three guides
-#       (README.md, docs/deployment-guide.md, docs/update-guide.md), and
-#       every test name the guides cite is a mapped ID or an exempt
-#       infrastructure test. §10.6 wants every guide section to name the
-#       test that covers it; a documented behaviour nothing cites is a
-#       promise with no test attached, and a citation naming a test that
-#       is not in the matrix is a reader sent to something that may not
-#       exist at all.
+#   (f) every mapped ID is CITED by at least one of the documents listed
+#       in GUIDES below, and every test name those documents cite is a
+#       mapped ID or an exempt infrastructure test. §10.6 wants every
+#       guide section to name the test that covers it; a documented
+#       behaviour nothing cites is a promise with no test attached, and a
+#       citation naming a test that is not in the matrix is a reader sent
+#       to something that may not exist at all.
 #
 #       A CITATION is a backticked WHOLE test ID — the token
-#       `Test<name>` — anywhere in a guide file: in a "*Covered by:*"
-#       line, in a section-to-test table, or in running prose. The three
-#       guides word it differently and both forms count; what is checked
-#       is the ID, not the sentence around it. The backticks are load
-#       bearing: they are what makes `TestProvision` a different token
+#       `Test<name>` — anywhere in one of those files: in a
+#       "*Covered by:*" line, in a section-to-test table, or in running
+#       prose. They word it differently and every form counts; what is
+#       checked is the ID, not the sentence around it. The backticks are
+#       load bearing: they are what makes `TestProvision` a different token
 #       from `TestProvisionOverStateRefused` instead of a prefix of it.
 #
 # The check is STRUCTURAL. It cannot tell whether a test exercises what
@@ -64,17 +63,32 @@ repo_root=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 
 # All three inputs are overridable so the check can be run against a
 # mutated copy of any side: a checker nobody has ever seen fail is not
-# known to work. GUIDES_ROOT is a directory holding the three guides at
+# known to work. GUIDES_ROOT is a directory holding the GUIDES files at
 # their usual paths, so a mutation test copies the files it wants to
 # break and points the check at the copy.
 MAP=${1:-$repo_root/docs/traceability.md}
 E2E_DIR=${2:-$repo_root/test/e2e}
 GUIDES_ROOT=${3:-$repo_root}
 
-# The §10.6 guides, relative to GUIDES_ROOT. Adding a guide means adding
-# it here — a guide absent from this list is one whose citations nothing
-# checks, in either direction.
+# Every document that cites a test ID, relative to GUIDES_ROOT. Adding
+# one means adding it here — a document absent from this list is one
+# whose citations nothing checks, in either direction, and check (f)
+# would report every ID only it cites as uncited.
+#
+# The first three are the §10.6 guides, which is what §10.6 is about:
+# a guide section that documents a behaviour names the test proving it.
+# The last two are not guides and are not held to that requirement, but
+# they cite test IDs in the same backticked form — operations.md names
+# the upgrade test when it explains why a drill skipped it,
+# adaptation-profile.md names the tests behind its measurements — and an
+# unchecked citation rots exactly the same way wherever it lives: a
+# renamed test leaves a reader chasing a function that no longer exists.
+# Listing them here buys the reverse direction for those two files; it
+# also makes the forward direction (every mapped ID cited somewhere)
+# easier to satisfy, which is why the §10.6 anchors in docs/traceability.md
+# — not this check — remain what ties an ID to a guide SECTION.
 GUIDES="README.md docs/deployment-guide.md docs/update-guide.md"
+GUIDES="$GUIDES docs/operations.md docs/adaptation-profile.md"
 
 # Test functions that are NOT B.5 rows. They test the suite, not the
 # image: TestMain is the entry point (preflight, sweep, teardown) and
@@ -91,10 +105,10 @@ if [ ! -d "$E2E_DIR" ]; then
 	echo "error: e2e directory not found: $E2E_DIR" >&2
 	exit 1
 fi
-# A missing guide is fatal rather than skipped: check (f) run over two of
-# the three guides would report every ID cited only by the third as
-# uncited, and — worse the other way round — a renamed guide would quietly
-# stop being checked at all.
+# A missing document is fatal rather than skipped: check (f) run over a
+# subset would report every ID cited only by the missing one as uncited,
+# and — worse the other way round — a renamed file would quietly stop
+# being checked at all.
 for g in $GUIDES; do
 	if [ ! -f "$GUIDES_ROOT/$g" ]; then
 		echo "error: guide not found: $GUIDES_ROOT/$g" >&2
@@ -162,8 +176,8 @@ rows=$(awk '
 # because a longer-named one is.
 #
 # Unlike the map, the whole file is read rather than its table rows: a
-# guide cites a test wherever it documents the behaviour, which is mostly
-# prose. Nothing in these three files names a Go function for any other
+# document cites a test wherever it describes the behaviour, which is
+# mostly prose. Nothing in these files names a Go function for any other
 # reason, so there is no prose to protect from the extraction here.
 set --
 for g in $GUIDES; do
@@ -228,7 +242,7 @@ fi
 # document the behaviour (or fail to), and a reader has no way to reach
 # the test that proves it.
 comm -23 "$tmp/ids" "$tmp/cited" >"$tmp/uncited"
-report "test ID(s) in $MAP that no guide cites (add a \`TestX\` citation to the section that documents it)" \
+report "test ID(s) in $MAP that no document in GUIDES cites (add a \`TestX\` citation to the section that documents it)" \
 	"$tmp/uncited"
 
 # A citation naming something that is not a mapped ID and not exempt: a
@@ -236,7 +250,7 @@ report "test ID(s) in $MAP that no guide cites (add a \`TestX\` citation to the 
 # reference the reader cannot check.
 sort -u "$tmp/ids" "$tmp/exempt" >"$tmp/known"
 comm -13 "$tmp/known" "$tmp/cited" >"$tmp/invented"
-report "test name(s) cited by a guide that no row of $MAP names (fix the citation, or add the row)" \
+report "test name(s) cited by a document in GUIDES that no row of $MAP names (fix the citation, or add the row)" \
 	"$tmp/invented"
 
 if [ "$failures" -ne 0 ]; then
@@ -255,7 +269,7 @@ fi
 # side, test functions found in the tree on another, backticked citations
 # scraped out of the guides on a third — so printing them is printing the
 # agreement, not the same number three times.
-printf 'traceability ok: %s matrix row(s) <-> %s test function(s) <-> %s distinct ID(s) cited across %s guide(s), %s infrastructure test(s) exempt\n' \
+printf 'traceability ok: %s matrix row(s) <-> %s test function(s) <-> %s distinct ID(s) cited across %s document(s), %s infrastructure test(s) exempt\n' \
 	"$rows" "$(wc -l <"$tmp/mapped" | tr -d ' ')" \
 	"$(wc -l <"$tmp/cited" | tr -d ' ')" "$guides" \
 	"$(wc -l <"$tmp/exempt" | tr -d ' ')"
