@@ -814,7 +814,7 @@ silently trusted.
 |---|---|
 | `0` | success |
 | `10` | configuration error |
-| `11` | missing/unreadable secret file |
+| `11` | secret material missing, unreadable, or (the TLS private key) not mode `0600` and owned by the container user |
 | `20` | provision/join refused over existing state |
 | `21` | run mode with absent state |
 | `22` | downgrade refusal |
