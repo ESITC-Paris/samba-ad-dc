@@ -9,9 +9,10 @@ are tied together:
   answers to a documented use case. An untested feature is an
   undocumented feature, hence unsupported.
 - **§10.6** requires every guide section to carry a reference to the E2E
-  test that covers it. The three guides now exist — `README.md`
-  (§10.1), `docs/deployment-guide.md` (§10.2) and `docs/update-guide.md`
-  (§10.3) — and each carries its citations inline; the two `docs/`
+  test that covers it. The guides exist — `README.md` (§10.1),
+  `docs/deployment-guide.md` (§10.2), `docs/update-guide.md` (§10.3) and
+  `docs/reuse-guide.md`, the contract a downstream project builds on
+  (Phase 6) — and each carries its citations inline; the three `docs/`
   guides close with a *Section → test map* table as well, the README
   does not. The **doc section** column below is the reverse index: for
   each row, the guide section that documents that use case.
@@ -30,9 +31,9 @@ The Go function names in `test/e2e/*_test.go` **are** the traceability
 IDs. They are a published contract, not an implementation detail:
 
 - **Do not rename a test function.** A rename silently breaks every
-  reference to it — in this file, in the three guides, and in any
-  postmortem or issue that cites a failing test by name. Check (f) of
-  the script catches the guides; nothing catches a postmortem.
+  reference to it — in this file, in the guides, and in any postmortem
+  or issue that cites a failing test by name. Check (f) of the script
+  catches the guides; nothing catches a postmortem.
 - **Do not delete a test without deleting its B.5 row**, and do not add
   a B.5 row without adding its test. Either half alone is a matrix gap,
   which §8.2 requires to be documented as a limitation (§12.4).
@@ -41,8 +42,9 @@ IDs. They are a published contract, not an implementation detail:
 `scripts/check-traceability.sh` enforces exactly this, and runs in CI's
 `lint` job. Its check (f) extends the same discipline to the guides, in
 both directions: every ID in the table below is cited by at least one
-guide, and every backticked `` `Test…` `` token in the three guides is
-either a row of the table or one of the exempt infrastructure tests.
+of the documents the script lists, and every backticked `` `Test…` ``
+token in those documents is either a row of the table or one of the
+exempt infrastructure tests.
 Matching is on the whole backticked ID — `TestProvision` is a prefix of
 `TestProvisionOverStateRefused`, and a substring match would report the
 shorter one as cited whenever the longer one is.
@@ -67,7 +69,7 @@ reviewer's job.
 | **N9** — declarative `[global]` options (`SAMBA_GLOBAL_OPTIONS`): applied, reconciled on restart, refused when samba's parser rejects them | `TestGlobalOptionsApplied` | `test/e2e/config_test.go` | [deployment §3.5 Declarative `[global]` settings](deployment-guide.md#35-declarative-global-settings) |
 | **N10** — operator-supplied LDAPS material (`SAMBA_TLS_CERT_FILE` / `SAMBA_TLS_KEY_FILE` / `SAMBA_TLS_CA_FILE`): served and verified by a client trusting only that CA; incomplete trio and unusable file refused | `TestCustomTLSMaterial` | `test/e2e/tls_test.go` | [deployment §4.5 Bring your own certificate](deployment-guide.md#bring-your-own-certificate) |
 | **R1** — additional-DC join with bidirectional directory replication, verified by object propagation both ways | `TestJoinReplicationBothWays` | `test/e2e/replication_test.go` | [deployment §5 Scale-out: an additional DC](deployment-guide.md#5-scale-out-an-additional-domain-controller) |
-| **R2** — reuse: an image built `FROM` this one inherits the whole runtime contract — ENTRYPOINT, HEALTHCHECK, VOLUME, ENV and the OCI labels — and inherits the refusals with it | `TestDerivedImageInheritsContract` | `test/e2e/derived_test.go` | [reuse §2 Deriving an image](reuse-guide.md#deriving-an-image) *(written by the next commit of this phase; until it lands the clause lives in [adaptation profile B.5](adaptation-profile.md#b5-documented-use-cases--e2e-matrix-82), which is where the citation sits)* |
+| **R2** — reuse: an image built `FROM` this one inherits the whole runtime contract — ENTRYPOINT, HEALTHCHECK, VOLUME, ENV and the version and spec-conformance labels — and inherits the refusals with it | `TestDerivedImageInheritsContract` | `test/e2e/derived_test.go` | [reuse §2 Deriving an image](reuse-guide.md#deriving-an-image) |
 | **O1** — idempotent restart without state loss | `TestIdempotentRestart` | `test/e2e/operational_test.go` | [deployment §3.4 Switch to `SAMBA_MODE=run`](deployment-guide.md#34-switch-to-samba_moderun-and-why) |
 | **O2** — offline backup **and** restore into a fresh instance, with object-level verification | `TestOfflineBackupRestore` | `test/e2e/operational_test.go` | [deployment §7 Backup and restore runbook](deployment-guide.md#7-backup-and-restore-runbook) |
 | **O3** — upgrade from the last published tag of the branch, data intact (§8.3) | `TestUpgradeFromLastPublished` | `test/e2e/operational_test.go` | [update §3 Patch update, step by step](update-guide.md#3-patch-update-step-by-step) |
@@ -77,14 +79,14 @@ reviewer's job.
 | **X3** — provision over existing state refused | `TestProvisionOverStateRefused` | `test/e2e/negative_test.go` | [deployment §3.4 Switch to `SAMBA_MODE=run`](deployment-guide.md#34-switch-to-samba_moderun-and-why) |
 | **X4** — run mode without state refused | `TestRunModeWithoutStateRefused` | `test/e2e/negative_test.go` | [deployment §3.4 Switch to `SAMBA_MODE=run`](deployment-guide.md#34-switch-to-samba_moderun-and-why) |
 
-19 B.5 rows ↔ 19 tests.
+20 B.5 rows ↔ 20 tests.
 
 The **doc section** links are relative to this file's directory, and each
 names the *primary* section — the one whose subject is that use case.
 Several rows legitimately share one (§1.5 documents both secret refusals,
 §3.4 both state refusals and the restart), and several use cases are
 touched by a second guide as well; the forward index is the *Section →
-test map* closing each of the two `docs/` guides, plus the README's
+test map* closing each of the three `docs/` guides, plus the README's
 inline `Covered by:` lines, and check (f) of
 `scripts/check-traceability.sh` holds the citation set to exactly this
 table's, in both directions.
@@ -122,8 +124,8 @@ appear in the table above:
   *itself*: network creation, secret files, a constrained DC start, the
   health wait, `samba-tool` exec, clean stop, test-client image. It
   exists so that a broken harness fails as a harness failure instead of
-  as sixteen confusing product failures. Its subject is the test code,
-  not the image's documented behaviour.
+  as a whole matrix of confusing product failures. Its subject is the
+  test code, not the image's documented behaviour.
 
 If a third infrastructure test is ever added, it goes in this list *and*
 in the script's exemption list — the script fails if an exempt name no

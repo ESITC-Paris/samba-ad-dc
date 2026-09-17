@@ -340,8 +340,24 @@ watcher armed on all of them.
 per branch per architecture. Project is live; SLO clock starts.
 
 Deferred beyond v1 (recorded in adaptation profile, already in B.6):
-sysvol replication mechanism (v2), real Windows-client join validation
-(out-of-band), SLSA L3, bit-for-bit reproducibility.
+sysvol replication mechanism (**v2, unchanged**), real Windows-client join
+validation (out-of-band — the *procedure* now exists as
+`docs/windows-client-validation.md`, with each run recorded under
+`docs/validations/`; the public pipeline still has no Windows runner, so
+the B.6 limitation stands), SLSA L3, bit-for-bit reproducibility.
+
+**Reusable-base contract — added 2026-09-17**, plan
+`2026-09-17-phase-6-reusable-base.md`. It is *not* the numbered Phase 6
+above (that is the watcher daemon); the numbering collides because the
+plans are dated rather than renumbered. The mandate — this image is to be
+the most general base possible, with a downstream project reusing it —
+landed as three extension points, each with its own E2E row: declarative
+`[global]` settings (`SAMBA_GLOBAL_OPTIONS`, N9), operator-supplied LDAPS
+material (`SAMBA_TLS_*_FILE`, N10) and the derived-image contract (R2).
+The boundaries are stated rather than implied in `docs/reuse-guide.md`:
+the AD DC role only — no file serving, no printing, no DHCP, no sysvol
+replication — with companion roles named for a project replacing a
+Windows server. No file-server or print image enters this repository.
 
 ## 4. CI architecture (summary)
 

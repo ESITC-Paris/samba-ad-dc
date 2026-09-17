@@ -508,11 +508,18 @@ A start that changes nothing writes nothing and says nothing. Maintenance
 mode applies none of it.
 
 **Removing an entry does not remove the setting.** The reconciliation adds
-and replaces; it never deletes, because it cannot tell a line it wrote last
-boot from one you put in `smb.conf` yourself. To undo a setting, give it the
-value you want — samba's default, written out explicitly, e.g.
-`max log size = 5000` — or edit `/etc/samba/smb.conf` on the configuration
-volume.
+and replaces; it never deletes a key you declared here, because it cannot
+tell a line it wrote last boot from one you put in `smb.conf` yourself. To
+undo a setting, give it the value you want — samba's default, written out
+explicitly, e.g. `max log size = 5000` — or edit `/etc/samba/smb.conf` on
+the configuration volume.
+
+The one exception is the three `tls *` keys, which this variable refuses
+because the image owns them: unsetting `SAMBA_TLS_CERT_FILE`,
+`SAMBA_TLS_KEY_FILE` and `SAMBA_TLS_CA_FILE` really does take those three
+lines back out of `smb.conf`, and §4.5 *[Bring your own
+certificate](#bring-your-own-certificate)* — "To go back" — is where that
+is documented. Nothing else is removed by anything.
 
 **What you put here reaches the running DC.** The image health-checks
 itself by probing DNS, LDAP and SMB on the loopback address (§6.1), and the
@@ -805,8 +812,10 @@ touches none of it.
 variables and recreate the container. The entrypoint then takes the three
 `tls *` lines back out of `/etc/samba/smb.conf` — one log line each,
 `removed "tls keyfile" from /etc/samba/smb.conf: SAMBA_TLS_*_FILE are unset` —
-and samba autogenerates its own self-signed material on the next start, at
-`0600`, even on a DC that never had any. Measured: `Attempting to autogenerate
+and samba autogenerates its own self-signed material on the next start, even
+on a DC that never had any: measured on a provisioned DC, `key.pem` is
+`0600` and `cert.pem` and `ca.pem` are `0644`, all owned by root. Measured
+too: `Attempting to autogenerate
 TLS self-signed keys for https for hostname '…'` / `TLS self-signed keys
 generated OK`, and `ldapsearch` over `ldaps://` works against the newly
 generated CA. Removal is the one thing the reconciliation does that §3.5's

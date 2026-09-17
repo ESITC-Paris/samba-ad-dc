@@ -75,20 +75,26 @@ GUIDES_ROOT=${3:-$repo_root}
 # whose citations nothing checks, in either direction, and check (f)
 # would report every ID only it cites as uncited.
 #
-# The first three are the §10.6 guides, which is what §10.6 is about:
+# The first four are the §10.6 guides, which is what §10.6 is about:
 # a guide section that documents a behaviour names the test proving it.
-# The last two are not guides and are not held to that requirement, but
+# reuse-guide.md joined them in Phase 6 — it is the contract a downstream
+# project builds on, and its sections carry the same *Covered by:* lines.
+# The last three are not guides and are not held to that requirement, but
 # they cite test IDs in the same backticked form — operations.md names
 # the upgrade test when it explains why a drill skipped it,
-# adaptation-profile.md names the tests behind its measurements — and an
-# unchecked citation rots exactly the same way wherever it lives: a
-# renamed test leaves a reader chasing a function that no longer exists.
-# Listing them here buys the reverse direction for those two files; it
-# also makes the forward direction (every mapped ID cited somewhere)
-# easier to satisfy, which is why the §10.6 anchors in docs/traceability.md
-# — not this check — remain what ties an ID to a guide SECTION.
+# adaptation-profile.md names the tests behind its measurements,
+# windows-client-validation.md names the protocol tests that stand in for
+# the join CI cannot run — and an unchecked citation rots exactly the same
+# way wherever it lives: a renamed test leaves a reader chasing a function
+# that no longer exists. Listing them here buys the reverse direction for
+# those three files; it also makes the forward direction (every mapped ID
+# cited somewhere) easier to satisfy, which is why the §10.6 anchors in
+# docs/traceability.md — not this check — remain what ties an ID to a
+# guide SECTION.
 GUIDES="README.md docs/deployment-guide.md docs/update-guide.md"
+GUIDES="$GUIDES docs/reuse-guide.md"
 GUIDES="$GUIDES docs/operations.md docs/adaptation-profile.md"
+GUIDES="$GUIDES docs/windows-client-validation.md"
 
 # Test functions that are NOT B.5 rows. They test the suite, not the
 # image: TestMain is the entry point (preflight, sweep, teardown) and

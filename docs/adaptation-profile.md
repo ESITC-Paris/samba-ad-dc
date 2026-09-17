@@ -229,31 +229,40 @@ against, and B.4 above is its summary.
 Nominal: provision; Kerberos authentication (kinit) and Kerberized SMB;
 NTLM authentication path; DNS SRV records served; LDAPS with certificate;
 signed-NTP wiring; database consistency; declarative `[global]` options
-applied, reconciled on a restart and refused when samba's own parser rejects
-them (`TestGlobalOptionsApplied`); LDAPS served with operator-supplied TLS
-material, verified by a client that trusts only the operator's CA, reversible
-by unsetting the three variables, with the incomplete trio, the file that is
-not there and the key at the wrong mode refused (`TestCustomTLSMaterial`).
-Additional-DC join with
-bidirectional directory replication verified by object propagation both
-ways; and a derived image inherits the runtime contract — an image built
-`FROM` this one, adding nothing but a file and an environment variable,
-provisions a domain and reaches this image's own health verdict, reports
-the same `entrypoint --version`, still declares the same ENTRYPOINT,
-HEALTHCHECK, VOLUME set, `KRB5_CONFIG` and OCI labels, and still refuses
-`SAMBA_MODE=run` on a volume holding no domain with exit 21
-(`TestDerivedImageInheritsContract`). Operational: idempotent restart without state loss; offline backup
-AND restore into a fresh instance with object-level verification; upgrade
-from the last published tag of the branch with data intact; explicit
-downgrade refusal. Negative: missing secret file fails fast with an
-actionable message; provision over existing state refused; run mode
-without state refused. All of the above executed on both architectures
-with the read-only rootfs configuration.
+applied, reconciled on a restart and refused when samba's own parser
+rejects them (`TestGlobalOptionsApplied`); LDAPS served with
+operator-supplied TLS material, verified by a client that trusts only the
+operator's CA, reversible by unsetting the three variables, with the
+incomplete trio, the file that is not there and the key at the wrong mode
+refused (`TestCustomTLSMaterial`). Additional-DC join with bidirectional
+directory replication verified by object propagation both ways; and a
+derived image inherits the runtime contract — an image built `FROM` this
+one, adding nothing but a file and an environment variable, provisions a
+domain and reaches this image's own health verdict, reports the same
+`entrypoint --version`, still declares the same ENTRYPOINT, HEALTHCHECK,
+VOLUME set and `KRB5_CONFIG`, still carries the base's
+`org.opencontainers.image.version` and `org.esitc-paris.spec-version`,
+and still refuses `SAMBA_MODE=run` on a volume holding no domain with
+exit 21 (`TestDerivedImageInheritsContract`). Operational: idempotent
+restart without state loss; offline backup AND restore into a fresh
+instance with object-level verification; upgrade from the last published
+tag of the branch with data intact; explicit downgrade refusal. Negative:
+missing secret file fails fast with an actionable message; provision over
+existing state refused; run mode without state refused. All of the above
+executed on both architectures with the read-only rootfs configuration.
 
 Which test covers which clause is not left to the reader:
 [`docs/traceability.md`](traceability.md) carries the row-by-row mapping
 in both directions (§8.2), and `scripts/check-traceability.sh` fails CI
 when a test or a row exists without its counterpart.
+
+What the reuse clause means for a project building on this image — what
+is inherited, what a derived build must not change and what it must
+re-declare (`org.opencontainers.image.base.name` and `.base.digest` are
+inherited verbatim and describe *this* image's base, so a derived build
+that leaves them alone publishes a falsehood) — is
+[`docs/reuse-guide.md`](reuse-guide.md), whose §1 restates the boundaries
+B.6 below establishes.
 
 ### B.6 Known limitations (stated per §12.4)
 
@@ -292,15 +301,36 @@ when a test or a row exists without its counterpart.
   as an ordinary one. Parsing the announce list and the armed polling mode
   are roadmap.
 
+- **The image fills the AD DC role and no other.** It is not a file
+  server: the Samba Team does not recommend using a DC as one, and POSIX
+  ACLs on shares of a DC do not work
+  ([wiki.samba.org](https://wiki.samba.org/index.php/Samba_AD_DC_as_a_File_Server)),
+  so this image defines no share beyond the `sysvol` and `netlogon` an AD
+  DC must serve. It is not a print server: `--disable-cups
+  --disable-iprint` are passed at build time, so printing is compiled out
+  rather than merely unconfigured. It is not a DHCP server: none is
+  installed, per SPEC §5.1 minimality. A deployment that replaces a
+  Windows server therefore needs companion roles — a Samba **domain
+  member** for file shares, a print server, DHCP — each joined to the
+  domain this image serves, none of them in this repository. Restated for
+  downstream projects, with the companion table, in
+  [`docs/reuse-guide.md`](reuse-guide.md) §1.
+
 - **Sysvol replication is not provided by Samba** (no DFS-R): with
   multiple DCs, group policy content does not replicate by itself. An
   integrated, tested synchronization mechanism from the PDC-emulator
   holder is committed roadmap (v2); until then this is a documented
   limitation with a manual procedure.
 - **Real Windows-client domain join is not exercised in CI** (no Windows
-  runners in the public pipeline); protocol-level equivalents are tested.
-  A non-blocking out-of-band validation with a real Windows client is a
-  roadmap item.
+  runners in the public pipeline); protocol-level equivalents are tested
+  (`TestDNSSRVRecords`, `TestKerberosKinit`, `TestKerberizedSMB`,
+  `TestNTLMAuth`, `TestLDAPSCertificate`). The non-blocking out-of-band
+  validation is no longer only a roadmap item: the procedure is
+  [`docs/windows-client-validation.md`](windows-client-validation.md) and
+  each run is recorded as a dated file under `docs/validations/`. A clean
+  run does not retire this limitation — CI still has no Windows runner —
+  but it puts evidence beside it: which image digest, which Windows
+  build, what was observed. No run has been recorded yet.
 - **Cross-branch upgrade coverage is bounded, and the bound is stated
   rather than implied.** Exactly two upgrade paths are tested and
   supported: *intra-branch* — the branch's previously published
@@ -773,8 +803,10 @@ a DC that once had the variables would name files whose mount is gone, for
 ever, with no remedy an operator could reach. What samba does next was
 measured, not assumed: on the following start it autogenerates its own
 self-signed material on demand (`Attempting to autogenerate TLS self-signed
-keys … TLS self-signed keys generated OK`), at `0600`, even on a DC that never
-had any, and LDAPS comes back up on it. So it is a full return to the default
+keys … TLS self-signed keys generated OK`), even on a DC that never had any,
+and LDAPS comes back up on it. The material it writes was measured on a
+provisioned DC: `key.pem` at `0600`, `cert.pem` and `ca.pem` at `0644`, all
+owned by root — the key at the only mode samba accepts for it. So it is a full return to the default
 behaviour, not a degraded state, and not a limitation.
 
 *What renewal costs.* Replace the files and recreate the container: the

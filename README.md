@@ -152,6 +152,33 @@ DC — is in [`docs/deployment-guide.md`](docs/deployment-guide.md).
 
 Covered by: `TestProvision`, `TestKerberosKinit`.
 
+## Building on this image
+
+This image is meant to be the base another project stands on — a school
+domain, a lab, an appliance. A derived image inherits the whole runtime
+contract without declaring any of it:
+
+```dockerfile
+FROM ghcr.io/esitc-paris/samba-ad-dc:4.24.7-r1
+```
+
+— the entrypoint, the health check, both volumes, `KRB5_CONFIG`, the
+version and spec-conformance labels, and the refusals that go with them.
+That is asserted, not assumed: `TestDerivedImageInheritsContract` builds
+such an image, provisions a domain on it and checks each of them.
+
+It is also a domain controller and **nothing else**: no file shares beyond
+`sysvol`/`netlogon` (the Samba Team does not recommend serving files from
+a DC), no printing (compiled out), no DHCP, no sysvol replication between
+DCs. A deployment replacing a Windows server needs companion roles around
+it.
+
+What you may rely on, what a derived build must not change and must
+re-declare, the two extension points (`SAMBA_GLOBAL_OPTIONS` and
+`SAMBA_TLS_*_FILE`), the operator API and a compose pattern for a
+downstream project are in
+[`docs/reuse-guide.md`](docs/reuse-guide.md).
+
 ## Configuration reference
 
 The binding contract is the **Runtime contract** section of
@@ -437,6 +464,11 @@ cycle"); how it is scheduled, supervised and driven by hand is in
   operations, backup and restore.
 - [`docs/update-guide.md`](docs/update-guide.md) — pinning strategies,
   patch and branch upgrades, multi-DC rollout order, rollback.
+- [`docs/reuse-guide.md`](docs/reuse-guide.md) — building a project on
+  this image: what is inherited and what must not change, the extension
+  points, the operator API, the boundaries of the DC role, and the
+  [Windows-client validation procedure](docs/windows-client-validation.md)
+  that CI cannot run.
 - [`docs/operations.md`](docs/operations.md) — running the release
   automation: scheduling, supervision, manual operations, triage.
 - [`docs/adaptation-profile.md`](docs/adaptation-profile.md) —
