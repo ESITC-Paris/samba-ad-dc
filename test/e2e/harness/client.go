@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -134,4 +135,48 @@ func splitList(v string) []string {
 		}
 	}
 	return out
+}
+
+// OwnAsRoot gives every named file in hostDir uid 0, gid 0 and the mode asked
+// for, by running chown and chmod inside a throwaway container that has the
+// directory bind-mounted read-write.
+//
+// A test process running as an ordinary user cannot create a root-owned file,
+// and one of the files here has to be exactly that: samba refuses to start
+// its LDAP server unless the TLS private key is mode 0600 AND owned by the
+// user samba runs as (root in this image) — measured, and fatal rather than
+// advisory. Docker preserves the host uid across a bind mount, so on a Linux
+// runner the key would arrive owned by the CI user and samba would refuse it.
+//
+// Doing it from a container is also what the deployment guide tells an
+// operator to do with sudo, so the suite and the documentation ask for the
+// same thing.
+func OwnAsRoot(t *testing.T, hostDir string, modes map[string]os.FileMode) {
+	t.Helper()
+	img := ClientImage(t)
+
+	script := "set -e\n"
+	for _, name := range sortedFileModes(modes) {
+		script += fmt.Sprintf("chown 0:0 /m/%s\nchmod %04o /m/%s\n", name, modes[name].Perm(), name)
+	}
+	script += "ls -ln /m\n"
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+	out, code, err := dockerCmd(ctx, "run", "--rm", "--label", ownerLabelArg,
+		"-v", hostDir+":/m", img, "sh", "-c", script)
+	if err != nil || code != 0 {
+		t.Fatalf("giving %s root ownership failed (exit %d): %v\n%s", hostDir, code, err, out)
+	}
+}
+
+// sortedFileModes returns the file names of m in a stable order, so the
+// script OwnAsRoot builds is the same on every run.
+func sortedFileModes(m map[string]os.FileMode) []string {
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
 }

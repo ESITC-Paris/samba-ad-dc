@@ -183,6 +183,24 @@ func (e *Executor) Execute(ctx context.Context, cfg *config.Config, plan modes.P
 		return ref
 	}
 
+	// The operator's own LDAPS material is checked before anything shells
+	// out, because provision names those paths on samba-tool's command line
+	// and every start writes them into smb.conf. A path that is not there has
+	// to stop the boot with one clear line here; left to samba it would not
+	// stop anything, since a file it cannot use sends it back to its own
+	// self-signed material — a container that comes up healthy serving a
+	// certificate nobody vouched for.
+	//
+	// Maintenance is excluded for the same reason it applies no [global]
+	// settings at all (see ensureGlobalOptions): it starts no listener, and
+	// material it will never use must not stand between an operator and the
+	// database check they reached for because their DC will not run.
+	if plan.Kind != modes.ActMaintenance {
+		if err := config.CheckTLSMaterial(cfg); err != nil {
+			return asRefusal(err, config.CodeSecretError)
+		}
+	}
+
 	switch plan.Kind {
 	case modes.ActProvision:
 		if ref := e.provision(ctx, cfg); ref != nil {
@@ -460,9 +478,10 @@ func (e *Executor) ensureJoinedConf(cfg *config.Config) *config.Refusal {
 	return nil
 }
 
-// ensureGlobalOptions reconciles the [global] settings declared through
-// SAMBA_GLOBAL_OPTIONS into the smb.conf on the configuration volume, and
-// refuses the boot when samba's own parser rejects the result.
+// ensureGlobalOptions reconciles the declared [global] settings — the
+// operator's own LDAPS material from the SAMBA_TLS_* variables first, then
+// the SAMBA_GLOBAL_OPTIONS block — into the smb.conf on the configuration
+// volume, and refuses the boot when samba's own parser rejects the result.
 //
 // It runs on every start rather than only on the boot that initialized the
 // volume, because the variable is what an operator edits: a setting that only
@@ -483,7 +502,8 @@ func (e *Executor) ensureJoinedConf(cfg *config.Config) *config.Refusal {
 // that edited the configuration on the way past would change the very thing
 // they are looking at.
 func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) *config.Refusal {
-	if len(cfg.GlobalOptions) == 0 {
+	options := cfg.EffectiveGlobalOptions()
+	if len(options) == 0 {
 		return nil
 	}
 	for _, key := range cfg.GlobalOptionsShadowed {
@@ -493,13 +513,13 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 	original, err := os.ReadFile(e.SMBConfPath)
 	if err != nil {
 		return config.Refuse(config.CodeRuntimeFailure,
-			"the configuration file %q that SAMBA_GLOBAL_OPTIONS must be applied to cannot be read (%s); mount /etc/samba read-write, or unset SAMBA_GLOBAL_OPTIONS",
+			"the configuration file %q that the declared [global] settings must be applied to cannot be read (%s); mount /etc/samba read-write, or unset SAMBA_GLOBAL_OPTIONS and the SAMBA_TLS_* variables",
 			e.SMBConfPath, oneLine(err.Error()))
 	}
 
 	conf := string(original)
-	var announcements []string
-	for _, o := range cfg.GlobalOptions {
+	var announcements, sources []string
+	for _, o := range options {
 		updated, edit := withGlobalSetting(conf, o.Key, o.Value)
 		if edit == confUnchanged {
 			continue
@@ -509,8 +529,15 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 		if edit == confReplaced {
 			verb = "replaced"
 		}
+		// Each line names the variable that asked for THIS setting, not the
+		// variable next to it: an operator reading their log has to be sent
+		// to the thing they can edit.
+		source := config.OptionSource(o.Key)
 		announcements = append(announcements,
-			fmt.Sprintf("SAMBA_GLOBAL_OPTIONS: %s %q = %q in %s", verb, o.Key, o.Value, e.SMBConfPath))
+			fmt.Sprintf("%s: %s %q = %q in %s", source, verb, o.Key, o.Value, e.SMBConfPath))
+		if !containsString(sources, source) {
+			sources = append(sources, source)
+		}
 	}
 	// Nothing to do is the steady state, and it says nothing: an operator
 	// who changed nothing must see no configuration noise at all, and the
@@ -521,20 +548,30 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 
 	if err := writeFileAtomic(e.SMBConfPath, []byte(conf), 0o644); err != nil {
 		return config.Refuse(config.CodeRuntimeFailure,
-			"the [global] settings SAMBA_GLOBAL_OPTIONS declares cannot be written into %q (%s); mount /etc/samba read-write",
-			e.SMBConfPath, oneLine(err.Error()))
+			"the [global] settings %s declares cannot be written into %q (%s); mount /etc/samba read-write",
+			strings.Join(sources, " and "), e.SMBConfPath, oneLine(err.Error()))
 	}
 	// The gate first, the announcements after it: the log must record what
 	// the domain controller is actually running with. A boot that announced
 	// "replaced max log size" and then put the previous file back would leave
 	// an operator reading their log for a setting that is not in force.
-	if ref := e.checkSMBConf(ctx, original); ref != nil {
+	if ref := e.checkSMBConf(ctx, original, strings.Join(sources, " and ")); ref != nil {
 		return ref
 	}
 	for _, a := range announcements {
 		e.logf("%s", a)
 	}
 	return nil
+}
+
+// containsString reports whether values holds want.
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // checkSMBConf asks testparm whether the file that was just rewritten is a
@@ -572,7 +609,7 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 // where Output deliberately does not capture it (see Runner.Output) — so
 // `--debug-stdout` moves them onto the stream this can read. testparm's own
 // banner stays on stderr and still reaches the container log.
-func (e *Executor) checkSMBConf(ctx context.Context, original []byte) *config.Refusal {
+func (e *Executor) checkSMBConf(ctx context.Context, original []byte, sources string) *config.Refusal {
 	out, err := e.Runner.Output(ctx, e.Bin.Testparm, testparmCheckArgs(e.SMBConfPath)...)
 	diagnostics := testparmDiagnostics(out)
 
@@ -588,7 +625,7 @@ func (e *Executor) checkSMBConf(ctx context.Context, original []byte) *config.Re
 		// warning, most often — is the operator's business and reaches
 		// their log, but it is not a reason to refuse their DC.
 		for _, d := range diagnostics {
-			e.logf("SAMBA_GLOBAL_OPTIONS: testparm says: %s", d)
+			e.logf("%s: testparm says: %s", sources, d)
 		}
 		return nil
 	}
@@ -598,12 +635,12 @@ func (e *Executor) checkSMBConf(ctx context.Context, original []byte) *config.Re
 
 	if rerr := writeFileAtomic(e.SMBConfPath, original, 0o644); rerr != nil {
 		return config.Refuse(config.CodeConfigError,
-			"testparm rejects the [global] settings SAMBA_GLOBAL_OPTIONS declares (%s) and %q could not be put back (%s); fix or remove the offending entry in SAMBA_GLOBAL_OPTIONS — the configuration volume still holds the rejected settings",
-			problem, e.SMBConfPath, oneLine(rerr.Error()))
+			"testparm rejects the [global] settings %s declares (%s) and %q could not be put back (%s); fix or remove the offending entry in %s — the configuration volume still holds the rejected settings",
+			sources, problem, e.SMBConfPath, oneLine(rerr.Error()), sources)
 	}
 	return config.Refuse(config.CodeConfigError,
-		"testparm rejects the [global] settings SAMBA_GLOBAL_OPTIONS declares (%s); %s has been put back to what it held before this start, so fix or remove the offending entry in SAMBA_GLOBAL_OPTIONS and start the container again",
-		problem, e.SMBConfPath)
+		"testparm rejects the [global] settings %s declares (%s); %s has been put back to what it held before this start, so fix or remove the offending entry in %s and start the container again",
+		sources, problem, e.SMBConfPath, sources)
 }
 
 // testparmDiagnostics returns everything testparm printed BEFORE the dump of
@@ -1017,11 +1054,16 @@ func provisionArgs(cfg *config.Config, secret string) []string {
 		args = append(args, "--option="+dnsForwarderKey+"="+cfg.DNSForwarder)
 	}
 	args = append(args, "--option="+dnsUpdateCommand)
-	// The operator's declarative block, in declaration order and last, so
-	// that it is applied over the image's own options rather than under
-	// them. Nothing here can collide with those: config.Load refuses every
-	// key this image owns before the value ever reaches provision.
-	for _, o := range cfg.GlobalOptions {
+	// The operator's own TLS material and declarative block, in that order
+	// and last, so that they are applied over the image's own options rather
+	// than under them. Nothing here can collide with those: config.Load
+	// refuses every key this image owns before the value ever reaches
+	// provision. The TLS files are passed HERE, and not only reconciled
+	// afterwards, because the smb.conf provision generates is what the DC's
+	// very first start reads: a DC that served samba's self-signed
+	// certificate for one boot and the operator's from the next would change
+	// identity under a client that had already seen it.
+	for _, o := range cfg.EffectiveGlobalOptions() {
 		args = append(args, "--option="+o.Key+" = "+o.Value)
 	}
 	return append(args, "--adminpass="+secret)

@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -643,4 +644,281 @@ func TestLoadGlobalOptionsRefusals(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// SAMBA_TLS_CERT_FILE / SAMBA_TLS_KEY_FILE / SAMBA_TLS_CA_FILE
+// ---------------------------------------------------------------------------
+
+// TestLoadTLSMaterial covers the accepting half of the trio: the three paths
+// land on the config, and they become the three `tls *` [global] settings
+// BEFORE whatever SAMBA_GLOBAL_OPTIONS declares.
+//
+// The order is not cosmetic. Both lists are applied through the same
+// reconciliation, and putting the material first means an operator reading
+// their smb.conf finds the certificate the DC serves at the top of what this
+// image wrote, next to the identity settings it belongs with.
+func TestLoadTLSMaterial(t *testing.T) {
+	cfg, err := Load(envMap(map[string]string{
+		"SAMBA_TLS_CERT_FILE":  "/run/secrets/tls/cert.pem",
+		"SAMBA_TLS_KEY_FILE":   "/run/secrets/tls/key.pem",
+		"SAMBA_TLS_CA_FILE":    "/run/secrets/tls/ca.pem",
+		"SAMBA_GLOBAL_OPTIONS": "max log size = 4000",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.TLSCertFile != "/run/secrets/tls/cert.pem" ||
+		cfg.TLSKeyFile != "/run/secrets/tls/key.pem" ||
+		cfg.TLSCAFile != "/run/secrets/tls/ca.pem" {
+		t.Fatalf("the three paths did not reach the config: %+v", cfg)
+	}
+
+	want := []GlobalOption{
+		{Key: "tls certfile", Value: "/run/secrets/tls/cert.pem"},
+		{Key: "tls keyfile", Value: "/run/secrets/tls/key.pem"},
+		{Key: "tls cafile", Value: "/run/secrets/tls/ca.pem"},
+		{Key: "max log size", Value: "4000"},
+	}
+	if got := cfg.EffectiveGlobalOptions(); !reflect.DeepEqual(got, want) {
+		t.Errorf("EffectiveGlobalOptions() = %+v, want %+v", got, want)
+	}
+	// The declarative block itself must not have grown three entries it
+	// never declared: the two lists are separate inputs and only the
+	// effective view joins them.
+	if got := len(cfg.GlobalOptions); got != 1 {
+		t.Errorf("GlobalOptions holds %d entries, want the 1 that was declared: %+v", got, cfg.GlobalOptions)
+	}
+}
+
+// With none of the three set the DC keeps today's behaviour: samba's own
+// self-signed material, and not one extra [global] setting.
+func TestLoadWithoutTLSMaterial(t *testing.T) {
+	cfg, err := Load(envMap(map[string]string{"SAMBA_GLOBAL_OPTIONS": "max log size = 4000"}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.TLSOptions() != nil {
+		t.Errorf("TLSOptions() = %+v with nothing set, want nil", cfg.TLSOptions())
+	}
+	want := []GlobalOption{{Key: "max log size", Value: "4000"}}
+	if got := cfg.EffectiveGlobalOptions(); !reflect.DeepEqual(got, want) {
+		t.Errorf("EffectiveGlobalOptions() = %+v, want %+v", got, want)
+	}
+}
+
+// TestLoadTLSMaterialPartialRefused: all three or none.
+//
+// A partial trio is refused rather than half-applied because every partial
+// combination is a DC that either does not start or serves a certificate the
+// operator did not intend — and the operator would have no way to tell which,
+// since samba falls back to its own self-signed material without a word.
+// The message names the ones that are MISSING: that is what has to be fixed.
+func TestLoadTLSMaterialPartialRefused(t *testing.T) {
+	const cert, key, ca = "/run/secrets/tls/cert.pem", "/run/secrets/tls/key.pem", "/run/secrets/tls/ca.pem"
+	for _, tc := range []struct {
+		name            string
+		env             map[string]string
+		wantMsgContains []string
+	}{
+		{
+			name: "only the certificate",
+			env:  map[string]string{"SAMBA_TLS_CERT_FILE": cert},
+			wantMsgContains: []string{
+				"SAMBA_TLS_CERT_FILE", "SAMBA_TLS_KEY_FILE", "SAMBA_TLS_CA_FILE",
+			},
+		},
+		{
+			name:            "only the key",
+			env:             map[string]string{"SAMBA_TLS_KEY_FILE": key},
+			wantMsgContains: []string{"SAMBA_TLS_CERT_FILE", "SAMBA_TLS_CA_FILE"},
+		},
+		{
+			name:            "only the CA",
+			env:             map[string]string{"SAMBA_TLS_CA_FILE": ca},
+			wantMsgContains: []string{"SAMBA_TLS_CERT_FILE", "SAMBA_TLS_KEY_FILE"},
+		},
+		{
+			name:            "certificate and key, no CA",
+			env:             map[string]string{"SAMBA_TLS_CERT_FILE": cert, "SAMBA_TLS_KEY_FILE": key},
+			wantMsgContains: []string{"SAMBA_TLS_CA_FILE"},
+		},
+		{
+			name:            "certificate and CA, no key",
+			env:             map[string]string{"SAMBA_TLS_CERT_FILE": cert, "SAMBA_TLS_CA_FILE": ca},
+			wantMsgContains: []string{"SAMBA_TLS_KEY_FILE"},
+		},
+		{
+			name:            "key and CA, no certificate",
+			env:             map[string]string{"SAMBA_TLS_KEY_FILE": key, "SAMBA_TLS_CA_FILE": ca},
+			wantMsgContains: []string{"SAMBA_TLS_CERT_FILE"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(envMap(tc.env))
+			if cfg != nil {
+				t.Errorf("expected nil config on refusal, got %+v", cfg)
+			}
+			r := refusalOf(t, err, CodeConfigError)
+			for _, frag := range tc.wantMsgContains {
+				if !strings.Contains(r.Msg, frag) {
+					t.Errorf("message %q does not contain %q", r.Msg, frag)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckTLSMaterial covers the start-time check on the files themselves.
+//
+// It is a SECRET-class refusal (exit 11) for the same reason the password
+// files are: one of the three is a private key, and the code that reports a
+// problem with it must never be tempted to quote what is inside. The message
+// names the variable and the path and stops there.
+func TestCheckTLSMaterial(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	const keyContent = "-----BEGIN PRIVATE KEY-----\nsupersecret\n-----END PRIVATE KEY-----\n"
+	cert := write("cert.pem", "-----BEGIN CERTIFICATE-----\n")
+	// 0600, because that is the only mode samba accepts on a private key —
+	// see TestCheckTLSMaterialKeyPermissions, which is where that rule is
+	// pinned. Here it only has to be out of the way.
+	key := write("key.pem", keyContent)
+	if err := os.Chmod(key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ca := write("ca.pem", "-----BEGIN CERTIFICATE-----\n")
+	empty := write("empty.pem", "")
+	absent := filepath.Join(dir, "does-not-exist.pem")
+
+	t.Run("nothing set is nothing to check", func(t *testing.T) {
+		if err := CheckTLSMaterial(&Config{}); err != nil {
+			t.Fatalf("unexpected refusal with no material declared: %v", err)
+		}
+	})
+
+	t.Run("three readable files", func(t *testing.T) {
+		cfg := &Config{TLSCertFile: cert, TLSKeyFile: key, TLSCAFile: ca}
+		if err := CheckTLSMaterial(cfg); err != nil {
+			t.Fatalf("unexpected refusal: %v", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name            string
+		cfg             *Config
+		wantMsgContains []string
+	}{
+		{
+			name:            "the key file is not there",
+			cfg:             &Config{TLSCertFile: cert, TLSKeyFile: absent, TLSCAFile: ca},
+			wantMsgContains: []string{"SAMBA_TLS_KEY_FILE", absent},
+		},
+		{
+			name:            "the certificate is not there",
+			cfg:             &Config{TLSCertFile: absent, TLSKeyFile: key, TLSCAFile: ca},
+			wantMsgContains: []string{"SAMBA_TLS_CERT_FILE", absent},
+		},
+		{
+			name:            "the CA is not there",
+			cfg:             &Config{TLSCertFile: cert, TLSKeyFile: key, TLSCAFile: absent},
+			wantMsgContains: []string{"SAMBA_TLS_CA_FILE", absent},
+		},
+		{
+			name:            "the path is a directory",
+			cfg:             &Config{TLSCertFile: dir, TLSKeyFile: key, TLSCAFile: ca},
+			wantMsgContains: []string{"SAMBA_TLS_CERT_FILE", dir},
+		},
+		{
+			name:            "the file is empty",
+			cfg:             &Config{TLSCertFile: cert, TLSKeyFile: empty, TLSCAFile: ca},
+			wantMsgContains: []string{"SAMBA_TLS_KEY_FILE", empty},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := refusalOf(t, CheckTLSMaterial(tc.cfg), CodeSecretError)
+			for _, frag := range tc.wantMsgContains {
+				if !strings.Contains(r.Msg, frag) {
+					t.Errorf("message %q does not contain %q", r.Msg, frag)
+				}
+			}
+			if strings.Contains(r.Msg, "supersecret") {
+				t.Errorf("the refusal quotes the private key: %q", r.Msg)
+			}
+		})
+	}
+}
+
+// TestCheckTLSMaterialKeyPermissions pins the one rule that is not this
+// image's but samba's, and that was MEASURED rather than assumed (Samba
+// 4.24.7 in this image, every mode below tried against a running DC):
+//
+//	mode 0400  invalid permissions on file '…': has 0400 should be 0600
+//	mode 0640  … has 0640 should be 0600
+//	mode 0660  … has 0660 should be 0600
+//	mode 0600  starts
+//
+// It is an EXACT comparison, not "no group or other access" — 0400 is refused
+// too — and samba does not warn and continue: `ldapsrv_task_init` fails with
+// NT_STATUS_CANT_ACCESS_DOMAIN_INFO and the whole server terminates. Checking
+// it here is what turns that into one line naming the file and the fix.
+//
+// Only the private key is checked. The certificate and the CA are public
+// material and samba reads them at any mode (both were 0644 on the DC that
+// started).
+func TestCheckTLSMaterialKeyPermissions(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, mode os.FileMode) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("-----BEGIN-----\n"), mode); err != nil {
+			t.Fatal(err)
+		}
+		// WriteFile's mode is masked by the umask, so set it explicitly.
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cert := write("cert.pem", 0o644)
+	ca := write("ca.pem", 0o644)
+
+	t.Run("0600 is accepted", func(t *testing.T) {
+		cfg := &Config{TLSCertFile: cert, TLSKeyFile: write("ok.pem", 0o600), TLSCAFile: ca}
+		if err := CheckTLSMaterial(cfg); err != nil {
+			t.Fatalf("a 0600 key was refused: %v", err)
+		}
+	})
+
+	for _, mode := range []os.FileMode{0o400, 0o640, 0o644, 0o660, 0o666} {
+		t.Run("mode "+mode.String(), func(t *testing.T) {
+			// A fresh name per mode: a 0400 file cannot be rewritten by the
+			// next iteration, and the failure would look like the check.
+			key := write(fmt.Sprintf("key-%o.pem", mode), mode)
+			r := refusalOf(t, CheckTLSMaterial(&Config{TLSCertFile: cert, TLSKeyFile: key, TLSCAFile: ca}), CodeSecretError)
+			for _, frag := range []string{EnvTLSKeyFile, key, "0600"} {
+				if !strings.Contains(r.Msg, frag) {
+					t.Errorf("message %q does not contain %q", r.Msg, frag)
+				}
+			}
+		})
+	}
+
+	// The certificate and the CA are public: their mode is samba's business
+	// and it does not object, so neither may this.
+	t.Run("a world-readable certificate and CA are fine", func(t *testing.T) {
+		cfg := &Config{
+			TLSCertFile: write("open-cert.pem", 0o666),
+			TLSKeyFile:  write("ok2.pem", 0o600),
+			TLSCAFile:   write("open-ca.pem", 0o666),
+		}
+		if err := CheckTLSMaterial(cfg); err != nil {
+			t.Fatalf("public material was refused over its mode: %v", err)
+		}
+	})
 }

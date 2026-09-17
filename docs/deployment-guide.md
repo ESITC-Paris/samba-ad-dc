@@ -686,6 +686,78 @@ succeeds, and the `ldapsearch` above passes on all three branches. If your
 own tooling parses the certificate with a strict library, this is the
 cause; the limitation is upstream's and is recorded in B.6.
 
+#### Bring your own certificate
+
+Everything above describes the certificate samba generates for itself. To
+serve LDAPS with material a real CA issued — the usual reason being that
+members must trust the DC without being handed a one-off CA — mount the three
+PEM files into the container and name them:
+
+```yaml
+services:
+  dc1:
+    environment:
+      SAMBA_TLS_CERT_FILE: /run/secrets/tls/cert.pem
+      SAMBA_TLS_KEY_FILE: /run/secrets/tls/key.pem
+      SAMBA_TLS_CA_FILE: /run/secrets/tls/ca.pem
+    volumes:
+      - ./tls:/run/secrets/tls:ro
+```
+
+The paths are paths **inside the container**. `/run` is a tmpfs and a bind
+mounted under it works — it is where this image already puts every `*_FILE`
+secret. Do not put the material on the `/etc/samba` or `/var/lib/samba`
+volumes: those belong to the DC, and material you renew from outside has no
+business living on one.
+
+**All three or none.** Setting one or two is refused with exit 10 naming the
+ones that are missing. It is refused rather than half-applied because a
+partial trio does not fail loudly: samba falls back to its own self-signed
+material, and the container comes up healthy serving a certificate nobody
+vouched for.
+
+**The private key must be `chmod 600` and owned by the container user
+(uid 0).** This is samba's rule and it is fatal, not advisory: a key at any
+other mode — `0400` included — makes samba refuse to start its LDAP server,
+citing CVE-2013-4476, and the whole domain controller then terminates. Docker
+preserves the host file's ownership across a bind mount, so on Linux a key
+you generated as yourself arrives owned by *your* uid and is refused however
+carefully you set its mode. On the host:
+
+```sh
+sudo chown 0:0 ./tls/key.pem
+sudo chmod 600 ./tls/key.pem
+chmod 644 ./tls/cert.pem ./tls/ca.pem
+```
+
+The certificate and the CA are public material; their mode is not checked.
+The entrypoint verifies all of this **before** it starts anything and refuses
+with exit 11 — the same class as a missing password file, because one of the
+three is a private key — naming the variable, the path and the command to
+run. It never prints the content.
+
+**The certificate has to match the name clients dial.** Its subject
+alternative name must carry the DC's FQDN (`dc1.ad.example.com`), the name
+the realm's DNS hands out; a certificate for the container's short name or
+its address will fail verification in exactly the `ldapsearch` above.
+
+**What happens when.** At **provision** the three settings are passed to
+`samba-tool domain provision`, so the very first `smb.conf` already names
+your material and the DC never serves a self-signed certificate at all — with
+the trio set, samba generates none (`/var/lib/samba/private/tls` stays
+empty). On **every later start**, provision-, join- and run-mode alike, the
+three settings are reconciled into `/etc/samba/smb.conf` the same way §3.5's
+declarative settings are, and each change is one log line. Maintenance mode
+touches none of it.
+
+**To renew**, replace the files with the new material at the same paths and
+recreate the container. Nothing here reloads a certificate in a running
+server, and nothing watches its expiry — that is your monitoring, not this
+image's. Because the paths did not change, the reconciliation writes nothing
+and samba simply reads the new files at startup.
+
+(*Covered by:* `TestCustomTLSMaterial`.)
+
 ### 4.6 Time
 
 ```sh
@@ -1414,7 +1486,7 @@ to, is the profile's
 | §1 Constraints first | `TestProvision` (the constrained profile is what every DC in the suite runs under); `TestPlainEnvSecretRejected`, `TestMissingSecretFailsFast` for §1.5 |
 | §2 Verify before the first run | *(none — a property of the published image; `post-push-verify.yml`, SPEC §8.5)* |
 | §3 The first domain controller | `TestProvision`, `TestIdempotentRestart`; `TestRunModeWithoutStateRefused`, `TestProvisionOverStateRefused` for §3.4; `TestGlobalOptionsApplied` for §3.5 |
-| §4 Protocol check from a member | `TestDNSSRVRecords`, `TestKerberosKinit`, `TestKerberizedSMB`, `TestNTLMAuth`, `TestLDAPSCertificate`, `TestSignedNTPWiring` |
+| §4 Protocol check from a member | `TestDNSSRVRecords`, `TestKerberosKinit`, `TestKerberizedSMB`, `TestNTLMAuth`, `TestLDAPSCertificate`, `TestSignedNTPWiring`; `TestCustomTLSMaterial` for §4.5 *Bring your own certificate* |
 | §5 Scale-out: an additional DC | `TestJoinReplicationBothWays` |
 | §6 Day-2 basics | `TestDBConsistency`; `TestDowngradeRefused` for the maintenance-mode guards; `TestUpgradeFromLastPublished` for §6.5 |
 | §7 Backup and restore runbook | `TestOfflineBackupRestore` |

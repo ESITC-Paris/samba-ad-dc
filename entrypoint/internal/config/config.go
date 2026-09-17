@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Exit codes (contract, immutable once released — SPEC §6.5).
@@ -108,6 +109,15 @@ type Config struct {
 	LogLevel      int
 	Chrony        bool
 	MaintenanceOp string
+
+	// TLSCertFile, TLSKeyFile and TLSCAFile are the paths, inside the
+	// container, of the LDAPS material the operator supplied through the
+	// SAMBA_TLS_* variables. All three are set or none of them is (Load
+	// refuses a partial trio), so TLSCertFile alone answers "did the
+	// operator bring their own certificate?".
+	TLSCertFile string
+	TLSKeyFile  string
+	TLSCAFile   string
 
 	// GlobalOptions are the [global] settings declared through
 	// SAMBA_GLOBAL_OPTIONS, in declaration order.
@@ -218,11 +228,18 @@ func Load(getenv func(string) string) (*Config, error) {
 		cfg.MaintenanceOp = op
 	}
 
-	opts, shadowed, err := parseGlobalOptions(get("SAMBA_GLOBAL_OPTIONS"))
+	opts, shadowed, err := parseGlobalOptions(get(envGlobalOptions))
 	if err != nil {
 		return nil, err
 	}
 	cfg.GlobalOptions, cfg.GlobalOptionsShadowed = opts, shadowed
+
+	cfg.TLSCertFile = get(EnvTLSCertFile)
+	cfg.TLSKeyFile = get(EnvTLSKeyFile)
+	cfg.TLSCAFile = get(EnvTLSCAFile)
+	if err := checkTLSTrio(cfg); err != nil {
+		return nil, err
+	}
 
 	// Realm and secrets are required only by the modes that initialize
 	// state. auto decides between provision and join once the volume has
@@ -259,6 +276,23 @@ func Load(getenv func(string) string) (*Config, error) {
 	return cfg, nil
 }
 
+// The variables that carry the operator's own LDAPS material, and the
+// [global] parameter each of them sets. They are named once here and used
+// both by the owned-key table (which refuses those parameters in
+// SAMBA_GLOBAL_OPTIONS) and by the loader below, so the two can never drift
+// apart and name different things to the same operator.
+const (
+	envGlobalOptions = "SAMBA_GLOBAL_OPTIONS"
+
+	EnvTLSCertFile = "SAMBA_TLS_CERT_FILE"
+	EnvTLSKeyFile  = "SAMBA_TLS_KEY_FILE"
+	EnvTLSCAFile   = "SAMBA_TLS_CA_FILE"
+
+	tlsCertFileKey = "tls certfile"
+	tlsKeyFileKey  = "tls keyfile"
+	tlsCAFileKey   = "tls cafile"
+)
+
 // The two owners that are not an environment variable. They are sentinels,
 // not prose to be printed as-is: globalOptionRefusal turns each into its own
 // sentence, because "set the image instead" would be nonsense.
@@ -291,20 +325,20 @@ const (
 //     setting it here would be configuring two files through one.
 //   - include would let an arbitrary file contradict every line above, from
 //     a path this image cannot validate.
-//   - the tls * files are reserved for the SAMBA_TLS_* variables that own
-//     them, which mount and check the material before naming it. They are
-//     refused from the moment SAMBA_GLOBAL_OPTIONS exists rather than from
-//     the moment those variables do, so that no deployment can come to
-//     depend on setting them by hand first.
+//   - the tls * files belong to the SAMBA_TLS_* variables that own them,
+//     which check that the material is there and readable before naming it
+//     in smb.conf. Setting one of the three here would also let an operator
+//     set one WITHOUT the other two, which is the half-configured DC the
+//     all-or-none rule below exists to prevent.
 var globalOptionOwners = map[string]string{
 	"realm":                      "SAMBA_REALM",
 	"workgroup":                  "SAMBA_DOMAIN",
 	"netbios name":               ownerHostname,
 	"ad dc functional level":     "SAMBA_FUNCTION_LEVEL",
 	"dns forwarder":              "SAMBA_DNS_FORWARDER",
-	"tls certfile":               "SAMBA_TLS_CERT_FILE",
-	"tls keyfile":                "SAMBA_TLS_KEY_FILE",
-	"tls cafile":                 "SAMBA_TLS_CA_FILE",
+	tlsCertFileKey:               EnvTLSCertFile,
+	tlsKeyFileKey:                EnvTLSKeyFile,
+	tlsCAFileKey:                 EnvTLSCAFile,
 	"server role":                ownerImage,
 	"dns update command":         ownerImage,
 	"ntp signd socket directory": ownerImage,
@@ -384,6 +418,232 @@ func globalOptionRefusal(key, owner string) error {
 			"SAMBA_GLOBAL_OPTIONS sets %q, which is owned by %s; remove that line and set %s instead",
 			key, owner, owner)
 	}
+}
+
+// checkTLSTrio enforces the all-or-none rule on the operator's own LDAPS
+// material.
+//
+// Every partial combination is a domain controller the operator did not ask
+// for, and — this is the part that makes refusing the only honest answer —
+// one they would have no way to notice. `tls enabled` is already yes on an AD
+// DC (measured with testparm against Samba 4.24.7 in this image), and samba
+// falls back to the self-signed material it generates for itself whenever the
+// files it is pointed at are not all usable. So a trio missing its key would
+// not produce an error: it would produce LDAPS served with a certificate
+// nobody vouched for, on a DC whose configuration claims otherwise.
+//
+// The message names the variables that are MISSING, because those are what
+// has to be set.
+func checkTLSTrio(cfg *Config) error {
+	var set, missing []string
+	for _, v := range []struct{ env, path string }{
+		{EnvTLSCertFile, cfg.TLSCertFile},
+		{EnvTLSKeyFile, cfg.TLSKeyFile},
+		{EnvTLSCAFile, cfg.TLSCAFile},
+	} {
+		if v.path == "" {
+			missing = append(missing, v.env)
+		} else {
+			set = append(set, v.env)
+		}
+	}
+	if len(set) == 0 || len(missing) == 0 {
+		return nil
+	}
+	return Refuse(CodeConfigError,
+		"%s %s set but %s %s not; serving LDAPS with your own material takes the certificate, its private key and the CA that issued it, so set all three or none — with none of them set this domain controller serves the self-signed certificate samba generates for itself",
+		joinAnd(set), isAre(set), joinAnd(missing), isAre(missing))
+}
+
+// TLSOptions renders the operator's own LDAPS material as the three [global]
+// settings that point samba at it, or nil when none was supplied.
+//
+// `tls enabled` is deliberately NOT among them: it already defaults to yes on
+// an AD DC, so setting it would add a line that changes nothing and invite the
+// reading that LDAPS is off without it.
+func (c *Config) TLSOptions() []GlobalOption {
+	if c.TLSCertFile == "" {
+		return nil
+	}
+	return []GlobalOption{
+		{Key: tlsCertFileKey, Value: c.TLSCertFile},
+		{Key: tlsKeyFileKey, Value: c.TLSKeyFile},
+		{Key: tlsCAFileKey, Value: c.TLSCAFile},
+	}
+}
+
+// EffectiveGlobalOptions is everything the entrypoint reconciles into
+// [global]: the TLS material first, then the declarative block, in
+// declaration order.
+//
+// The material goes first so that an operator reading their smb.conf finds
+// the certificate their DC serves at the top of what this image wrote. The
+// order cannot change the outcome — nothing in the declarative block may set
+// a `tls *` file (globalOptionOwners refuses them) — so it is chosen for the
+// reader.
+func (c *Config) EffectiveGlobalOptions() []GlobalOption {
+	return append(c.TLSOptions(), c.GlobalOptions...)
+}
+
+// OptionSource names the environment variable an applied [global] setting
+// came from, so that a log line about it can send the operator to the right
+// place. It is exhaustive rather than a guess: the three `tls *` files can
+// only come from the SAMBA_TLS_* variables, because globalOptionOwners
+// refuses them everywhere else.
+func OptionSource(key string) string {
+	switch key {
+	case tlsCertFileKey:
+		return EnvTLSCertFile
+	case tlsKeyFileKey:
+		return EnvTLSKeyFile
+	case tlsCAFileKey:
+		return EnvTLSCAFile
+	default:
+		return envGlobalOptions
+	}
+}
+
+// CheckTLSMaterial verifies, at start, that each file the trio names is there
+// and can be opened. It reads nothing: one of the three is a private key, and
+// code that never holds the content cannot leak it into a message, a log or a
+// crash report. The refusal is CodeSecretError for the same reason.
+//
+// Checking at start rather than trusting samba is what turns a misconfigured
+// mount into one clear line. Samba would not say much: with a file it cannot
+// use it goes back to its own self-signed material, which is a working DC
+// serving the wrong certificate — visible only to whoever next verifies the
+// chain, long after the container came up healthy.
+func CheckTLSMaterial(c *Config) error {
+	for _, v := range []struct {
+		env, path  string
+		privateKey bool
+	}{
+		{env: EnvTLSCertFile, path: c.TLSCertFile},
+		{env: EnvTLSKeyFile, path: c.TLSKeyFile, privateKey: true},
+		{env: EnvTLSCAFile, path: c.TLSCAFile},
+	} {
+		if v.path == "" {
+			continue
+		}
+		info, err := checkReadableFile(v.env, v.path)
+		if err != nil {
+			return err
+		}
+		if v.privateKey {
+			if err := checkPrivateKeyPermissions(v.env, v.path, info); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkReadableFile is CheckTLSMaterial's per-file half: it opens the file
+// (which is what proves it is readable — os.Stat only proves it exists) and
+// closes it again without reading a byte.
+func checkReadableFile(variable, path string) (os.FileInfo, error) {
+	f, err := os.Open(path) //nolint:gosec // the path is the operator's own, and nothing is read from it
+	if err != nil {
+		return nil, Refuse(CodeSecretError,
+			"%s names %q, which cannot be read (%s); bind-mount the file into the container read-only at that exact path and make it readable by the container user",
+			variable, path, errReason(err))
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, Refuse(CodeSecretError,
+			"%s names %q, which cannot be inspected (%s); bind-mount the file into the container read-only at that exact path",
+			variable, path, errReason(err))
+	}
+	if info.IsDir() {
+		return nil, Refuse(CodeSecretError,
+			"%s names %q, which is a directory; point %s at the PEM file itself, not at the directory the material is mounted in",
+			variable, path, variable)
+	}
+	if info.Size() == 0 {
+		return nil, Refuse(CodeSecretError,
+			"%s names %q, which is empty; write the PEM material into the file before starting the container",
+			variable, path)
+	}
+	return info, nil
+}
+
+// tlsKeyMode is the ONLY mode samba accepts on a TLS private key. It is not
+// this image's rule and it is not "no group or other access": samba compares
+// the low nine bits for equality and refuses 0400 exactly as it refuses 0644.
+//
+// Measured against Samba 4.24.7 in this image, by starting a DC on a key at
+// each mode:
+//
+//	0400  invalid permissions on file '…': has 0400 should be 0600
+//	0640  … has 0640 should be 0600
+//	0660  … has 0660 should be 0600
+//	0600  starts
+//
+// And it is fatal, not advisory. The message samba prints cites
+// CVE-2013-4476, `ldapsrv_task_init` then fails with
+// NT_STATUS_CANT_ACCESS_DOMAIN_INFO, and the whole server terminates — so a
+// DC whose key is mounted 0644 does not come up degraded, it does not come up
+// at all. Which is why this is worth checking here: the container log would
+// otherwise carry that failure twenty lines deep in samba's own output, and
+// the operator would be looking for a networking fault.
+const tlsKeyMode = os.FileMode(0o600)
+
+// checkPrivateKeyPermissions enforces tlsKeyMode, and the ownership samba
+// checks alongside it: the key must belong to the user samba runs as, which
+// is the user this process runs as.
+//
+// Ownership is the half a bind mount gets wrong by default. Docker preserves
+// the host file's uid, so a key generated by an ordinary user and mounted in
+// is owned by that user's uid inside the container — where samba runs as
+// root — and samba refuses it however carefully its mode was set.
+func checkPrivateKeyPermissions(variable, path string, info os.FileInfo) error {
+	if mode := info.Mode().Perm(); mode != tlsKeyMode {
+		return Refuse(CodeSecretError,
+			"%s names %q, whose permissions are %04o; samba refuses to start its LDAP server unless the TLS private key is exactly mode %04o (it cites CVE-2013-4476 and terminates), so run chmod %04o on the file before mounting it",
+			variable, path, mode, tlsKeyMode, tlsKeyMode)
+	}
+	if uid, ok := fileOwner(info); ok && uid != os.Getuid() {
+		return Refuse(CodeSecretError,
+			"%s names %q, which is owned by uid %d; samba refuses to start its LDAP server unless the TLS private key belongs to the user it runs as (uid %d in this container), so run chown %d:%d on the file on the host before mounting it",
+			variable, path, uid, os.Getuid(), os.Getuid(), os.Getgid())
+	}
+	return nil
+}
+
+// fileOwner returns the uid owning info, and whether the platform told us.
+// The stat structure is not part of the io/fs contract, so a type that does
+// not carry one leaves ownership unchecked rather than refused: on such a
+// platform this code cannot know, and refusing on ignorance would be worse
+// than letting samba have the last word.
+func fileOwner(info os.FileInfo) (int, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
+}
+
+// joinAnd renders a list of variable names for a sentence: "A", "A and B",
+// "A, B and C".
+func joinAnd(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0]
+	default:
+		return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+	}
+}
+
+// isAre picks the verb that agrees with a list rendered by joinAnd.
+func isAre(names []string) string {
+	if len(names) == 1 {
+		return "is"
+	}
+	return "are"
 }
 
 // indexGlobalOption returns the position of key in opts, or -1.

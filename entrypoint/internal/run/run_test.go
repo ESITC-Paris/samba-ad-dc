@@ -2424,3 +2424,173 @@ func (b *syncBuffer) reset() {
 	defer b.mu.Unlock()
 	b.buf.Reset()
 }
+
+// ---------------------------------------------------------------------------
+// SAMBA_TLS_CERT_FILE / SAMBA_TLS_KEY_FILE / SAMBA_TLS_CA_FILE
+// ---------------------------------------------------------------------------
+
+// tlsMaterialFiles writes three stand-in PEM files and returns their paths in
+// certificate, key, CA order. The content is irrelevant: nothing in the
+// entrypoint parses this material — samba does — so what is under test is
+// that the paths reach smb.conf and that a path which is not there stops the
+// boot.
+func tlsMaterialFiles(t *testing.T) (cert, key, ca string) {
+	t.Helper()
+	dir := t.TempDir()
+	for name, f := range map[string]struct {
+		content string
+		mode    os.FileMode
+	}{
+		"cert.pem": {"-----BEGIN CERTIFICATE-----\n", 0o644},
+		// The private key at 0600: the only mode samba accepts (the rule
+		// itself is pinned by config.TestCheckTLSMaterialKeyPermissions).
+		"key.pem": {"-----BEGIN PRIVATE KEY-----\n", 0o600},
+		"ca.pem":  {"-----BEGIN CERTIFICATE-----\n", 0o644},
+	} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(f.content), f.mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, f.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"), filepath.Join(dir, "ca.pem")
+}
+
+// withTLSMaterial points cfg at three readable files and returns their paths.
+func withTLSMaterial(t *testing.T, cfg *config.Config) (cert, key, ca string) {
+	t.Helper()
+	cert, key, ca = tlsMaterialFiles(t)
+	cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile = cert, key, ca
+	return cert, key, ca
+}
+
+// The material has to reach provision on the command line, because the
+// smb.conf provision generates is the one the DC's very first start reads:
+// a DC that served samba's self-signed certificate for its first boot and the
+// operator's from the second would be a DC whose identity changed under a
+// client that had already pinned it.
+func TestProvisionPassesTheTLSMaterialBeforeTheDeclaredOptions(t *testing.T) {
+	cfg := provisionConfig(t)
+	cert, key, ca := withTLSMaterial(t, cfg)
+	cfg.GlobalOptions = []config.GlobalOption{{Key: "max log size", Value: "4000"}}
+
+	args := redactArgs(provisionArgs(cfg, testSecret))
+	var got []string
+	for _, a := range args {
+		if strings.HasPrefix(a, "--option=tls ") || strings.HasPrefix(a, "--option=max log size") {
+			got = append(got, a)
+		}
+	}
+	want := []string{
+		"--option=tls certfile = " + cert,
+		"--option=tls keyfile = " + key,
+		"--option=tls cafile = " + ca,
+		"--option=max log size = 4000",
+	}
+	if !equalStrings(got, want) {
+		t.Errorf("provision got %v, want %v (full args %v)", got, want, args)
+	}
+}
+
+// Every start reconciles the material into smb.conf, the same way the
+// declarative block is reconciled — and each line is announced naming the
+// variable that asked for it, not the variable next to it.
+func TestEnsureGlobalOptionsAppliesTheTLSMaterial(t *testing.T) {
+	e, logBuf := newTestExecutor(t, newFakeRunner())
+	writeSMBConf(t, e.SMBConfPath)
+
+	cfg := runConfig(config.ModeRun)
+	cert, key, ca := withTLSMaterial(t, cfg)
+
+	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+		t.Fatalf("unexpected refusal %d: %s", ref.Code, ref.Msg)
+	}
+	conf := readFile(t, e.SMBConfPath)
+	for _, want := range []string{
+		"tls certfile = " + cert,
+		"tls keyfile = " + key,
+		"tls cafile = " + ca,
+	} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("smb.conf does not carry %q:\n%s", want, conf)
+		}
+	}
+	for _, want := range []string{
+		`SAMBA_TLS_CERT_FILE: added "tls certfile" = "` + cert + `" in ` + e.SMBConfPath,
+		`SAMBA_TLS_KEY_FILE: added "tls keyfile" = "` + key + `" in ` + e.SMBConfPath,
+		`SAMBA_TLS_CA_FILE: added "tls cafile" = "` + ca + `" in ` + e.SMBConfPath,
+	} {
+		if !strings.Contains(logBuf.String(), want) {
+			t.Errorf("the log does not carry %q:\n%s", want, logBuf.String())
+		}
+	}
+	// A second start with the same material must change nothing and say
+	// nothing: `tls enabled` is already yes on an AD DC, and a DC that
+	// rewrote its own configuration on every boot would make the log useless
+	// exactly when it matters.
+	logBuf.reset()
+	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+		t.Fatalf("second pass: unexpected refusal: %s", ref.Msg)
+	}
+	if logBuf.String() != "" {
+		t.Errorf("the second start re-applied the material:\n%s", logBuf.String())
+	}
+}
+
+// A path that is not there stops the boot BEFORE samba-tool runs. A provision
+// that went ahead would leave a volume claimed by a half-configured DC, and
+// the operator would have to delete it to retry — for a typo in a mount path.
+func TestExecuteRefusesUnreadableTLSMaterial(t *testing.T) {
+	r := newFakeRunner()
+	e, _ := newTestExecutor(t, r)
+	cfg := provisionConfig(t)
+	cert, _, ca := withTLSMaterial(t, cfg)
+	missing := filepath.Join(t.TempDir(), "never-mounted", "key.pem")
+	cfg.TLSKeyFile = missing
+
+	ref := e.Execute(context.Background(), cfg, modes.Plan{Kind: modes.ActProvision}, t.TempDir(), testImageVersion)
+	if ref == nil {
+		t.Fatal("expected a refusal for a TLS key file that is not there")
+	}
+	if ref.Code != config.CodeSecretError {
+		t.Errorf("refusal code = %d, want %d (secret material)", ref.Code, config.CodeSecretError)
+	}
+	for _, frag := range []string{"SAMBA_TLS_KEY_FILE", missing} {
+		if !strings.Contains(ref.Msg, frag) {
+			t.Errorf("message %q does not name %q", ref.Msg, frag)
+		}
+	}
+	// The two paths that ARE readable must not be quoted: the message has to
+	// point at the one thing to fix.
+	for _, other := range []string{cert, ca} {
+		if strings.Contains(ref.Msg, other) {
+			t.Errorf("message %q also names the readable %q", ref.Msg, other)
+		}
+	}
+	if n := r.countCalls("run", "samba-tool"); n != 0 {
+		t.Errorf("samba-tool ran %d time(s) despite the refusal (%v)", n, r.names())
+	}
+}
+
+// Maintenance starts no listener, so material it will never use must not stop
+// an operator from diagnosing a DC that does not run — the same reason
+// maintenance applies no [global] settings at all.
+func TestExecuteMaintenanceIgnoresTLSMaterial(t *testing.T) {
+	r := newFakeRunner()
+	e, _ := newTestExecutor(t, r)
+	original := writeSMBConf(t, e.SMBConfPath)
+
+	cfg := runConfig(config.ModeMaintenance)
+	withTLSMaterial(t, cfg)
+	cfg.TLSKeyFile = filepath.Join(t.TempDir(), "never-mounted", "key.pem")
+
+	dir := stateDirWith(t, &state.Marker{SambaVersion: testImageVersion, LastMode: "provision"})
+	if ref := e.Execute(context.Background(), cfg, modes.Plan{Kind: modes.ActMaintenance}, dir, testImageVersion); ref != nil {
+		t.Fatalf("maintenance refused over TLS material it does not use: %s", ref.Msg)
+	}
+	if got := readFile(t, e.SMBConfPath); got != string(original) {
+		t.Errorf("maintenance mode rewrote smb.conf:\nwas\n%s\nnow\n%s", original, got)
+	}
+}

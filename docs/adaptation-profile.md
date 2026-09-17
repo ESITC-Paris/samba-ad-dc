@@ -230,7 +230,10 @@ Nominal: provision; Kerberos authentication (kinit) and Kerberized SMB;
 NTLM authentication path; DNS SRV records served; LDAPS with certificate;
 signed-NTP wiring; database consistency; declarative `[global]` options
 applied, reconciled on a restart and refused when samba's own parser rejects
-them (`TestGlobalOptionsApplied`). Additional-DC join with
+them (`TestGlobalOptionsApplied`); LDAPS served with operator-supplied TLS
+material, verified by a client that trusts only the operator's CA, with the
+incomplete trio and the file that is not there refused
+(`TestCustomTLSMaterial`). Additional-DC join with
 bidirectional directory replication verified by object propagation both
 ways. Operational: idempotent restart without state loss; offline backup
 AND restore into a fresh instance with object-level verification; upgrade
@@ -576,6 +579,9 @@ against a running container. Exit codes are **immutable once released**.
 | `SAMBA_LOG_LEVEL` | all | `1` | samba debug level |
 | `SAMBA_CHRONY` | auto/provision/join/run | `on` | serve MS-SNTP signed time (`on|off`) |
 | `SAMBA_GLOBAL_OPTIONS` | auto/provision/join/run (not maintenance) | none | newline-separated `key = value` smb.conf `[global]` settings, reconciled on every start and validated by `testparm` (see below) |
+| `SAMBA_TLS_CERT_FILE` | auto/provision/join/run (not maintenance) | none | path **inside the container** of the LDAPS server certificate (PEM) |
+| `SAMBA_TLS_KEY_FILE` | auto/provision/join/run (not maintenance) | none | path inside the container of its private key (PEM), mode `0600`, owned by the container user |
+| `SAMBA_TLS_CA_FILE` | auto/provision/join/run (not maintenance) | none | path inside the container of the CA that issued the certificate (PEM) |
 | `SAMBA_MAINTENANCE_OP` | maintenance | `check` | `check` (dbcheck) or `repair` (dbcheck --fix --yes) |
 
 Secrets are accepted **only** through the `*_FILE` variables (§6.1).
@@ -693,6 +699,55 @@ says is copied to the container log and the boot continues. All of it is
 DEBUG output, which samba writes to stderr — hence `--debug-stdout`, which
 is what makes the diagnostics readable by the entrypoint.
 *Covered by:* `TestGlobalOptionsApplied`.
+
+**Bring your own TLS material: `SAMBA_TLS_CERT_FILE`, `SAMBA_TLS_KEY_FILE`,
+`SAMBA_TLS_CA_FILE`.** Unset, the DC serves LDAPS with the self-signed
+certificate samba generates for itself on the state volume — today's
+behaviour, unchanged, and what §4.5 of the deployment guide describes. Set,
+the three name PEM files **inside the container**, which the operator
+bind-mounts read-only (`/run/secrets/tls/` is the layout the guide and the
+E2E test use; `/run` is a tmpfs and a bind mounted under it works, as every
+`*_FILE` secret already shows). They become the `tls certfile`, `tls keyfile`
+and `tls cafile` `[global]` settings, applied through exactly the same
+mechanism as `SAMBA_GLOBAL_OPTIONS` — passed to provision with `--option` and
+reconciled into `smb.conf` on every start, ahead of the declarative block —
+so material replaced on the volume takes effect by recreating the container,
+not by provisioning a new domain. `tls enabled` is **not** set: it already
+defaults to `yes` on an AD DC (measured with `testparm`), and writing it
+would only invite the reading that LDAPS is off without it.
+
+*All three or none*, refused with exit 10 naming the ones that are missing.
+A partial trio would not fail loudly: samba falls back to its own self-signed
+material, so the DC would come up healthy serving a certificate nobody
+vouched for.
+
+*Each file is checked before anything shells out* — it must exist, be
+readable and not be empty — and a failure is exit **11**, the secret class,
+because one of the three is a private key. The message names the variable and
+the path and never the content.
+
+*The private key must be mode `0600` and owned by the user samba runs as*
+(uid 0 in this image). This is samba's rule, not the image's, it is an
+**exact** comparison, and it is **fatal**: measured against Samba 4.24.7 in
+this image, a key at `0400`, `0640` or `0660` is refused exactly as `0644` is
+(`invalid permissions on file '…': has 0640 should be 0600`), samba cites
+CVE-2013-4476, `ldapsrv_task_init` fails with
+`NT_STATUS_CANT_ACCESS_DOMAIN_INFO` and the whole server terminates. Docker
+preserves the host file's ownership across a bind mount, so a key generated
+by an ordinary user arrives owned by that user's uid and is refused however
+carefully its mode was set. The entrypoint therefore checks both and refuses
+with exit 11 naming the `chmod` and the `chown` to run, instead of leaving
+the operator to find samba's complaint twenty lines into its own output. The
+certificate and the CA are public material and their mode is not checked —
+samba reads them at any mode.
+
+*What renewal costs.* Replace the files and recreate the container: the
+reconciliation rewrites the three settings only when they changed, so a
+renewal that keeps the same paths changes nothing in `smb.conf` and samba
+simply reads the new material at startup. Nothing here reloads a certificate
+in place, and nothing checks its expiry — that is the operator's monitoring,
+not this image's.
+*Covered by:* `TestCustomTLSMaterial`.
 
 **`KRB5_CONFIG` is set in the image** to
 `/var/lib/samba/private/krb5.conf`, the Kerberos configuration both
@@ -1445,3 +1500,23 @@ gates.
   measured against Samba 4.24.7 in this image. B.5 gains the clause and
   `docs/traceability.md` row **N9** (`TestGlobalOptionsApplied`), the first
   row added since Phase 3 froze the set at 17.
+
+- 2026-09-17: Phase 6 — **operator TLS material for LDAPS**
+  (`SAMBA_TLS_CERT_FILE`, `SAMBA_TLS_KEY_FILE`, `SAMBA_TLS_CA_FILE`). The
+  Runtime contract gains the three variables and the *Bring your own TLS
+  material* section above: all-or-none (exit 10), each file checked before
+  anything shells out (exit 11, the secret class), and the three `tls *`
+  settings applied through the same reconciliation `SAMBA_GLOBAL_OPTIONS`
+  uses — which is what makes them changeable on a DC that already exists.
+  One measured fact decides the shape of the check and contradicts what the
+  task assumed: samba does not *warn* about a TLS private key at the wrong
+  mode, it **refuses to start** (`ldapsrv_task_init` →
+  `NT_STATUS_CANT_ACCESS_DOMAIN_INFO`, citing CVE-2013-4476), and its rule
+  is an exact `0600` plus ownership by the user samba runs as — `0400` is
+  refused as surely as `0644`. Measured against Samba 4.24.7 in this image by
+  starting a DC at each mode. Also measured: with the trio set, samba
+  generates no self-signed material at all
+  (`/var/lib/samba/private/tls` stays empty), and `tls enabled` is already
+  `yes` by default on an AD DC, so the image does not set it. B.5 gains the
+  clause and `docs/traceability.md` row **N10**
+  (`TestCustomTLSMaterial`).
