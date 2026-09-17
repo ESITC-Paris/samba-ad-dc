@@ -231,9 +231,10 @@ NTLM authentication path; DNS SRV records served; LDAPS with certificate;
 signed-NTP wiring; database consistency; declarative `[global]` options
 applied, reconciled on a restart and refused when samba's own parser rejects
 them (`TestGlobalOptionsApplied`); LDAPS served with operator-supplied TLS
-material, verified by a client that trusts only the operator's CA, with the
-incomplete trio and the file that is not there refused
-(`TestCustomTLSMaterial`). Additional-DC join with
+material, verified by a client that trusts only the operator's CA, reversible
+by unsetting the three variables, with the incomplete trio, the file that is
+not there and the key at the wrong mode refused (`TestCustomTLSMaterial`).
+Additional-DC join with
 bidirectional directory replication verified by object propagation both
 ways. Operational: idempotent restart without state loss; offline backup
 AND restore into a fresh instance with object-level verification; upgrade
@@ -579,9 +580,9 @@ against a running container. Exit codes are **immutable once released**.
 | `SAMBA_LOG_LEVEL` | all | `1` | samba debug level |
 | `SAMBA_CHRONY` | auto/provision/join/run | `on` | serve MS-SNTP signed time (`on|off`) |
 | `SAMBA_GLOBAL_OPTIONS` | auto/provision/join/run (not maintenance) | none | newline-separated `key = value` smb.conf `[global]` settings, reconciled on every start and validated by `testparm` (see below) |
-| `SAMBA_TLS_CERT_FILE` | auto/provision/join/run (not maintenance) | none | path **inside the container** of the LDAPS server certificate (PEM) |
-| `SAMBA_TLS_KEY_FILE` | auto/provision/join/run (not maintenance) | none | path inside the container of its private key (PEM), mode `0600`, owned by the container user |
-| `SAMBA_TLS_CA_FILE` | auto/provision/join/run (not maintenance) | none | path inside the container of the CA that issued the certificate (PEM) |
+| `SAMBA_TLS_CERT_FILE` | auto/provision/join/run (not maintenance) | none | **absolute path inside the container** of the LDAPS server certificate (PEM) |
+| `SAMBA_TLS_KEY_FILE` | auto/provision/join/run (not maintenance) | none | absolute path inside the container of its private key (PEM), mode `0600`, owned by the container user |
+| `SAMBA_TLS_CA_FILE` | auto/provision/join/run (not maintenance) | none | absolute path inside the container of the CA that issued the certificate (PEM) |
 | `SAMBA_MAINTENANCE_OP` | maintenance | `check` | `check` (dbcheck) or `repair` (dbcheck --fix --yes) |
 
 Secrets are accepted **only** through the `*_FILE` variables (§6.1).
@@ -716,6 +717,14 @@ not by provisioning a new domain. `tls enabled` is **not** set: it already
 defaults to `yes` on an AD DC (measured with `testparm`), and writing it
 would only invite the reading that LDAPS is off without it.
 
+*Absolute paths only*, refused with exit 10 naming the variable. The two
+programs disagree about what a relative path means: this entrypoint would
+resolve it against its own working directory, while samba resolves `tls
+certfile` against the private directory on the state volume — that is what
+its defaults `tls/cert.pem`, `tls/key.pem` and `tls/ca.pem` are relative to
+(measured). A check that passed on one file while samba opened another would
+be worse than no check.
+
 *All three or none*, refused with exit 10 naming the ones that are missing.
 A partial trio does not fail loudly. The settings left unset keep samba's own
 defaults — `tls/cert.pem`, `tls/key.pem` and `tls/ca.pem` under the private
@@ -744,6 +753,23 @@ with exit 11 naming the `chmod` and the `chown` to run, instead of leaving
 the operator to find samba's complaint twenty lines into its own output. The
 certificate and the CA are public material and their mode is not checked —
 samba reads them at any mode.
+
+*Unsetting the three is the way back, and the reconciliation implements it.*
+`tls certfile`, `tls keyfile` and `tls cafile` are keys the IMAGE owns — they
+are the ones `SAMBA_GLOBAL_OPTIONS` refuses — so when the variables are unset
+the three lines are REMOVED from `[global]`, one log line each (`removed "tls
+keyfile" from /etc/samba/smb.conf: SAMBA_TLS_*_FILE are unset`), gated by
+testparm like any other rewrite. This is the one exception to *reconciliation
+adds and replaces; it does not remove* above, and it is exactly as narrow as
+the reason for it: three named keys nothing but this image ever writes.
+Without it the trio would be a one-way door — `smb.conf` lives on a volume, so
+a DC that once had the variables would name files whose mount is gone, for
+ever, with no remedy an operator could reach. What samba does next was
+measured, not assumed: on the following start it autogenerates its own
+self-signed material on demand (`Attempting to autogenerate TLS self-signed
+keys … TLS self-signed keys generated OK`), at `0600`, even on a DC that never
+had any, and LDAPS comes back up on it. So it is a full return to the default
+behaviour, not a degraded state, and not a limitation.
 
 *What renewal costs.* Replace the files and recreate the container: the
 reconciliation rewrites the three settings only when they changed, so a
@@ -1524,3 +1550,14 @@ gates.
   `yes` by default on an AD DC, so the image does not set it. B.5 gains the
   clause and `docs/traceability.md` row **N10**
   (`TestCustomTLSMaterial`).
+
+  Fix round: the three variables take **absolute** paths only (exit 10) —
+  samba resolves a relative TLS path against the private directory on the
+  state volume and this entrypoint would resolve it against its working
+  directory, so the check and the read could diverge; and the trio is now
+  **reversible** — unsetting the variables REMOVES `tls certfile`, `tls
+  keyfile` and `tls cafile` from `[global]`, which it may because those keys
+  are the image's own, after which samba autogenerates its self-signed
+  material on demand at start (measured) and LDAPS comes back up on it.
+  Without that, a DC that once had the variables would have named a mount
+  that is gone for ever, since `SAMBA_GLOBAL_OPTIONS` refuses those keys.

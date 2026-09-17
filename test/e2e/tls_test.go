@@ -24,6 +24,7 @@ const (
 	customTLSBadKey  = "customtls-bad"
 	customTLSPartial = "customtls-two"
 	customTLSBadMode = "customtls-mode"
+	customTLSBack    = "customtls-back"
 )
 
 // Where the material is mounted inside the DC, and what the three variables
@@ -45,7 +46,8 @@ const customCAName = "samba-ad-dc E2E operator CA"
 // one provision, two containers that are expected to refuse, and the stop in
 // between. Checked before anything is started, for the reason requireDeadline
 // documents: being killed by `go test` skips every teardown.
-const customTLSWorstCase = harness.HealthTimeout + 3*harness.ExitTimeout + stopTimeout + 2*time.Minute
+const customTLSWorstCase = harness.HealthTimeout + harness.HealthTransitionTimeout +
+	3*harness.ExitTimeout + 2*stopTimeout + 2*time.Minute
 
 // tlsMaterial is the PEM material one run of generateTLSMaterial produced.
 type tlsMaterial struct {
@@ -198,6 +200,11 @@ func tlsEnv(cert, key, ca string) map[string]string {
 //     it does not — the chain is genuinely being checked;
 //   - a path that is not mounted exits 11 naming the variable, and a trio
 //     missing one variable exits 10 naming the one to set;
+//   - unsetting the three variables is a way BACK: the three settings are
+//     taken out of smb.conf again and the DC returns to samba's own material.
+//     Without that the trio would be a one-way door, since smb.conf lives on
+//     a volume and those keys are exactly the ones SAMBA_GLOBAL_OPTIONS
+//     refuses;
 //   - a private key at any mode but 0600 exits 11 before any daemon starts.
 //     That last one is not this image's rule but samba's, it is exact (0400
 //     is refused as surely as 0644) and it is fatal — samba refuses to start
@@ -353,4 +360,62 @@ func TestCustomTLSMaterial(t *testing.T) {
 			exit, exitSecretError, logs)
 	}
 	mustContain(t, "refusal of "+customTLSBadMode, logs, "SAMBA_TLS_KEY_FILE", "0600")
+
+	// --- the way back ----------------------------------------------------
+	//
+	// A new container on the SAME volumes with the three variables gone and
+	// the material not even mounted — an operator undoing the change. The
+	// three settings must be taken back OUT of smb.conf: they live on a
+	// volume, and SAMBA_GLOBAL_OPTIONS refuses those very keys, so a DC that
+	// kept them would point at a mount that no longer exists with no remedy
+	// at all.
+	//
+	// What samba then does was measured rather than assumed: it autogenerates
+	// its self-signed material on demand at start ("Attempting to
+	// autogenerate TLS self-signed keys … TLS self-signed keys generated
+	// OK"), even on a DC that never had any, and LDAPS comes back up on it.
+	back := harness.StartDC(t, net, customTLSBack, "run", nil,
+		harness.WithVolumes(dc.StateVolume, dc.ConfVolume))
+	harness.WaitHealthy(t, back.Name, harness.HealthTransitionTimeout)
+
+	backLogs := harness.Logs(t, back.Name)
+	for _, key := range []string{"tls certfile", "tls keyfile", "tls cafile"} {
+		mustContain(t, "the way back on "+back.Name, backLogs,
+			`removed "`+key+`" from `+smbConfPath+": SAMBA_TLS_*_FILE are unset")
+	}
+	// Read back through samba's own parser, which is what decides: with the
+	// lines gone it reports the compile-time defaults, relative to the
+	// private directory on the state volume.
+	for _, want := range []struct{ key, value string }{
+		{"tls certfile", "tls/cert.pem"},
+		{"tls keyfile", "tls/key.pem"},
+		{"tls cafile", "tls/ca.pem"},
+	} {
+		if got := globalSetting(t, back.Name, want.key); got != want.value {
+			t.Fatalf("after unsetting the variables samba still reads %q = %q, want its default %q\n--- logs ---\n%s",
+				want.key, got, want.value, backLogs)
+		}
+	}
+	// And LDAPS actually works again, on material samba made for itself.
+	regenerated := harness.CopyFrom(t, back.Name, "/var/lib/samba/private/tls/ca.pem")
+	backSearch := "ldapsearch -H ldaps://" + fqdn + ":636 -x -s base -b '' dnsHostName"
+	out = harness.Client(t, net, map[string]string{
+		harness.ClientDNSEnv: back.IP,
+		"E2E_CA_PEM":         string(regenerated),
+	}, "sh", "-c", `printf %s "$E2E_CA_PEM" > /tmp/ca.pem; `+
+		"LDAPTLS_CACERT=/tmp/ca.pem LDAPTLS_REQCERT=demand "+backSearch)
+	mustContain(t, "ldaps after the way back", out,
+		"dnsHostName: "+fqdn, "result: 0 Success")
+
+	// The operator's CA must now be useless — the mirror image of the first
+	// half of this test, and what proves the DC really did change back.
+	code, out = harness.ClientErr(t, net, map[string]string{
+		harness.ClientDNSEnv: back.IP,
+		"E2E_CA_PEM":         material.caPEM,
+	}, "sh", "-c", `printf %s "$E2E_CA_PEM" > /tmp/ca.pem; `+
+		"LDAPTLS_CACERT=/tmp/ca.pem LDAPTLS_REQCERT=demand "+backSearch)
+	if code == 0 {
+		t.Fatalf("ldaps still verifies against the operator's CA after the variables were "+
+			"unset: the material was not taken back out:\n%s", out)
+	}
 }

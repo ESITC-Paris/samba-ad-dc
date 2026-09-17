@@ -704,11 +704,14 @@ services:
       - ./tls:/run/secrets/tls:ro
 ```
 
-The paths are paths **inside the container**. `/run` is a tmpfs and a bind
-mounted under it works — it is where this image already puts every `*_FILE`
-secret. Do not put the material on the `/etc/samba` or `/var/lib/samba`
-volumes: those belong to the DC, and material you renew from outside has no
-business living on one.
+The paths are **absolute paths inside the container**, and a relative one is
+refused with exit 10: samba resolves a relative TLS path against the private
+directory on the state volume, the entrypoint would resolve it against its own
+working directory, and a check that passed on a file samba never opens would
+be worse than no check. `/run` is a tmpfs and a bind mounted under it works —
+it is where this image already puts every `*_FILE` secret. Do not put the
+material on the `/etc/samba` or `/var/lib/samba` volumes: those belong to the
+DC, and material you renew from outside has no business living on one.
 
 **All three or none.** Setting one or two is refused with exit 10 naming the
 ones that are missing. It is refused rather than half-applied because a
@@ -737,6 +740,53 @@ with exit 11 — the same class as a missing password file, because one of the
 three is a private key — naming the variable, the path and the command to
 run. It never prints the content.
 
+**Delivering a root-owned `0600` key without `sudo`.** Both orchestrators can
+do it declaratively, and that is the better answer wherever it is available:
+
+*Docker Swarm* — the long form of `secrets:` sets owner and mode on the file
+it materialises, so nothing on the host has to be root-owned:
+
+```yaml
+services:
+  dc1:
+    secrets:
+      - source: dc-tls-key
+        target: /run/secrets/tls/key.pem
+        uid: "0"
+        gid: "0"
+        mode: 0600
+      - source: dc-tls-cert
+        target: /run/secrets/tls/cert.pem
+        mode: 0644
+      - source: dc-tls-ca
+        target: /run/secrets/tls/ca.pem
+        mode: 0644
+```
+
+*Kubernetes* — a `secret` volume, with the key's mode set on its item. The
+container runs as root in this image, so the file is owned by uid 0 already:
+
+```yaml
+      volumes:
+        - name: dc-tls
+          secret:
+            secretName: dc-tls
+            defaultMode: 0644
+            items:
+              - key: key.pem
+                path: key.pem
+                mode: 0600
+              - key: cert.pem
+                path: cert.pem
+              - key: ca.pem
+                path: ca.pem
+```
+
+*Plain Compose or `docker run`* — a bind mount carries the host file's owner
+and mode through unchanged, which is why this is the one case that needs the
+`chown`/`chmod` above. `secrets:` with a `file:` source in non-Swarm Compose
+is a bind mount too, and behaves the same way.
+
 **The certificate has to match the name clients dial.** Its subject
 alternative name must carry the DC's FQDN (`dc1.ad.example.com`), the name
 the realm's DNS hands out; a certificate for the container's short name or
@@ -750,6 +800,18 @@ empty). On **every later start**, provision-, join- and run-mode alike, the
 three settings are reconciled into `/etc/samba/smb.conf` the same way §3.5's
 declarative settings are, and each change is one log line. Maintenance mode
 touches none of it.
+
+**To go back** to the certificate samba makes for itself, unset the three
+variables and recreate the container. The entrypoint then takes the three
+`tls *` lines back out of `/etc/samba/smb.conf` — one log line each,
+`removed "tls keyfile" from /etc/samba/smb.conf: SAMBA_TLS_*_FILE are unset` —
+and samba autogenerates its own self-signed material on the next start, at
+`0600`, even on a DC that never had any. Measured: `Attempting to autogenerate
+TLS self-signed keys for https for hostname '…'` / `TLS self-signed keys
+generated OK`, and `ldapsearch` over `ldaps://` works against the newly
+generated CA. Removal is the one thing the reconciliation does that §3.5's
+declarative settings do not get, and deliberately so: these three keys are the
+image's own, which is what makes taking them out safe.
 
 **To renew**, replace the files with the new material at the same paths and
 recreate the container. Nothing here reloads a certificate in a running

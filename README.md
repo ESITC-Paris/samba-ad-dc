@@ -175,9 +175,9 @@ authoritative; the tables below are a copy of it. Exit codes are
 | `SAMBA_LOG_LEVEL` | all | `1` | samba debug level |
 | `SAMBA_CHRONY` | auto/provision/join/run | `on` | serve MS-SNTP signed time (`on\|off`) |
 | `SAMBA_GLOBAL_OPTIONS` | auto/provision/join/run (not maintenance) | none | newline-separated `key = value` smb.conf `[global]` settings, reconciled on every start and validated by `testparm`; see the deployment guide §3.5 |
-| `SAMBA_TLS_CERT_FILE` | auto/provision/join/run (not maintenance) | none | path **inside the container** of the LDAPS server certificate (PEM); all three `SAMBA_TLS_*` variables or none |
-| `SAMBA_TLS_KEY_FILE` | auto/provision/join/run (not maintenance) | none | its private key (PEM); samba requires mode `0600` owned by the container user, and the entrypoint refuses the start otherwise |
-| `SAMBA_TLS_CA_FILE` | auto/provision/join/run (not maintenance) | none | the CA that issued the certificate (PEM); see the deployment guide §4.5 |
+| `SAMBA_TLS_CERT_FILE` | auto/provision/join/run (not maintenance) | none | **absolute path inside the container** of the LDAPS server certificate (PEM); all three `SAMBA_TLS_*` variables or none |
+| `SAMBA_TLS_KEY_FILE` | auto/provision/join/run (not maintenance) | none | absolute path inside the container of its private key (PEM); samba requires mode `0600` owned by the container user, and the entrypoint refuses the start otherwise |
+| `SAMBA_TLS_CA_FILE` | auto/provision/join/run (not maintenance) | none | absolute path inside the container of the CA that issued the certificate (PEM); unsetting all three puts the DC back on samba's own material — see the deployment guide §4.5 |
 | `SAMBA_MAINTENANCE_OP` | maintenance | `check` | `check` (dbcheck) or `repair` (dbcheck --fix --yes) |
 
 Secrets are accepted **only** through the `*_FILE` variables. Setting a

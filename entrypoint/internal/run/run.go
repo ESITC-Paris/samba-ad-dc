@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -505,15 +506,35 @@ func (e *Executor) ensureJoinedConf(cfg *config.Config) *config.Refusal {
 // they are looking at.
 func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) *config.Refusal {
 	options := cfg.EffectiveGlobalOptions()
-	if len(options) == 0 {
-		return nil
+
+	// The three `tls *` keys are the IMAGE's, not the operator's, and that
+	// is what makes taking them back out safe — and necessary. smb.conf
+	// lives on a volume, so a DC that once had the SAMBA_TLS_* variables
+	// would otherwise keep naming files whose mount is gone, for ever, with
+	// no remedy: those keys are exactly the ones SAMBA_GLOBAL_OPTIONS
+	// refuses. Removing them hands the DC back to samba's own material,
+	// which makes unsetting the variables a real way back rather than a
+	// one-way door. The declarative block is NOT removed this way, for the
+	// reason in this function's doc comment: nothing can tell a line the
+	// operator wrote from one this wrote last boot.
+	var removals []string
+	if len(cfg.TLSOptions()) == 0 {
+		removals = config.TLSOptionKeys()
 	}
+
 	for _, key := range cfg.GlobalOptionsShadowed {
 		e.logf("SAMBA_GLOBAL_OPTIONS: %q is set more than once; the last occurrence wins", key)
 	}
 
 	original, err := os.ReadFile(e.SMBConfPath)
 	if err != nil {
+		if len(options) == 0 {
+			// Nothing declared, so the only work left would be REMOVING
+			// settings from a file that cannot be read — which this could not
+			// do anyway. A container that declares nothing must not refuse
+			// over a file it would otherwise never touch.
+			return nil
+		}
 		return config.Refuse(config.CodeRuntimeFailure,
 			"the configuration file %q that the declared [global] settings must be applied to cannot be read (%s); mount /etc/samba read-write, or unset SAMBA_GLOBAL_OPTIONS and the SAMBA_TLS_* variables",
 			e.SMBConfPath, oneLine(err.Error()))
@@ -537,8 +558,20 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 		source := config.OptionSource(o.Key)
 		announcements = append(announcements,
 			fmt.Sprintf("%s: %s %q = %q in %s", source, verb, o.Key, o.Value, e.SMBConfPath))
-		if !containsString(sources, source) {
+		if !slices.Contains(sources, source) {
 			sources = append(sources, source)
+		}
+	}
+	for _, key := range removals {
+		updated, gone := withoutGlobalSetting(conf, key)
+		if !gone {
+			continue
+		}
+		conf = updated
+		announcements = append(announcements,
+			fmt.Sprintf("removed %q from %s: %s are unset", key, e.SMBConfPath, config.EnvTLSGroup))
+		if !slices.Contains(sources, config.EnvTLSGroup) {
+			sources = append(sources, config.EnvTLSGroup)
 		}
 	}
 	// Nothing to do is the steady state, and it says nothing: an operator
@@ -564,16 +597,6 @@ func (e *Executor) ensureGlobalOptions(ctx context.Context, cfg *config.Config) 
 		e.logf("%s", a)
 	}
 	return nil
-}
-
-// containsString reports whether values holds want.
-func containsString(values []string, want string) bool {
-	for _, v := range values {
-		if v == want {
-			return true
-		}
-	}
-	return false
 }
 
 // checkSMBConf asks testparm whether the file that was just rewritten is a
@@ -637,11 +660,11 @@ func (e *Executor) checkSMBConf(ctx context.Context, original []byte, sources st
 
 	if rerr := writeFileAtomic(e.SMBConfPath, original, 0o644); rerr != nil {
 		return config.Refuse(config.CodeConfigError,
-			"testparm rejects the [global] settings %s declares (%s) and %q could not be put back (%s); fix or remove the offending entry in %s — the configuration volume still holds the rejected settings",
+			"testparm rejects the [global] section this start wrote from %s (%s) and %q could not be put back (%s); fix %s — the configuration volume still holds the rejected settings",
 			sources, problem, e.SMBConfPath, oneLine(rerr.Error()), sources)
 	}
 	return config.Refuse(config.CodeConfigError,
-		"testparm rejects the [global] settings %s declares (%s); %s has been put back to what it held before this start, so fix or remove the offending entry in %s and start the container again",
+		"testparm rejects the [global] section this start wrote from %s (%s); %s has been put back to what it held before this start, so fix or remove the offending entry in %s and start the container again",
 		sources, problem, e.SMBConfPath, sources)
 }
 
@@ -1270,6 +1293,48 @@ func withGlobalSetting(conf, key, value string) (string, confEdit) {
 		out += "\n\n"
 	}
 	return out + "[global]\n" + entry + "\n", confAdded
+}
+
+// withoutGlobalSetting returns conf with EVERY [global] line setting key
+// removed, and says whether anything changed. It is the counterpart of
+// withGlobalSetting, and like it, it is pure and idempotent.
+//
+// It exists for exactly one class of key: the ones this image owns and writes
+// itself. The `tls *` files are the case — they are written when the
+// SAMBA_TLS_* variables are set, and smb.conf lives on a volume, so without a
+// way back a DC that once had them would keep pointing at a mount the
+// operator has removed, with no remedy at all (SAMBA_GLOBAL_OPTIONS refuses
+// those very keys). It must never be pointed at a key the OPERATOR may have
+// written by hand: nothing here can tell their line from ours, which is the
+// same reason ensureGlobalOptions does not remove the declarative block.
+//
+// Scoped to [global], matching on the key alone — the value is irrelevant
+// when the whole setting is going — and every occurrence goes, because a file
+// that somehow carried two would otherwise keep one.
+func withoutGlobalSetting(conf, key string) (string, bool) {
+	lines := strings.Split(conf, "\n")
+	out := make([]string, 0, len(lines))
+
+	section := ""
+	removed := false
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		switch {
+		case t == "" || strings.HasPrefix(t, "#") || strings.HasPrefix(t, ";"):
+		case strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]"):
+			section = strings.ToLower(strings.TrimSpace(t[1 : len(t)-1]))
+		case section == "global":
+			if k, _, ok := strings.Cut(t, "="); ok && strings.EqualFold(normalize(k), key) {
+				removed = true
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	if !removed {
+		return conf, false
+	}
+	return strings.Join(out, "\n"), true
 }
 
 // normalize collapses the whitespace of one smb.conf key or value so that

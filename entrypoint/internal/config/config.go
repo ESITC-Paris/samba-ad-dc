@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -287,6 +288,9 @@ const (
 	EnvTLSCertFile = "SAMBA_TLS_CERT_FILE"
 	EnvTLSKeyFile  = "SAMBA_TLS_KEY_FILE"
 	EnvTLSCAFile   = "SAMBA_TLS_CA_FILE"
+	// EnvTLSGroup names the three at once, for the one message that is
+	// about their ABSENCE and can therefore name none of them individually.
+	EnvTLSGroup = "SAMBA_TLS_*_FILE"
 
 	tlsCertFileKey = "tls certfile"
 	tlsKeyFileKey  = "tls keyfile"
@@ -448,12 +452,38 @@ func checkTLSTrio(cfg *Config) error {
 			set = append(set, v.env)
 		}
 	}
-	if len(set) == 0 || len(missing) == 0 {
-		return nil
+	if len(set) > 0 && len(missing) > 0 {
+		return Refuse(CodeConfigError,
+			"%s %s set but %s %s not; serving LDAPS with your own material takes the certificate, its private key and the CA that issued it, so set all three or none — with none of them set this domain controller serves the self-signed certificate samba generates for itself",
+			joinAnd(set), isAre(set), joinAnd(missing), isAre(missing))
 	}
-	return Refuse(CodeConfigError,
-		"%s %s set but %s %s not; serving LDAPS with your own material takes the certificate, its private key and the CA that issued it, so set all three or none — with none of them set this domain controller serves the self-signed certificate samba generates for itself",
-		joinAnd(set), isAre(set), joinAnd(missing), isAre(missing))
+	// A relative path would be read by two different programs from two
+	// different directories. This process resolves it against its own working
+	// directory; samba resolves `tls certfile` against the PRIVATE directory
+	// on the state volume — that is what its defaults `tls/cert.pem`,
+	// `tls/key.pem` and `tls/ca.pem` are relative to (measured). So the check
+	// below could pass on a file samba never opens, which is the one outcome
+	// checking at all is meant to rule out.
+	for _, v := range []struct{ env, path string }{
+		{EnvTLSCertFile, cfg.TLSCertFile},
+		{EnvTLSKeyFile, cfg.TLSKeyFile},
+		{EnvTLSCAFile, cfg.TLSCAFile},
+	} {
+		if v.path != "" && !filepath.IsAbs(v.path) {
+			return Refuse(CodeConfigError,
+				"%s is %q, which is not an absolute path; samba resolves a relative TLS path against the private directory on the state volume while this entrypoint would resolve it against its own working directory, so set %s to the absolute path the file has inside the container, for example /run/secrets/tls/cert.pem",
+				v.env, v.path, v.env)
+		}
+	}
+	return nil
+}
+
+// TLSOptionKeys are the three [global] parameters the SAMBA_TLS_* variables
+// own. They are needed even when the variables are UNSET: those keys belong
+// to the image, so unsetting the variables has to take them back OUT of
+// smb.conf rather than leave a DC pointing at a mount that is gone.
+func TLSOptionKeys() []string {
+	return []string{tlsCertFileKey, tlsKeyFileKey, tlsCAFileKey}
 }
 
 // TLSOptions renders the operator's own LDAPS material as the three [global]
@@ -543,18 +573,14 @@ func CheckTLSMaterial(c *Config) error {
 // (which is what proves it is readable — os.Stat only proves it exists) and
 // closes it again without reading a byte.
 func checkReadableFile(variable, path string) (os.FileInfo, error) {
-	f, err := os.Open(path) //nolint:gosec // the path is the operator's own, and nothing is read from it
+	// Stat BEFORE open, and refuse anything that is not a regular file.
+	// Opening first would be a way to hang the boot forever: a FIFO at the
+	// path blocks in open(2) until somebody writes to it, and a container
+	// stuck there never starts and never says why.
+	info, err := os.Stat(path)
 	if err != nil {
 		return nil, Refuse(CodeSecretError,
 			"%s names %q, which cannot be read (%s); bind-mount the file into the container read-only at that exact path and make it readable by the container user",
-			variable, path, errReason(err))
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, Refuse(CodeSecretError,
-			"%s names %q, which cannot be inspected (%s); bind-mount the file into the container read-only at that exact path",
 			variable, path, errReason(err))
 	}
 	if info.IsDir() {
@@ -562,11 +588,26 @@ func checkReadableFile(variable, path string) (os.FileInfo, error) {
 			"%s names %q, which is a directory; point %s at the PEM file itself, not at the directory the material is mounted in",
 			variable, path, variable)
 	}
+	if !info.Mode().IsRegular() {
+		return nil, Refuse(CodeSecretError,
+			"%s names %q, which is not a regular file (%s); point %s at the PEM file itself",
+			variable, path, info.Mode().Type(), variable)
+	}
 	if info.Size() == 0 {
 		return nil, Refuse(CodeSecretError,
 			"%s names %q, which is empty; write the PEM material into the file before starting the container",
 			variable, path)
 	}
+
+	// Opening is what proves the file is READABLE — a stat succeeds on a
+	// file whose mode denies it. Nothing is read from the handle.
+	f, err := os.Open(path) //nolint:gosec // the path is the operator's own, and nothing is read from it
+	if err != nil {
+		return nil, Refuse(CodeSecretError,
+			"%s names %q, which cannot be read (%s); bind-mount the file into the container read-only at that exact path and make it readable by the container user",
+			variable, path, errReason(err))
+	}
+	_ = f.Close()
 	return info, nil
 }
 
@@ -600,18 +641,26 @@ const tlsKeyMode = os.FileMode(0o600)
 // is owned by that user's uid inside the container — where samba runs as
 // root — and samba refuses it however carefully its mode was set.
 func checkPrivateKeyPermissions(variable, path string, info os.FileInfo) error {
+	want := tlsKeyOwner()
 	if mode := info.Mode().Perm(); mode != tlsKeyMode {
 		return Refuse(CodeSecretError,
 			"%s names %q, whose permissions are %04o; samba refuses to start its LDAP server unless the TLS private key is exactly mode %04o (it cites CVE-2013-4476 and terminates), so run chmod %04o on the file before mounting it",
 			variable, path, mode, tlsKeyMode, tlsKeyMode)
 	}
-	if uid, ok := fileOwner(info); ok && uid != os.Getuid() {
+	if uid, ok := fileOwner(info); ok && uid != want {
 		return Refuse(CodeSecretError,
 			"%s names %q, which is owned by uid %d; samba refuses to start its LDAP server unless the TLS private key belongs to the user it runs as (uid %d in this container), so run chown %d:%d on the file on the host before mounting it",
-			variable, path, uid, os.Getuid(), os.Getuid(), os.Getgid())
+			variable, path, uid, want, want, os.Getegid())
 	}
 	return nil
 }
+
+// tlsKeyOwner reports the uid the TLS private key must belong to. It is a
+// variable so a unit test can pin the ownership refusal without needing a
+// file it is not allowed to create, and it is the EFFECTIVE uid because that
+// is what samba compares against (file_check_permissions is called with
+// geteuid()).
+var tlsKeyOwner = os.Geteuid
 
 // fileOwner returns the uid owning info, and whether the platform told us.
 // The stat structure is not part of the io/fs contract, so a type that does

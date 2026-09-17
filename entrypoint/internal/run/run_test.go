@@ -2594,3 +2594,167 @@ func TestExecuteMaintenanceIgnoresTLSMaterial(t *testing.T) {
 		t.Errorf("maintenance mode rewrote smb.conf:\nwas\n%s\nnow\n%s", original, got)
 	}
 }
+
+// smbConfWithTLS is a provisioned-looking smb.conf that already names the
+// operator's material — what the volume of a DC that HAD the trio holds.
+const smbConfWithTLS = "[global]\n\trealm = AD.EXAMPLE.COM\n\tworkgroup = AD\n" +
+	"\ttls certfile = /run/secrets/tls/cert.pem\n" +
+	"\ttls keyfile = /run/secrets/tls/key.pem\n" +
+	"\ttls cafile = /run/secrets/tls/ca.pem\n"
+
+// writeSMBConfWith writes conf at path and returns its bytes.
+func writeSMBConfWith(t *testing.T, path, conf string) []byte {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(conf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return []byte(conf)
+}
+
+// TestEnsureGlobalOptionsRemovesTheTLSMaterialWhenUnset is the way back.
+//
+// Without it the trio is a one-way door: the three settings are written into
+// an smb.conf that lives on a volume, so a DC that once had them keeps them
+// forever — pointing at a mount the operator has removed — and there is no
+// remedy, because those keys are exactly the ones SAMBA_GLOBAL_OPTIONS
+// refuses. They are the image's to write, so they are the image's to take
+// back out.
+func TestEnsureGlobalOptionsRemovesTheTLSMaterialWhenUnset(t *testing.T) {
+	e, logBuf := newTestExecutor(t, newFakeRunner())
+	writeSMBConfWith(t, e.SMBConfPath, smbConfWithTLS)
+
+	// A run-mode config with no SAMBA_TLS_* and no SAMBA_GLOBAL_OPTIONS:
+	// the operator took the variables out and recreated the container.
+	if ref := e.ensureGlobalOptions(context.Background(), runConfig(config.ModeRun)); ref != nil {
+		t.Fatalf("unexpected refusal %d: %s", ref.Code, ref.Msg)
+	}
+
+	conf := readFile(t, e.SMBConfPath)
+	for _, gone := range []string{"tls certfile", "tls keyfile", "tls cafile"} {
+		if strings.Contains(conf, gone) {
+			t.Errorf("%q survived the start that unset the variables:\n%s", gone, conf)
+		}
+	}
+	// Everything else is untouched: this removes three named keys, not
+	// whatever else happens to be in [global].
+	for _, kept := range []string{"realm = AD.EXAMPLE.COM", "workgroup = AD"} {
+		if !strings.Contains(conf, kept) {
+			t.Errorf("the removal took %q with it:\n%s", kept, conf)
+		}
+	}
+	for _, want := range []string{
+		`removed "tls certfile" from ` + e.SMBConfPath,
+		`removed "tls keyfile" from ` + e.SMBConfPath,
+		`removed "tls cafile" from ` + e.SMBConfPath,
+		"SAMBA_TLS_*_FILE are unset",
+	} {
+		if !strings.Contains(logBuf.String(), want) {
+			t.Errorf("the log does not carry %q:\n%s", want, logBuf.String())
+		}
+	}
+}
+
+// The steady state of a DC that never had the trio: nothing to remove, so
+// nothing is written and nothing is said. Without this the removal would
+// rewrite smb.conf on every single boot of every DC in existence.
+func TestEnsureGlobalOptionsRemovesNothingWhenThereIsNoTLSMaterial(t *testing.T) {
+	r := newFakeRunner()
+	e, logBuf := newTestExecutor(t, r)
+	original := writeSMBConf(t, e.SMBConfPath)
+
+	if ref := e.ensureGlobalOptions(context.Background(), runConfig(config.ModeRun)); ref != nil {
+		t.Fatalf("unexpected refusal: %s", ref.Msg)
+	}
+	if got := readFile(t, e.SMBConfPath); got != string(original) {
+		t.Errorf("smb.conf was rewritten with nothing to remove:\nwas\n%s\nnow\n%s", original, got)
+	}
+	if n := r.countCalls("output", "testparm"); n != 0 {
+		t.Errorf("testparm ran %d time(s) for a start that changed nothing", n)
+	}
+	if logBuf.String() != "" {
+		t.Errorf("the log is not silent:\n%s", logBuf.String())
+	}
+}
+
+// A start that still HAS the trio must not remove what it just applied.
+func TestEnsureGlobalOptionsKeepsTheTLSMaterialWhileItIsSet(t *testing.T) {
+	e, logBuf := newTestExecutor(t, newFakeRunner())
+	writeSMBConfWith(t, e.SMBConfPath, smbConfWithTLS)
+
+	cfg := runConfig(config.ModeRun)
+	cfg.TLSCertFile = "/run/secrets/tls/cert.pem"
+	cfg.TLSKeyFile = "/run/secrets/tls/key.pem"
+	cfg.TLSCAFile = "/run/secrets/tls/ca.pem"
+
+	if ref := e.ensureGlobalOptions(context.Background(), cfg); ref != nil {
+		t.Fatalf("unexpected refusal: %s", ref.Msg)
+	}
+	for _, kept := range []string{"tls certfile", "tls keyfile", "tls cafile"} {
+		if !strings.Contains(readFile(t, e.SMBConfPath), kept) {
+			t.Errorf("%q was removed although the variables are set:\n%s", kept, readFile(t, e.SMBConfPath))
+		}
+	}
+	if logBuf.String() != "" {
+		t.Errorf("an unchanged start said something:\n%s", logBuf.String())
+	}
+}
+
+func TestWithoutGlobalSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name, conf, key, want string
+		wantRemoved           bool
+	}{
+		{
+			name:        "removes the [global] entry",
+			conf:        "[global]\n\trealm = A\n\ttls keyfile = /k.pem\n",
+			key:         "tls keyfile",
+			want:        "[global]\n\trealm = A\n",
+			wantRemoved: true,
+		},
+		{
+			name:        "whatever its spacing and case",
+			conf:        "[global]\n\tTLS   KeyFile   =   /k.pem\n\trealm = A\n",
+			key:         "tls keyfile",
+			want:        "[global]\n\trealm = A\n",
+			wantRemoved: true,
+		},
+		{
+			name:        "every occurrence",
+			conf:        "[global]\n\ttls keyfile = /a.pem\n\trealm = A\n\ttls keyfile = /b.pem\n",
+			key:         "tls keyfile",
+			want:        "[global]\n\trealm = A\n",
+			wantRemoved: true,
+		},
+		{
+			name:        "absent is unchanged",
+			conf:        "[global]\n\trealm = A\n",
+			key:         "tls keyfile",
+			want:        "[global]\n\trealm = A\n",
+			wantRemoved: false,
+		},
+		{
+			// The same key in another section does not configure the DC,
+			// and taking it out would be editing a share nobody asked about.
+			name:        "another section is left alone",
+			conf:        "[global]\n\trealm = A\n\n[share]\n\ttls keyfile = /k.pem\n",
+			key:         "tls keyfile",
+			want:        "[global]\n\trealm = A\n\n[share]\n\ttls keyfile = /k.pem\n",
+			wantRemoved: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, removed := withoutGlobalSetting(tc.conf, tc.key)
+			if removed != tc.wantRemoved {
+				t.Errorf("removed = %v, want %v", removed, tc.wantRemoved)
+			}
+			if got != tc.want {
+				t.Errorf("got\n%q\nwant\n%q", got, tc.want)
+			}
+			// Idempotent: a second pass over the result changes nothing.
+			again, removedAgain := withoutGlobalSetting(got, tc.key)
+			if removedAgain || again != got {
+				t.Errorf("not idempotent: second pass removed=%v, got\n%q", removedAgain, again)
+			}
+		})
+	}
+}
