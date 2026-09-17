@@ -119,9 +119,10 @@ const (
 	// layers but the daemon — tarring the context up, and on a loaded
 	// runner waiting for a builder at all — so the margin is over that,
 	// not over the work. It is deliberately NOT as generous as
-	// PullTimeout: nothing here goes to a registry, and a budget large
-	// enough to hide a hung daemon would be spent by the test that has to
-	// declare it up front.
+	// PullTimeout: this build is not expected to reach a registry at all
+	// (Build passes `--pull=false`, and Preflight has already established
+	// the base image locally), and a budget large enough to hide a hung
+	// daemon would be spent by the test that has to declare it up front.
 	BuildTimeout = 3 * time.Minute
 	// dockerTimeout bounds the short bookkeeping commands (inspect, rm,
 	// volume create) that should answer immediately or not at all.
@@ -771,12 +772,21 @@ func EnsureImage(t *testing.T, ref string) {
 // Build builds contextDir into a harness-owned image tagged ref, and
 // registers its removal with t.Cleanup.
 //
-// It is the one place the suite is allowed to produce an image, and it is
-// NOT a way to build the subject: Preflight refuses to run at all unless
-// the image under test already exists, because a suite that built its own
-// subject could report green about something the release build never
-// produced. What this is for is an image whose whole point is to be
+// It is NOT a way to build the subject: Preflight refuses to run at all
+// unless the image under test already exists, because a suite that built
+// its own subject could report green about something the release build
+// never produced. What this is for is an image whose whole point is to be
 // derived from that subject (the B.5 reuse row).
+//
+// It is not the only `docker build` in this package — ClientImage
+// (client.go) builds the protocol test client — and the two are
+// deliberately unalike. The client image is a fixed tag, built at most
+// once per test binary (or supplied ready-made through E2E_CLIENT_IMAGE),
+// shared by every test that needs it, and carries no ownership label: it
+// is a tool the suite reuses across runs, and sweeping it would throw
+// that away and rebuild it on the next one. What Build produces is the
+// opposite — a per-test artifact, uniquely tagged, labelled, and gone
+// before the test that asked for it returns.
 //
 // The ownership label goes on with `--label`, so the image is subject to
 // the same rule as every container, volume and network here: the harness
@@ -800,7 +810,28 @@ func Build(t *testing.T, ref, contextDir string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), BuildTimeout)
 	defer cancel()
-	out, code, err := dockerCmd(ctx, "build", "--label", ownerLabelArg, "-t", ref, contextDir)
+	// `--pull=false` is docker's default and is passed explicitly anyway,
+	// because BuildTimeout is sized on the premise that this build stays
+	// local. What it buys, precisely: a base tag that IS present locally is
+	// used as it is, never re-resolved against a registry. That is the case
+	// that matters here — the caller's `FROM` names the image under test,
+	// and re-resolving it could build on a REGISTRY image of the same name
+	// instead of the local one Preflight checked, which would make this
+	// suite report on something the build never produced.
+	//
+	// What it does NOT buy, measured rather than assumed: with buildkit the
+	// flag does not keep a MISSING base local. A `FROM` naming a tag that is
+	// not in the local store still goes out to resolve it —
+	//
+	//	docker build --pull=false   (base absent)
+	//	  => failed to resolve source metadata for
+	//	     docker.io/library/samba-ad-dc:definitely-not-here-31415
+	//
+	// — so the flag is a guard on the second build, not on the first.
+	// Preflight is what closes that gap, by refusing to run the suite at all
+	// while the image under test is missing.
+	out, code, err := dockerCmd(ctx, "build", "--pull=false",
+		"--label", ownerLabelArg, "-t", ref, contextDir)
 	if err != nil || code != 0 {
 		t.Fatalf("docker build -t %s %s: exit %d: %v\n%s",
 			ref, contextDir, code, err, strings.TrimSpace(out))

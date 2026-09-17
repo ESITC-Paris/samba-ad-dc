@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/esitc-paris/samba-ad-dc/test/e2e/harness"
 )
@@ -41,11 +42,24 @@ const derivedMarkerPath = "/usr/share/samba-ad-dc/derived-marker"
 // human who finds this file inside a stray image knows where it came from.
 const derivedMarkerText = "built by TestDerivedImageInheritsContract\n"
 
-// derivedWorstCase is what this test can consume if every budget it opens
-// is spent to the last second: the build, the provision that has to reach
-// healthy, and TWO containers bounded by harness.ExitTimeout — the one-off
-// `--version` on the base image, and the refusal at the end.
-const derivedWorstCase = harness.BuildTimeout + harness.HealthTimeout + 2*harness.ExitTimeout
+// derivedWorstCase is the budget this test declares to requireDeadline: the
+// build, the provision that has to reach healthy, and TWO containers bounded
+// by harness.ExitTimeout — the one-off `--version` on the base image, and the
+// refusal at the end — plus a minute of slack.
+//
+// It is NOT the arithmetic sum of every timeout the test can open, and does
+// not claim to be. The two `docker exec`s are each bounded by
+// harness.ExecTimeout and the eight inspects by the harness's internal
+// docker timeout, so a literal upper bound would be past half an hour — a
+// number no run has ever approached (14 s in CI, both architectures) and one
+// that would make the test refuse to start on a perfectly healthy suite,
+// which is the failure requireDeadline exists to avoid, not to cause. What
+// is counted is therefore the same thing globalOptionsWorstCase and
+// customTLSWorstCase count: the container budgets, which are the only ones
+// large enough to eat a binary deadline, plus explicit slack for the short
+// commands in between.
+const derivedWorstCase = harness.BuildTimeout + harness.HealthTimeout +
+	2*harness.ExitTimeout + time.Minute
 
 // ---------------------------------------------------------------------
 // B.5: a derived image inherits the runtime contract

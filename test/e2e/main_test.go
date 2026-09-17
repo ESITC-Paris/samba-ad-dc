@@ -13,9 +13,10 @@
 // multi-DC test alone budgets up to ~19 minutes of worst case. Worse than
 // being slow, blowing the binary timeout is *destructive*: go test panics
 // the process, which skips every t.Cleanup and every AtExit teardown and
-// leaves labeled containers, volumes and networks behind. (harness.Sweep,
-// which TestMain runs, cleans those up on the NEXT run — but a run that
-// leaks is still a run whose teardown never proved anything.)
+// leaves labeled containers, volumes, networks and images behind.
+// (harness.Sweep, which TestMain runs, cleans those up on the NEXT run —
+// but a run that leaks is still a run whose teardown never proved
+// anything.)
 //
 // TestJoinReplicationBothWays refuses to start when the deadline it is
 // given is plainly too short, rather than failing 10 minutes later with a
