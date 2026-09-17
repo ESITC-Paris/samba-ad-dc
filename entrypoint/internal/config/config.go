@@ -423,14 +423,15 @@ func globalOptionRefusal(key, owner string) error {
 // checkTLSTrio enforces the all-or-none rule on the operator's own LDAPS
 // material.
 //
-// Every partial combination is a domain controller the operator did not ask
-// for, and — this is the part that makes refusing the only honest answer —
-// one they would have no way to notice. `tls enabled` is already yes on an AD
-// DC (measured with testparm against Samba 4.24.7 in this image), and samba
-// falls back to the self-signed material it generates for itself whenever the
-// files it is pointed at are not all usable. So a trio missing its key would
-// not produce an error: it would produce LDAPS served with a certificate
-// nobody vouched for, on a DC whose configuration claims otherwise.
+// Refusing is cheaper than finding out what a partial trio does. `tls
+// enabled` is already yes on an AD DC (measured with testparm against Samba
+// 4.24.7 in this image), so LDAPS is served either way; what changes is that
+// the settings left unset keep samba's own defaults — `tls/cert.pem`,
+// `tls/key.pem`, `tls/ca.pem` under the private directory on the state
+// volume, also measured — and the DC would then assemble its chain from two
+// different places, or regenerate the missing half itself. Which of those
+// happens has NOT been measured here, and that is precisely the problem: the
+// operator cannot tell either, from a container that came up healthy.
 //
 // The message names the variables that are MISSING, because those are what
 // has to be set.

@@ -717,9 +717,13 @@ defaults to `yes` on an AD DC (measured with `testparm`), and writing it
 would only invite the reading that LDAPS is off without it.
 
 *All three or none*, refused with exit 10 naming the ones that are missing.
-A partial trio would not fail loudly: samba falls back to its own self-signed
-material, so the DC would come up healthy serving a certificate nobody
-vouched for.
+A partial trio does not fail loudly. The settings left unset keep samba's own
+defaults — `tls/cert.pem`, `tls/key.pem` and `tls/ca.pem` under the private
+directory on the state volume (measured) — so the DC would assemble its chain
+from two different places, or regenerate the missing half itself, and come up
+healthy either way. Which of those it does has deliberately not been
+measured: the operator could not tell either, which is the whole reason the
+combination is refused instead of resolved.
 
 *Each file is checked before anything shells out* — it must exist, be
 readable and not be empty — and a failure is exit **11**, the secret class,

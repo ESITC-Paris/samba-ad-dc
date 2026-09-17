@@ -712,9 +712,10 @@ business living on one.
 
 **All three or none.** Setting one or two is refused with exit 10 naming the
 ones that are missing. It is refused rather than half-applied because a
-partial trio does not fail loudly: samba falls back to its own self-signed
-material, and the container comes up healthy serving a certificate nobody
-vouched for.
+partial trio does not fail loudly: whatever you leave unset keeps samba's own
+default path under the state volume, so the DC would build its chain from two
+different places — and come up healthy while doing it. Rather than have you
+discover which certificate is actually on the wire, the entrypoint says no.
 
 **The private key must be `chmod 600` and owned by the container user
 (uid 0).** This is samba's rule and it is fatal, not advisory: a key at any
