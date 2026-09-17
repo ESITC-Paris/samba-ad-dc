@@ -1240,8 +1240,11 @@ gates.
   describes the constrained profile, and `docs/traceability.md` stated
   that `harness.StartDC` applied it — but the harness emitted no
   `--security-opt` at all. The setting is now `DefaultSecurityOpt` in
-  `test/e2e/harness`, applied to every container the suite starts (DCs
-  and the backup/restore/marker one-offs alike), and the whole suite was
+  `test/e2e/harness`, applied to every **DC** container the suite starts —
+  every container running the image under test goes through `StartDC` /
+  `RunDCExpectExit`, the one-offs included. The separate test client is a
+  different image and deliberately outside the profile: it is a fixture,
+  not a thing the guides tell an operator to run. The whole suite was
   re-run under it locally on arm64 against `samba-ad-dc:dev`: 17 pass,
   1 skip (`TestUpgradeFromLastPublished`, with `E2E_UPGRADE_FROM` unset),
   0 fail. It is defence-in-depth rather than a measured minimum —

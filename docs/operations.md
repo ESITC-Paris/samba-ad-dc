@@ -98,10 +98,28 @@ minute.
 | Secret | `DOCKERHUB_USERNAME` | Docker Hub account with push rights on `esitcparis/samba-ad-dc` | Mirror skipped with a `::warning::`; the release still succeeds — GHCR is the source of truth |
 | Secret | `DOCKERHUB_TOKEN` | Docker Hub access token with push rights on that repository | as above |
 | Variable | `IMAGE_NAME` | **unset in production.** Set only for a drill that must retarget the package itself (see [Staging drill](#staging-drill)) | defaults to `samba-ad-dc` in `upstream-check.yml`, `release.yml` and `post-push-verify.yml` |
-| Variable | `RELEASE_SOAK_HOURS` | **unset in production.** The §9bis.5 soak in hours | defaults to `24` |
+| Variable | `RELEASE_SOAK_HOURS` | set to `24` — or unset, which is the same thing. The §9bis.5 soak in hours | defaults to `24` |
+| Setting | Dependabot alerts | **enabled** (`gh api repos/ESITC-Paris/samba-ad-dc/vulnerability-alerts` answers `204`) | `.github/dependabot.yml` still opens its weekly version bumps, but a CVE disclosed against a pinned action or Go module between two of them goes unannounced |
+| Setting | Private vulnerability reporting | **enabled** (`gh api repos/ESITC-Paris/samba-ad-dc/private-vulnerability-reporting` → `{"enabled":true}`) | `SECURITY.md` sends reporters to `.../security/advisories/new`, which only members can open while this is off — leaving a public issue as the reporter's only channel, which is exactly what that file forbids |
+| Setting | Actions permissions | `allowed_actions: all`; default `GITHUB_TOKEN` permissions **write** | Narrowing the allow-list stops the SHA-pinned third-party actions (`docker/*`, `sigstore/*`, `actions/attest-build-provenance`) from resolving. The token default is only a fallback here: every workflow declares its own `permissions:` block — `release.yml:45`, `upstream-check.yml:29`, `post-push-verify.yml:42` — so what would inherit this default is a workflow added later without one |
+| Setting | Package visibility | `samba-ad-dc` **public**, set per package after the first release (step 6 of *Going live* below) or organisation-wide at *Organization settings* → *Packages* | Anonymous `docker pull`, `cosign verify` and `gh attestation verify` all fail, and no automated check notices: post-push verification runs with `GITHUB_TOKEN` and reads a private package happily |
 
 Both Docker Hub secrets are checked together: the mirror runs only when
 *both* are non-empty and the run is not a staging rehearsal.
+
+The four `Setting` rows are repository configuration, not anything the
+tree can hold itself to: no file in this repository can assert them, and
+three of the four fail *silently* when they are wrong — a missed advisory,
+a reporter with nowhere to report, an image nobody outside the
+organisation can pull. Only the Actions row fails loudly. They are written
+down here so that a repository restored, forked or transferred can be put
+back into the state the rest of this document assumes, and each value
+above is what the API answered on 2026-09-17.
+
+`RELEASE_SOAK_HOURS` is a variable rather than a setting, and it is set to
+`24`, which is the value `upstream-check.yml` already defaults to when it
+is unset. Setting it changes nothing; it is recorded because the live
+repository has it, and deleting it would also be correct.
 
 No other secret is needed. Signing is keyless (OIDC), attestations and
 GHCR pushes use the run's `GITHUB_TOKEN`, and the watcher's issue, tag and
@@ -167,8 +185,12 @@ describes — and nothing about the rest of this section changes.
 
    ```sh
    docker logout ghcr.io
-   docker buildx imagetools inspect ghcr.io/esitc-paris/samba-ad-dc:4.24.7-r1
+   docker buildx imagetools inspect ghcr.io/esitc-paris/samba-ad-dc:4.24
    ```
+
+   `4.24` is the default branch's mutable alias rather than an immutable
+   tag, so the command stays correct whichever revision publishes first —
+   the section above already warns that the first tags may be `-r2`.
 
    The post-push verification passing is **not** evidence of this: it runs
    with the repository's `GITHUB_TOKEN` and can read a private package.
@@ -181,6 +203,20 @@ describes — and nothing about the rest of this section changes.
 8. **Merge the open Dependabot pull requests**, each one only once CI is
    green on it. They were left open deliberately: a dependency bump that
    lands between the tag and the build is a change to what was tested.
+
+   Three are open (`gh pr list --repo ESITC-Paris/samba-ad-dc`). #1
+   (`actions/checkout` 5.1.0 → 7.0.1) and #2 (`go-ldap/ldap/v3` 3.4.13 →
+   3.4.14) are green. #3 (`actions/setup-go` 5.6.0 → 7.0.0) is red, and
+   only because its base commit predates `50126ad`: `setup-go` v6 began
+   exporting `GOTOOLCHAIN=local`, and on that base `test/e2e/go.mod`
+   declared `go 1.24.0` while `go.work` declares `go 1.25.0`, so the
+   toolchain the action resolved was one language version below the
+   workspace — `go: ../../go.work requires go >= 1.25.0 (running go
+   1.24.0; GOTOOLCHAIN=local)` in both `Build` legs. `50126ad` raised the
+   e2e module's floor to `1.25.0`; `@dependabot rebase` (or a manual
+   rebase onto `main`) is the whole fix, and the run then goes green. Do
+   not close it as broken and do not pin `setup-go` back — the bump is
+   fine, the base is stale.
 9. **Delete the staging package.** The drill left
    `ghcr.io/esitc-paris/samba-ad-dc-staging` behind (private, and it still
    exists at the time of writing). It is not deleted automatically and
@@ -193,6 +229,44 @@ describes — and nothing about the rest of this section changes.
 
    That call needs `delete:packages` on the token `gh` is using — see
    *Token scopes for package work* below.
+10. **Verify the published image the way a stranger would.** This has
+    never been done. Every verification this repository has run happened
+    inside GitHub Actions, with the run's own `GITHUB_TOKEN`; the drill's
+    staging package was private and the laptop `gh` token carried no
+    package scopes, so no local check ever ran. Until this step is taken,
+    the verification instructions in `README.md` and
+    `docs/deployment-guide.md` are untested against a real published tag —
+    they are derived from the pipeline, not confirmed against it.
+
+    From a shell logged out of everything, against the first published
+    tag and the index digest its release notes pin:
+
+    ```sh
+    docker logout ghcr.io
+    cosign version    # record this: it is what the result is evidence for
+
+    cosign verify ghcr.io/esitc-paris/samba-ad-dc:<tag> \
+      --certificate-identity-regexp 'https://github.com/ESITC-Paris/samba-ad-dc/.*' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+    gh attestation verify oci://ghcr.io/esitc-paris/samba-ad-dc@<digest> \
+      --repo ESITC-Paris/samba-ad-dc
+    ```
+
+    Run them **verbatim as the README publishes them**, copied from that
+    file rather than from here or from memory: what is under test is the
+    published instruction, and a command a maintainer improved on the way
+    past tests something no reader will ever type. If either behaves
+    differently from what the guides describe, the guides are what is
+    wrong — correct them, do not correct the transcript.
+
+    The cosign version matters twice over. The pipeline signs and
+    re-verifies with **v2.6.5**, while `brew install cosign` now gives v3;
+    `README.md`, `docs/deployment-guide.md` §2.1 and the pin comment in
+    `post-push-verify.yml` all say in so many words that a v3 verification
+    is *expected* to work and has not been exercised. A v3 run of the
+    commands above is that measurement. Record which version was used and
+    replace the expectation with the result in all three places.
 
 Nothing else changes state: a `publish` decision edits no tracked file by
 design, so the watcher's own commit on that run is a state-only commit or
@@ -401,7 +475,14 @@ two — `IMAGE_NAME=samba-ad-dc-staging` plus `-f staging=true` targets
   repeatable. The
   [post-push verification](https://github.com/ESITC-Paris/samba-ad-dc/actions/runs/35159720483)
   it triggered passed on the staging package it resolved from the run
-  title's ` (staging)` suffix.
+  title's ` (staging)` suffix — which is a check run *inside* GitHub
+  Actions with the repository's own `GITHUB_TOKEN`. **No artefact of this
+  drill was ever verified from outside GitHub**: the staging package was
+  private and the laptop `gh` token carried no package scopes, so the
+  local check was refused before it could start. Step 10 of
+  [Going live](#going-live-the-first-publication) is where that gap
+  closes, and until it is taken the published verification instructions
+  remain untested by anyone.
   Two gates did **not** run, for the documented first-publication reason
   rather than a defect: no `samba-ad-dc` package existed on GHCR yet, so
   `TestUpgradeFromLastPublished` skipped on both architectures (SPEC
