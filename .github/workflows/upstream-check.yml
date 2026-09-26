@@ -59,7 +59,7 @@ jobs:
         ghcr.io/aquasecurity/trivy:0.71.2@sha256:f5d0e600ecda7449e2a9b272805aef698631d3bb3f3a739a750de2c6819acdc9
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Ensure PyYAML
         # catalog.py hard-requires PyYAML (watch.py and cve-ledger.py reach
