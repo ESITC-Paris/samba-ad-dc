@@ -118,7 +118,7 @@ jobs:
         # because the repository happens to carry a committed report from
         # another architecture.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: capbisect-run-${{ matrix.arch }}
           path: test/capbisect/results-${{ matrix.arch }}-*.txt
@@ -131,7 +131,7 @@ jobs:
         # guard above. `warn` rather than `error` because the driver writes
         # it last — a run that died mid-bisection legitimately has none.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: capbisect-stable-${{ matrix.arch }}
           path: test/capbisect/results-${{ matrix.arch }}.txt
